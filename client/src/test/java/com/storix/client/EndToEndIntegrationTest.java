@@ -8,10 +8,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -24,12 +23,26 @@ class EndToEndIntegrationTest {
     private MetadataServer metadataServer;
     private ChunkServer nodeA, nodeB, nodeC;
     private Path metadataFile;
+    private int metadataPort;
+    private int nodeAPort, nodeBPort, nodeCPort;
+
+    private int findFreePort() throws IOException {
+        try (ServerSocket socket = new ServerSocket(0)) {
+            return socket.getLocalPort();
+        }
+    }
 
     @BeforeEach
     void setUp() throws Exception {
+        // Use dynamic ports to avoid conflicts
+        metadataPort = findFreePort();
+        nodeAPort = findFreePort();
+        nodeBPort = findFreePort();
+        nodeCPort = findFreePort();
+
         metadataFile = tempDir.resolve("metadata.json");
         // Start Metadata Server with Factor 2, short timeout/interval
-        metadataServer = new MetadataServer(8000, metadataFile, 2, 2000, 500);
+        metadataServer = new MetadataServer(metadataPort, metadataFile, 2, 2000, 500);
         new Thread(() -> {
             try {
                 metadataServer.start();
@@ -38,15 +51,15 @@ class EndToEndIntegrationTest {
         Thread.sleep(500); // give it time to bind
 
         // Start Nodes
-        nodeA = startNode("node-a", 9001);
-        nodeB = startNode("node-b", 9002);
-        nodeC = startNode("node-c", 9003);
+        nodeA = startNode("node-a", nodeAPort);
+        nodeB = startNode("node-b", nodeBPort);
+        nodeC = startNode("node-c", nodeCPort);
         Thread.sleep(500); // give nodes time to start and register
     }
 
     private ChunkServer startNode(String id, int port) throws IOException {
         ChunkServer node = new ChunkServer(id, "127.0.0.1", port,
-                tempDir.resolve(id), "127.0.0.1", 8000);
+                tempDir.resolve(id), "127.0.0.1", metadataPort);
         new Thread(() -> {
             try {
                 node.start();
@@ -72,7 +85,7 @@ class EndToEndIntegrationTest {
         Files.write(originalFile, data);
 
         // Step 2: Put file with chunk size 1MB using StorixClient
-        StorixClient client = new StorixClient("127.0.0.1", 8000, 1024 * 1024);
+        StorixClient client = new StorixClient("127.0.0.1", metadataPort, 1024 * 1024);
         client.putFile(originalFile);
 
         // Verify info
@@ -117,7 +130,7 @@ class EndToEndIntegrationTest {
         }
 
         // Step 7: Restart Node B and verify it rejoins
-        nodeB = startNode("node-b", 9002);
+        nodeB = startNode("node-b", nodeBPort);
         Thread.sleep(1000);
         status = client.getMetadataClient().getClusterStatus();
         assertEquals(3, status.get("healthyNodes"));

@@ -25,6 +25,20 @@ public class HealthMonitor {
     }
 
     /**
+     * Returns the configured health check interval in milliseconds.
+     */
+    public long getCheckIntervalMillis() {
+        return checkIntervalMillis;
+    }
+
+    /**
+     * Returns the configured node timeout in milliseconds.
+     */
+    public long getNodeTimeoutMillis() {
+        return nodeTimeoutMillis;
+    }
+
+    /**
      * Starts the periodic health check.
      */
     public void start() {

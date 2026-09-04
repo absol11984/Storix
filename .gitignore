@@ -1,0 +1,17 @@
+# Build outputs
+target/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS
+*.pid
+.DS_Store
+
+# Logs
+*.log

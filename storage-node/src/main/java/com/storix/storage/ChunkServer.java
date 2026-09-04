@@ -22,18 +22,34 @@ public class ChunkServer {
     private final ChunkStorage storage;
     private final String metadataHost;
     private final int metadataPort;
+    private final long heartbeatIntervalMillis;
     private volatile boolean running = true;
     private ScheduledExecutorService heartbeatScheduler;
     private ServerSocketChannel serverChannel;
 
+    public static final long DEFAULT_HEARTBEAT_INTERVAL_MILLIS = 2000;
+
     public ChunkServer(String nodeId, String host, int port, Path storageDir,
                        String metadataHost, int metadataPort) throws IOException {
+        this(nodeId, host, port, storageDir, metadataHost, metadataPort, DEFAULT_HEARTBEAT_INTERVAL_MILLIS);
+    }
+
+    public ChunkServer(String nodeId, String host, int port, Path storageDir,
+                       String metadataHost, int metadataPort, long heartbeatIntervalMillis) throws IOException {
         this.nodeId = nodeId;
         this.host = host;
         this.port = port;
         this.storage = new ChunkStorage(storageDir);
         this.metadataHost = metadataHost;
         this.metadataPort = metadataPort;
+        this.heartbeatIntervalMillis = heartbeatIntervalMillis > 0 ? heartbeatIntervalMillis : DEFAULT_HEARTBEAT_INTERVAL_MILLIS;
+    }
+
+    /**
+     * Returns the configured heartbeat interval in milliseconds.
+     */
+    public long getHeartbeatIntervalMillis() {
+        return heartbeatIntervalMillis;
     }
 
     /**
@@ -112,7 +128,7 @@ public class ChunkServer {
             } catch (IOException e) {
                 System.err.println("Heartbeat failed: " + e.getMessage());
             }
-        }, 2, 2, TimeUnit.SECONDS); // Send heartbeat every 2 seconds
+        }, heartbeatIntervalMillis, heartbeatIntervalMillis, TimeUnit.MILLISECONDS);
     }
 
     private void sendToMetadataServer(byte opcode, String jsonPayload) throws IOException {
@@ -165,6 +181,7 @@ public class ChunkServer {
         Path storageDir = Path.of("chunks");
         String metadataHost = "127.0.0.1";
         int metadataPort = 9090;
+        long heartbeatInterval = DEFAULT_HEARTBEAT_INTERVAL_MILLIS;
 
         // Parse command line arguments
         for (int i = 0; i < args.length; i++) {
@@ -183,6 +200,8 @@ public class ChunkServer {
                 if (parts.length > 1) {
                     metadataPort = Integer.parseInt(parts[1]);
                 }
+            } else if ("--heartbeat-interval".equals(args[i]) && i + 1 < args.length) {
+                heartbeatInterval = Long.parseLong(args[++i]);
             } else if (!args[i].startsWith("--")) {
                 // backward compatibility positional arguments
                 if (i == 0) port = Integer.parseInt(args[0]);
@@ -190,7 +209,7 @@ public class ChunkServer {
             }
         }
 
-        ChunkServer server = new ChunkServer(nodeId, host, port, storageDir, metadataHost, metadataPort);
+        ChunkServer server = new ChunkServer(nodeId, host, port, storageDir, metadataHost, metadataPort, heartbeatInterval);
 
         // Graceful shutdown on SIGINT/SIGTERM
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {

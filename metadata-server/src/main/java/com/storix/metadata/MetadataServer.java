@@ -124,6 +124,8 @@ public class MetadataServer {
                 replicationFactor = Integer.parseInt(args[++i]);
             } else if ("--timeout".equals(args[i]) && i + 1 < args.length) {
                 timeout = Long.parseLong(args[++i]);
+            } else if ("--interval".equals(args[i]) && i + 1 < args.length) {
+                interval = Long.parseLong(args[++i]);
             } else if (!args[i].startsWith("--")) {
                 if (i == 0) port = Integer.parseInt(args[0]);
                 else if (i == 1) metadataFile = Path.of(args[1]);
