@@ -1,7 +1,9 @@
 package com.storix.client;
 
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Command-line interface for Storix.
@@ -12,13 +14,13 @@ import java.util.List;
  *   storix delete <object>
  *   storix info <object>
  *   storix list
+ *   storix status
+ *   storix repair
  */
 public class StorixCLI {
 
     private static final String DEFAULT_METADATA_HOST = "localhost";
     private static final int DEFAULT_METADATA_PORT = 9090;
-    private static final String DEFAULT_STORAGE_HOST = "localhost";
-    private static final int DEFAULT_STORAGE_PORT = 8080;
     private static final int DEFAULT_CHUNK_SIZE = 1024 * 1024; // 1 MB
 
     public static void main(String[] args) {
@@ -36,6 +38,8 @@ public class StorixCLI {
                 case "delete" -> handleDelete(args);
                 case "info" -> handleInfo(args);
                 case "list" -> handleList();
+                case "status" -> handleStatus();
+                case "repair" -> handleRepair();
                 default -> {
                     System.err.println("Unknown command: " + command);
                     printUsage();
@@ -110,14 +114,47 @@ public class StorixCLI {
                 System.exit(1);
             }
 
+            Map<String, Object> statusMap = client.getMetadataClient().getClusterStatus();
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> nodesList = (List<Map<String, Object>>) statusMap.get("nodes");
+
             System.out.println("Object: " + metadata.getObjectName());
             System.out.println("Size: " + metadata.getFileSize() + " bytes");
-            System.out.println("Chunk size: " + metadata.getChunkSize() + " bytes");
             System.out.println("Chunks: " + metadata.getChunkCount());
+            System.out.println("Chunk Size: " + metadata.getChunkSize() + " bytes");
+            System.out.println("Replication Factor: " + statusMap.get("replicationFactor"));
             System.out.println();
 
+            int overallDegradedCount = 0;
+
             for (ChunkInfoDTO chunk : metadata.getChunks()) {
-                System.out.println("  " + chunk.getChunkId() + " → " + chunk.getStorageNodeId());
+                System.out.println("Chunk " + chunk.getChunkIndex() + ":");
+                int healthyReplicaCount = 0;
+                for (String replicaNodeId : chunk.getReplicaNodeIds()) {
+                    String nodeStatus = "UNKNOWN";
+                    if (nodesList != null) {
+                        for (Map<String, Object> nodeMap : nodesList) {
+                            if (replicaNodeId.equals(nodeMap.get("nodeId"))) {
+                                nodeStatus = (String) nodeMap.get("status");
+                                break;
+                            }
+                        }
+                    }
+                    if ("ACTIVE".equals(nodeStatus)) {
+                        healthyReplicaCount++;
+                    }
+                    System.out.println("  " + replicaNodeId + " " + nodeStatus);
+                }
+                if (healthyReplicaCount < (Integer) statusMap.get("replicationFactor")) {
+                    overallDegradedCount++;
+                }
+                System.out.println();
+            }
+
+            if (overallDegradedCount > 0) {
+                System.out.println("Status: DEGRADED");
+            } else {
+                System.out.println("Status: HEALTHY");
             }
         }
     }
@@ -136,14 +173,51 @@ public class StorixCLI {
         }
     }
 
+    private static void handleStatus() throws Exception {
+        try (StorixClient client = createClient(DEFAULT_CHUNK_SIZE)) {
+            Map<String, Object> status = client.getMetadataClient().getClusterStatus();
+
+            System.out.println("Storix Cluster\n");
+            System.out.println("Metadata Server:\nACTIVE\n");
+
+            System.out.println("Storage Nodes:");
+            System.out.println("---------------------------------------");
+
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> nodes = (List<Map<String, Object>>) status.get("nodes");
+            if (nodes != null) {
+                for (Map<String, Object> node : nodes) {
+                    String addr = String.format("%s:%d", node.get("host"), node.get("port"));
+                    System.out.printf("%-10s %-16s %s\n", node.get("nodeId"), addr, node.get("status"));
+                }
+            }
+            System.out.println("---------------------------------------\n");
+
+            System.out.println("Objects: " + status.get("objects"));
+            System.out.println("Chunks: " + status.get("chunks"));
+            System.out.println("Healthy nodes: " + status.get("healthyNodes") + "/" + status.get("totalNodes"));
+            System.out.println();
+
+            System.out.println("Replication:");
+            System.out.println("Healthy: " + status.get("healthyChunks"));
+            System.out.println("Degraded: " + status.get("degradedChunks"));
+        }
+    }
+
+    private static void handleRepair() throws Exception {
+        try (StorixClient client = createClient(DEFAULT_CHUNK_SIZE)) {
+            Map<String, Object> result = client.getMetadataClient().repair();
+
+            System.out.println("Repair Results:");
+            System.out.println("Chunks Scanned: " + result.get("chunksScanned"));
+            System.out.println("Chunks Repaired: " + result.get("chunksRepaired"));
+            System.out.println("Chunks Failed: " + result.get("chunksFailed"));
+            System.out.println("Chunks Already Healthy: " + result.get("chunksAlreadyHealthy"));
+        }
+    }
+
     private static StorixClient createClient(int chunkSize) {
-        return new StorixClient(
-            DEFAULT_METADATA_HOST,
-            DEFAULT_METADATA_PORT,
-            DEFAULT_STORAGE_HOST,
-            DEFAULT_STORAGE_PORT,
-            chunkSize
-        );
+        return new StorixClient(DEFAULT_METADATA_HOST, DEFAULT_METADATA_PORT, chunkSize);
     }
 
     private static int parseChunkSize(String[] args, int index) {
@@ -169,11 +243,8 @@ public class StorixCLI {
         System.out.println("  delete <object>         Delete an object");
         System.out.println("  info <object>           Show object information");
         System.out.println("  list                    List all objects");
+        System.out.println("  status                  Show cluster status");
+        System.out.println("  repair                  Trigger manual repair of under-replicated chunks");
         System.out.println();
-        System.out.println("Chunk size examples: 1M, 512K, 1048576");
-        System.out.println();
-        System.out.println("Environment:");
-        System.out.println("  Metadata Server: " + DEFAULT_METADATA_HOST + ":" + DEFAULT_METADATA_PORT);
-        System.out.println("  Storage Node: " + DEFAULT_STORAGE_HOST + ":" + DEFAULT_STORAGE_PORT);
     }
 }

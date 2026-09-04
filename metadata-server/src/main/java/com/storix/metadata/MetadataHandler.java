@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -15,10 +17,17 @@ import java.util.Map;
 public class MetadataHandler {
 
     private final MetadataStore store;
+    private final NodeRegistry nodeRegistry;
+    private final PlacementManager placementManager;
+    private final RepairManager repairManager;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public MetadataHandler(MetadataStore store) {
+    public MetadataHandler(MetadataStore store, NodeRegistry nodeRegistry,
+                           PlacementManager placementManager, RepairManager repairManager) {
         this.store = store;
+        this.nodeRegistry = nodeRegistry;
+        this.placementManager = placementManager;
+        this.repairManager = repairManager;
     }
 
     /**
@@ -37,7 +46,7 @@ public class MetadataHandler {
                 lengthBuffer.flip();
                 int requestLength = lengthBuffer.getInt();
 
-                if (requestLength <= 0 || requestLength > 1024 * 1024) { // Max 1MB
+                if (requestLength <= 0 || requestLength > 5 * 1024 * 1024) { // Max 5MB
                     sendError(channel, MetadataProtocol.ERROR, "Invalid request length");
                     break;
                 }
@@ -79,6 +88,15 @@ public class MetadataHandler {
                 case MetadataProtocol.UPDATE_OBJECT -> handleUpdateObject(payload);
                 case MetadataProtocol.DELETE_OBJECT -> handleDeleteObject(payload);
                 case MetadataProtocol.LIST_OBJECTS -> handleListObjects();
+
+                // Node Registry commands
+                case MetadataProtocol.REGISTER_NODE -> handleRegisterNode(payload);
+                case MetadataProtocol.HEARTBEAT -> handleHeartbeat(payload);
+                case MetadataProtocol.GET_NODES -> handleGetNodes();
+                case MetadataProtocol.GET_PLACEMENT -> handleGetPlacement(payload);
+                case MetadataProtocol.GET_CLUSTER_STATUS -> handleGetClusterStatus();
+                case MetadataProtocol.REPAIR -> handleRepair();
+
                 default -> createErrorResponse(MetadataProtocol.ERROR, "Unknown opcode: " + opcode);
             };
         } catch (Exception e) {
@@ -129,6 +147,93 @@ public class MetadataHandler {
     private ByteBuffer handleListObjects() throws IOException {
         String[] objects = store.listObjects().toArray(new String[0]);
         byte[] data = objectMapper.writeValueAsBytes(objects);
+        return createSuccessResponse(data);
+    }
+
+    // Node registry handlers
+
+    private ByteBuffer handleRegisterNode(byte[] payload) throws IOException {
+        NodeInfo nodeInfo = objectMapper.readValue(payload, NodeInfo.class);
+        nodeRegistry.registerNode(nodeInfo.getNodeId(), nodeInfo.getHost(), nodeInfo.getPort());
+        return createSuccessResponse(new byte[0]);
+    }
+
+    private ByteBuffer handleHeartbeat(byte[] payload) throws IOException {
+        Map<String, String> request = objectMapper.readValue(payload, Map.class);
+        String nodeId = request.get("nodeId");
+
+        boolean found = nodeRegistry.heartbeat(nodeId);
+        if (found) {
+            return createSuccessResponse(new byte[0]);
+        } else {
+            return createErrorResponse(MetadataProtocol.NOT_FOUND, "Node not registered");
+        }
+    }
+
+    private ByteBuffer handleGetNodes() throws IOException {
+        List<NodeInfo> healthyNodes = nodeRegistry.getHealthyNodes();
+        byte[] data = objectMapper.writeValueAsBytes(healthyNodes);
+        return createSuccessResponse(data);
+    }
+
+    private ByteBuffer handleGetPlacement(byte[] payload) throws IOException {
+        Map<String, Integer> request = objectMapper.readValue(payload, Map.class);
+        Integer chunkIndex = request.get("chunkIndex");
+        if (chunkIndex == null) {
+            return createErrorResponse(MetadataProtocol.ERROR, "Missing chunkIndex");
+        }
+
+        List<NodeInfo> selectedNodes = placementManager.selectNodes(chunkIndex);
+        byte[] data = objectMapper.writeValueAsBytes(selectedNodes);
+        return createSuccessResponse(data);
+    }
+
+    private ByteBuffer handleGetClusterStatus() throws IOException {
+        Collection<NodeInfo> allNodes = nodeRegistry.getAllNodes();
+
+        // Calculate replication stats
+        int objects = store.listObjects().size();
+        int chunks = 0;
+        int healthyChunks = 0;
+        int degradedChunks = 0;
+
+        for (String objectName : store.listObjects()) {
+            ObjectMetadata metadata = store.getObject(objectName).orElse(null);
+            if (metadata == null) continue;
+
+            chunks += metadata.getChunkCount();
+
+            for (ChunkInfo chunk : metadata.getChunks()) {
+                long healthyReplicas = chunk.getReplicaNodeIds().stream()
+                        .map(id -> nodeRegistry.getNode(id))
+                        .filter(opt -> opt.isPresent() && opt.get().getStatus() == NodeStatus.ACTIVE)
+                        .count();
+
+                if (healthyReplicas >= placementManager.getReplicationFactor()) {
+                    healthyChunks++;
+                } else {
+                    degradedChunks++;
+                }
+            }
+        }
+
+        Map<String, Object> status = new HashMap<>();
+        status.put("nodes", allNodes);
+        status.put("objects", objects);
+        status.put("chunks", chunks);
+        status.put("healthyNodes", nodeRegistry.healthyCount());
+        status.put("totalNodes", nodeRegistry.size());
+        status.put("healthyChunks", healthyChunks);
+        status.put("degradedChunks", degradedChunks);
+        status.put("replicationFactor", placementManager.getReplicationFactor());
+
+        byte[] data = objectMapper.writeValueAsBytes(status);
+        return createSuccessResponse(data);
+    }
+
+    private ByteBuffer handleRepair() throws IOException {
+        RepairManager.RepairResult result = repairManager.repairAll();
+        byte[] data = objectMapper.writeValueAsBytes(result);
         return createSuccessResponse(data);
     }
 

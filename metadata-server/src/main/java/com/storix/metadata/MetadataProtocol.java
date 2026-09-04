@@ -11,12 +11,20 @@ import java.nio.ByteBuffer;
  */
 public final class MetadataProtocol {
 
-    // Opcodes
+    // Prompt 1 opcodes
     public static final byte CREATE_OBJECT = 1;
     public static final byte GET_OBJECT = 2;
     public static final byte UPDATE_OBJECT = 3;
     public static final byte DELETE_OBJECT = 4;
     public static final byte LIST_OBJECTS = 5;
+
+    // Prompt 2 opcodes — node registry and cluster management
+    public static final byte REGISTER_NODE = 10;
+    public static final byte HEARTBEAT = 11;
+    public static final byte GET_NODES = 12;
+    public static final byte GET_CLUSTER_STATUS = 13;
+    public static final byte GET_PLACEMENT = 14;
+    public static final byte REPAIR = 15;
 
     // Status codes
     public static final byte OK = 0;

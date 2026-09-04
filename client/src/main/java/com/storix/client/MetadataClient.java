@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -23,37 +24,26 @@ public class MetadataClient implements AutoCloseable {
         this.port = port;
     }
 
-    /**
-     * Connects to the metadata server.
-     */
     public void connect() throws IOException {
-        channel = SocketChannel.open(new InetSocketAddress(host, port));
+        if (channel == null || !channel.isOpen()) {
+            channel = SocketChannel.open(new InetSocketAddress(host, port));
+        }
     }
 
-    /**
-     * Creates object metadata on the server.
-     */
     public void createObject(ObjectMetadataDTO metadata) throws IOException {
         ensureConnected();
-
         byte[] payload = objectMapper.writeValueAsBytes(metadata);
         sendRequest(MetadataProtocol.CREATE_OBJECT, payload);
-
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
             throw new IOException("CREATE_OBJECT failed: " + new String(response.data()));
         }
     }
 
-    /**
-     * Retrieves object metadata from the server.
-     */
     public ObjectMetadataDTO getObject(String objectName) throws IOException {
         ensureConnected();
-
         byte[] payload = objectMapper.writeValueAsBytes(Map.of("objectName", objectName));
         sendRequest(MetadataProtocol.GET_OBJECT, payload);
-
         Response response = readResponse();
         if (response.status() == MetadataProtocol.NOT_FOUND) {
             return null;
@@ -61,52 +51,100 @@ public class MetadataClient implements AutoCloseable {
         if (response.status() != MetadataProtocol.OK) {
             throw new IOException("GET_OBJECT failed: " + new String(response.data()));
         }
-
         return objectMapper.readValue(response.data(), ObjectMetadataDTO.class);
     }
 
-    /**
-     * Updates object metadata on the server.
-     */
     public void updateObject(ObjectMetadataDTO metadata) throws IOException {
         ensureConnected();
-
         byte[] payload = objectMapper.writeValueAsBytes(metadata);
         sendRequest(MetadataProtocol.UPDATE_OBJECT, payload);
-
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
             throw new IOException("UPDATE_OBJECT failed: " + new String(response.data()));
         }
     }
 
-    /**
-     * Deletes object metadata from the server.
-     */
     public boolean deleteObject(String objectName) throws IOException {
         ensureConnected();
-
         byte[] payload = objectMapper.writeValueAsBytes(Map.of("objectName", objectName));
         sendRequest(MetadataProtocol.DELETE_OBJECT, payload);
-
         Response response = readResponse();
         return response.status() == MetadataProtocol.OK;
     }
 
-    /**
-     * Lists all objects on the server.
-     */
     public String[] listObjects() throws IOException {
         ensureConnected();
-
         sendRequest(MetadataProtocol.LIST_OBJECTS, new byte[0]);
-
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
             throw new IOException("LIST_OBJECTS failed: " + new String(response.data()));
         }
-
         return objectMapper.readValue(response.data(), String[].class);
+    }
+
+    // New node management endpoints
+
+    public void registerNode(NodeInfoDTO nodeInfo) throws IOException {
+        ensureConnected();
+        byte[] payload = objectMapper.writeValueAsBytes(nodeInfo);
+        sendRequest(MetadataProtocol.REGISTER_NODE, payload);
+        Response response = readResponse();
+        if (response.status() != MetadataProtocol.OK) {
+            throw new IOException("REGISTER_NODE failed: " + new String(response.data()));
+        }
+    }
+
+    public void heartbeat(String nodeId) throws IOException {
+        ensureConnected();
+        byte[] payload = objectMapper.writeValueAsBytes(Map.of("nodeId", nodeId));
+        sendRequest(MetadataProtocol.HEARTBEAT, payload);
+        Response response = readResponse();
+        if (response.status() != MetadataProtocol.OK) {
+            throw new IOException("HEARTBEAT failed: " + new String(response.data()));
+        }
+    }
+
+    public NodeInfoDTO[] getNodes() throws IOException {
+        ensureConnected();
+        sendRequest(MetadataProtocol.GET_NODES, new byte[0]);
+        Response response = readResponse();
+        if (response.status() != MetadataProtocol.OK) {
+            throw new IOException("GET_NODES failed: " + new String(response.data()));
+        }
+        return objectMapper.readValue(response.data(), NodeInfoDTO[].class);
+    }
+
+    public NodeInfoDTO[] getPlacement(int chunkIndex) throws IOException {
+        ensureConnected();
+        byte[] payload = objectMapper.writeValueAsBytes(Map.of("chunkIndex", chunkIndex));
+        sendRequest(MetadataProtocol.GET_PLACEMENT, payload);
+        Response response = readResponse();
+        if (response.status() != MetadataProtocol.OK) {
+            throw new IOException("GET_PLACEMENT failed: " + new String(response.data()));
+        }
+        return objectMapper.readValue(response.data(), NodeInfoDTO[].class);
+    }
+
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> getClusterStatus() throws IOException {
+        ensureConnected();
+        sendRequest(MetadataProtocol.GET_CLUSTER_STATUS, new byte[0]);
+        Response response = readResponse();
+        if (response.status() != MetadataProtocol.OK) {
+            throw new IOException("GET_CLUSTER_STATUS failed: " + new String(response.data()));
+        }
+        return objectMapper.readValue(response.data(), Map.class);
+    }
+
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> repair() throws IOException {
+        ensureConnected();
+        sendRequest(MetadataProtocol.REPAIR, new byte[0]);
+        Response response = readResponse();
+        if (response.status() != MetadataProtocol.OK) {
+            throw new IOException("REPAIR failed: " + new String(response.data()));
+        }
+        return objectMapper.readValue(response.data(), Map.class);
     }
 
     private void ensureConnected() throws IOException {
@@ -172,15 +210,19 @@ public class MetadataClient implements AutoCloseable {
 
     private record Response(byte status, byte[] data) {}
 
-    /**
-     * Protocol constants matching MetadataProtocol in metadata-server.
-     */
     private static final class MetadataProtocol {
         static final byte CREATE_OBJECT = 1;
         static final byte GET_OBJECT = 2;
         static final byte UPDATE_OBJECT = 3;
         static final byte DELETE_OBJECT = 4;
         static final byte LIST_OBJECTS = 5;
+
+        static final byte REGISTER_NODE = 10;
+        static final byte HEARTBEAT = 11;
+        static final byte GET_NODES = 12;
+        static final byte GET_CLUSTER_STATUS = 13;
+        static final byte GET_PLACEMENT = 14;
+        static final byte REPAIR = 15;
 
         static final byte OK = 0;
         static final byte ERROR = 1;

@@ -1,0 +1,13 @@
+com/storix/metadata/ObjectMetadata.class
+com/storix/metadata/MetadataStore.class
+com/storix/metadata/HealthMonitor.class
+com/storix/metadata/MetadataServer.class
+com/storix/metadata/MetadataProtocol.class
+com/storix/metadata/MetadataHandler.class
+com/storix/metadata/ChunkInfo.class
+com/storix/metadata/RepairManager$RepairResult.class
+com/storix/metadata/PlacementManager.class
+com/storix/metadata/NodeInfo.class
+com/storix/metadata/RepairManager.class
+com/storix/metadata/NodeStatus.class
+com/storix/metadata/NodeRegistry.class
