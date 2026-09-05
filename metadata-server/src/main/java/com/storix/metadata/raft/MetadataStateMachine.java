@@ -21,6 +21,13 @@ public class MetadataStateMachine {
     }
 
     /**
+     * Returns the underlying store (for testing).
+     */
+    public MetadataStore getStore() {
+        return store;
+    }
+
+    /**
      * Applies a single log entry to the state machine.
      */
     public void apply(LogEntry entry) throws IOException {

@@ -9,6 +9,7 @@ import java.net.InetSocketAddress;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.Executors;
@@ -92,7 +93,15 @@ public class MetadataServer {
                     System.out.println("[SERVER] Found snapshot at index " + snap.lastIncludedIndex() +
                             ", term " + snap.lastIncludedTerm());
 
-                    // Restore state from snapshot FIRST
+                    // Clear metadataStore first - we're going to restore from snapshot
+                    // which provides the authoritative state. If metadata.json has any data,
+                    // it would conflict with snapshot restoration.
+                    for (String name : new ArrayList<>(metadataStore.listObjects())) {
+                        metadataStore.deleteObjectDirect(name);
+                    }
+                    metadataStore.save();
+
+                    // Restore state from snapshot
                     snapshotManager.restoreFromSnapshot(snap, metadataStore);
 
                     // Set snapshot boundary in RaftLog BEFORE loading entries
@@ -121,7 +130,15 @@ public class MetadataServer {
                     }
                     System.out.println("[SERVER] Applied " + postSnapshotEntries.size() + " entries to state machine");
                 } else {
-                    // No snapshot - load all entries
+                    // No snapshot - clear any stale metadata from disk and rebuild from WAL
+                    // metadataStore was loaded from metadata.json but may not match WAL state
+                    if (recoveryData.commitIndex > 0 || !recoveryData.entries.isEmpty()) {
+                        for (String name : new ArrayList<>(metadataStore.listObjects())) {
+                            metadataStore.deleteObjectDirect(name);
+                        }
+                        metadataStore.save();
+                    }
+
                     raftLog.loadEntries(
                         recoveryData.entries,
                         recoveryData.commitIndex,
@@ -137,18 +154,31 @@ public class MetadataServer {
                 }
             } catch (Exception e) {
                 System.err.println("[SERVER] Failed to load snapshot: " + e.getMessage());
-                // Continue without snapshot - load all entries
-                raftLog.loadEntries(
-                    recoveryData.entries,
-                    recoveryData.commitIndex,
-                    recoveryData.lastApplied
-                );
-                // Apply all entries to state machine
-                for (LogEntry entry : recoveryData.entries) {
-                    if (entry.index() <= recoveryData.commitIndex) {
-                        stateMachine.apply(entry);
+                // Snapshot restoration failed. Try to recover from WAL if entries exist.
+                // DON'T clear metadataStore - it was loaded from metadata.json and may have valid data.
+                // If WAL entries exist and were committed, replay them to update metadataStore.
+                if (recoveryData.commitIndex > 0 || !recoveryData.entries.isEmpty()) {
+                    // Clear only if we need to rebuild from WAL
+                    if (!recoveryData.entries.isEmpty()) {
+                        for (String name : new ArrayList<>(metadataStore.listObjects())) {
+                            metadataStore.deleteObjectDirect(name);
+                        }
+                    }
+                    raftLog.loadEntries(
+                        recoveryData.entries,
+                        recoveryData.commitIndex,
+                        recoveryData.lastApplied
+                    );
+                    // Apply committed entries to update state machine
+                    for (LogEntry entry : recoveryData.entries) {
+                        if (entry.index() <= recoveryData.commitIndex) {
+                            stateMachine.apply(entry);
+                        }
                     }
                 }
+                // metadata.json fallback: if metadataStore still has data, keep it
+                // This provides a last-resort fallback when snapshot and WAL are both unreliable
+                metadataStore.save();
             }
 
             this.raftNode = new RaftNode(clusterConfig, resolvedRaftStateDir, raftLog, wal,

@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.Random;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -19,14 +20,13 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class RaftClusterIntegrationTest {
 
-    private static int BASE_PORT = 52000;
-    private static int META_A_PORT;
-    private static int META_B_PORT;
-    private static int META_C_PORT;
-
     private static final Path tempDir = Path.of("/tmp/raft-integration-test-" + System.currentTimeMillis());
     private static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final Random random = new Random();
 
+    private int metaAPort;
+    private int metaBPort;
+    private int metaCPort;
     private RaftNode nodeA;
     private RaftNode nodeB;
     private RaftNode nodeC;
@@ -48,13 +48,12 @@ class RaftClusterIntegrationTest {
     @BeforeEach
     void startCluster() throws Exception {
         // Wait for previous test's ports to be released
-        Thread.sleep(1000);
+        Thread.sleep(500);
 
-        // Use fresh ports for each test to avoid state conflicts
-        BASE_PORT = 50000 + (int)((System.currentTimeMillis() / 1000) % 1000) * 10;
-        META_A_PORT = BASE_PORT;
-        META_B_PORT = BASE_PORT + 1;
-        META_C_PORT = BASE_PORT + 2;
+        // Use random ports in a high range to avoid conflicts
+        metaAPort = 50000 + random.nextInt(10000);
+        metaBPort = metaAPort + 1;
+        metaCPort = metaAPort + 2;
 
         // Clean up any existing state
         try {
@@ -67,24 +66,24 @@ class RaftClusterIntegrationTest {
 
         // Create cluster config for each node
         ClusterConfig configA = new ClusterConfig("storix",
-            "meta-a", "127.0.0.1", META_A_PORT,
+            "meta-a", "127.0.0.1", metaAPort,
             List.of(
-                new RaftPeer("meta-b", "127.0.0.1", META_B_PORT),
-                new RaftPeer("meta-c", "127.0.0.1", META_C_PORT)
+                new RaftPeer("meta-b", "127.0.0.1", metaBPort),
+                new RaftPeer("meta-c", "127.0.0.1", metaCPort)
             ));
 
         ClusterConfig configB = new ClusterConfig("storix",
-            "meta-b", "127.0.0.1", META_B_PORT,
+            "meta-b", "127.0.0.1", metaBPort,
             List.of(
-                new RaftPeer("meta-a", "127.0.0.1", META_A_PORT),
-                new RaftPeer("meta-c", "127.0.0.1", META_C_PORT)
+                new RaftPeer("meta-a", "127.0.0.1", metaAPort),
+                new RaftPeer("meta-c", "127.0.0.1", metaCPort)
             ));
 
         ClusterConfig configC = new ClusterConfig("storix",
-            "meta-c", "127.0.0.1", META_C_PORT,
+            "meta-c", "127.0.0.1", metaCPort,
             List.of(
-                new RaftPeer("meta-a", "127.0.0.1", META_A_PORT),
-                new RaftPeer("meta-b", "127.0.0.1", META_B_PORT)
+                new RaftPeer("meta-a", "127.0.0.1", metaAPort),
+                new RaftPeer("meta-b", "127.0.0.1", metaBPort)
             ));
 
         // Create and start Raft nodes directly

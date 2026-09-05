@@ -43,6 +43,7 @@ public class RaftNode implements AutoCloseable {
     // Persistent state
     private volatile long currentTerm = 0;
     private volatile String votedFor = null;
+    private volatile long persistedTerm = -1; // Track what term has been persisted to WAL
     private final RaftLog raftLog;
     private final Path stateDir;
     private WAL wal; // For persisting term/votedFor changes
@@ -135,6 +136,8 @@ public class RaftNode implements AutoCloseable {
         // Restore recovered state
         this.currentTerm = recoveredTerm;
         this.votedFor = recoveredVotedFor;
+        // Track that this term has already been persisted to WAL
+        this.persistedTerm = recoveredTerm;
 
         // Restore logIndexCounter to highest index + 1
         long highestIndex = raftLog.getLastLogIndex();
@@ -270,7 +273,31 @@ public class RaftNode implements AutoCloseable {
             // Append to local log (writes to WAL)
             raftLog.append(indexedEntry);
 
-            // Replicate to followers
+            // For single-node clusters, immediately commit the entry
+            // (no followers to replicate to, so we commit locally)
+            if (singleNode || peers.isEmpty()) {
+                // Commit the entry
+                if (indexedEntry.term() == currentTerm) {
+                    raftLog.advanceCommitIndex(index);
+                }
+                // Persist commit index so it survives restarts
+                persistCommitIndex();
+                // Apply to state machine SYNCHRONOUSLY for single-node
+                // (avoids issues with async scheduler not running)
+                if (stateMachineApplier != null) {
+                    try {
+                        stateMachineApplier.accept(indexedEntry);
+                        raftLog.advanceLastApplied();
+                    } catch (Exception e) {
+                        System.err.println("[RAFT] Failed to apply entry: " + e.getMessage());
+                    }
+                }
+                // Complete the future immediately
+                commitFuture.complete(true);
+                return true;
+            }
+
+            // Replicate to followers for multi-node clusters
             replicateToFollowers(indexedEntry);
 
             // Wait for majority commit with timeout
@@ -1264,11 +1291,19 @@ public class RaftNode implements AutoCloseable {
     /**
      * Persists term and votedFor to WAL.
      * WAL is the authoritative source for crash recovery.
+     * Only writes if the term has actually changed from what's already persisted.
      */
     private void persistTermToWal() {
         if (wal != null) {
             try {
-                wal.persistTerm(currentTerm, votedFor);
+                // Only persist if term has actually changed from what's in the WAL
+                // This prevents duplicate state records on startup when term is just
+                // being incremented as part of the election protocol
+                // We track persistedTerm to know what we've already written
+                if (currentTerm != persistedTerm) {
+                    wal.persistTerm(currentTerm, votedFor);
+                    persistedTerm = currentTerm;
+                }
             } catch (IOException e) {
                 System.err.println("[RAFT] Failed to persist term to WAL: " + e.getMessage());
             }

@@ -1,3 +1,4 @@
+com/storix/metadata/wal/Phase1MasterEndToEndTest$CapturedObject.class
 com/storix/metadata/wal/Phase12CompactionTest.class
 com/storix/metadata/wal/WALPersistenceTest.class
 com/storix/metadata/wal/DebugTest.class
@@ -7,6 +8,7 @@ com/storix/metadata/HealthMonitorConfigTest.class
 com/storix/metadata/wal/WALTruncationTest.class
 com/storix/metadata/wal/Phase12PersistenceIntegrationTest.class
 com/storix/metadata/raft/RaftClusterIntegrationTest.class
+com/storix/metadata/wal/Phase1MasterEndToEndTest.class
 com/storix/metadata/wal/Phase11AcceptanceTest.class
 com/storix/metadata/wal/DeduplicationCacheTest.class
 com/storix/metadata/wal/DebugHeaderTest.class
@@ -16,6 +18,7 @@ com/storix/metadata/PlacementManagerTest.class
 com/storix/metadata/wal/DebugCompactTest2.class
 com/storix/metadata/NodeRegistryTest.class
 com/storix/metadata/raft/RaftLogRepeatedCompactionTest.class
+com/storix/metadata/wal/Phase1MasterEndToEndTest$CapturedChunk.class
 com/storix/metadata/MetadataStoreTest.class
 com/storix/metadata/wal/DebugTest2.class
 com/storix/metadata/raft/RaftLogCompactionTest.class

@@ -247,7 +247,6 @@ public class WAL implements AutoCloseable {
             ch.write(buffer);
             ch.force(true); // fsync
             lastSyncedIndex = entry.index();
-
         } finally {
             lock.unlock();
         }

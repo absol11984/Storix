@@ -17,5 +17,6 @@
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/Phase11AcceptanceTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/Phase12CompactionTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/Phase12PersistenceIntegrationTest.java
+/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/Phase1MasterEndToEndTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/WALPersistenceTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/WALTruncationTest.java
