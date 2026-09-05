@@ -138,7 +138,8 @@ public class SnapshotManager {
                 Optional<Snapshot> snap = loadSnapshot(p);
                 if (snap.isPresent()) {
                     // Validate: index should match filename, term should be valid
-                    if (snap.get().lastIncludedIndex() == index && snap.get().lastIncludedTerm() > 0) {
+                    // Accept term >= 0 (single-node clusters may have term=0 before leader election)
+                    if (snap.get().lastIncludedIndex() == index && snap.get().lastIncludedTerm() >= 0) {
                         if (index > highestIndex) {
                             highestIndex = index;
                             latestValid = p;
@@ -146,13 +147,14 @@ public class SnapshotManager {
                     } else {
                         System.err.println("[SNAPSHOT] Invalid snapshot " + filename +
                                 ": index mismatch (file=" + index +
-                                ", actual=" + snap.get().lastIncludedIndex() + ")");
+                                ", actual=" + snap.get().lastIncludedIndex() +
+                                ", term=" + snap.get().lastIncludedTerm() + ")");
                     }
                 }
             } catch (IOException e) {
-                System.err.println("[SNAPSHOT] Corrupted snapshot " + filename + ": " + e.getMessage());
-                // Re-throw IOException for corrupted snapshots to fail fast
-                throw new IOException("Snapshot validation failed for " + filename + ": " + e.getMessage(), e);
+                System.err.println("[SNAPSHOT] Corrupted/invalid snapshot " + filename + ": " + e.getMessage());
+                // Skip corrupted snapshots and continue checking others
+                // This ensures we find the highest VALID snapshot even if newer ones are corrupted
             } catch (NumberFormatException e) {
                 // Skip files with invalid names
                 System.err.println("[SNAPSHOT] Skipping invalid snapshot filename: " + filename);

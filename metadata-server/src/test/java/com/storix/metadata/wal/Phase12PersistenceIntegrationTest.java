@@ -288,4 +288,182 @@ class Phase12PersistenceIntegrationTest {
 
         System.out.println("  PASSED: Next index correctly restored after restart");
     }
+
+    // ===== Complete Acceptance Test =====
+    // START → WRITE → SNAPSHOT → MORE WRITE → CAPTURE STATE → COMPACT → SHUTDOWN →
+    // RESTART → AUTO RECOVER → VERIFY EXACT STATE → WRITE → RESTART AGAIN → VERIFY
+
+    @Test
+    void testCompletePersistenceLifecycleWithSnapshotAndCompact() throws Exception {
+        System.out.println("=== COMPLETE ACCEPTANCE TEST ===");
+        System.out.println("START → WRITE → SNAPSHOT → MORE WRITE → CAPTURE STATE → " +
+                         "COMPACT → SHUTDOWN → RESTART → AUTO RECOVER → VERIFY EXACT STATE → " +
+                         "WRITE → RESTART AGAIN → VERIFY");
+
+        int port = 57000 + (int)(System.currentTimeMillis() % 1000);
+
+        // ===== Setup: Create directories =====
+        Path metadataFile = dataDir.resolve("metadata-complete.json");
+        Path raftStateDir = dataDir.resolve("raft-state-complete");
+        Files.createDirectories(raftStateDir);
+
+        // Create cluster config
+        ClusterConfig config = new ClusterConfig("test-cluster", "node1", "127.0.0.1", port, null);
+
+        // ===== PHASE 1: Start server, write initial data =====
+        System.out.println("\n[PHASE 1] Start server, write initial data");
+        MetadataServer server1 = new MetadataServer(port, metadataFile, 2, 6000, 2000, config, raftStateDir);
+        MetadataStore store1 = server1.getMetadataStore();
+        RaftNode raftNode1 = server1.getRaftNode();
+
+        // Wait for leader election
+        Thread.sleep(500);
+
+        // Create objects A, B, C
+        for (String name : List.of("A", "B", "C")) {
+            ObjectMetadata obj = new ObjectMetadata(name, name.hashCode(), 4096);
+            obj.addChunk(new ChunkInfo("chunk-" + name, 0, 500, List.of("node1", "node2"), "hash-" + name));
+            store1.createObject(obj);
+        }
+        System.out.println("  Created 3 objects: A, B, C");
+        assertEquals(3, store1.listObjects().size());
+
+        // ===== PHASE 2: Take snapshot =====
+        System.out.println("\n[PHASE 2] Take snapshot");
+        long snapshotIndex = 3; // After 3 entries
+        raftNode1.compactLog(snapshotIndex);
+        System.out.println("  Snapshot taken at index " + snapshotIndex);
+
+        // ===== PHASE 3: Write more data =====
+        System.out.println("\n[PHASE 3] Write more data (D, E, F)");
+        for (String name : List.of("D", "E", "F")) {
+            ObjectMetadata obj = new ObjectMetadata(name, name.hashCode(), 4096);
+            obj.addChunk(new ChunkInfo("chunk-" + name, 0, 500, List.of("node1", "node2"), "hash-" + name));
+            store1.createObject(obj);
+        }
+        System.out.println("  Now have 6 objects: A, B, C, D, E, F");
+        assertEquals(6, store1.listObjects().size());
+
+        // Capture exact state for later verification
+        Map<String, Long> expectedFileSizes = new HashMap<>();
+        Map<String, List<String>> expectedChunkIds = new HashMap<>();
+        for (String name : store1.listObjects()) {
+            ObjectMetadata obj = store1.getObject(name).orElseThrow();
+            expectedFileSizes.put(name, obj.getFileSize());
+            expectedChunkIds.put(name, new ArrayList<>(obj.getChunks().stream()
+                    .map(ChunkInfo::getChunkId)
+                    .toList()));
+        }
+        System.out.println("  Captured state: " + expectedFileSizes);
+
+        // Capture log index for verification
+        long lastLogIndex = raftNode1.getRaftLog().getLastLogIndex();
+        System.out.println("  Last log index: " + lastLogIndex);
+
+        // ===== PHASE 4: Compact again (through index 6) =====
+        System.out.println("\n[PHASE 4] Compact through index 6");
+        raftNode1.compactLog(6);
+        System.out.println("  Compacted through index 6");
+
+        // ===== PHASE 5: SHUTDOWN =====
+        System.out.println("\n[PHASE 5] SHUTDOWN");
+        server1.stop();
+        Thread.sleep(300);
+        System.out.println("  Server stopped");
+
+        // ===== PHASE 6: RESTART with automatic recovery =====
+        System.out.println("\n[PHASE 6] RESTART (automatic recovery)");
+        MetadataServer server2 = new MetadataServer(port, metadataFile, 2, 6000, 2000, config, raftStateDir);
+        MetadataStore store2 = server2.getMetadataStore();
+        RaftNode raftNode2 = server2.getRaftNode();
+
+        Thread.sleep(500);
+        System.out.println("  Server restarted");
+
+        // ===== PHASE 7: VERIFY EXACT STATE after restart =====
+        System.out.println("\n[PHASE 7] VERIFY EXACT STATE after restart");
+
+        // Check object count
+        Collection<String> objectsAfterRestart = store2.listObjects();
+        assertEquals(6, objectsAfterRestart.size(),
+            "Should have 6 objects after restart, got " + objectsAfterRestart.size());
+
+        // Verify each object's file size
+        for (String name : List.of("A", "B", "C", "D", "E", "F")) {
+            ObjectMetadata obj = store2.getObject(name)
+                .orElseThrow(() -> new AssertionError("Object " + name + " should exist after restart"));
+            assertEquals(expectedFileSizes.get(name), obj.getFileSize(),
+                "File size mismatch for " + name + " after restart");
+            List<String> chunkIds = new ArrayList<>(obj.getChunks().stream()
+                    .map(ChunkInfo::getChunkId)
+                    .toList());
+            assertEquals(expectedChunkIds.get(name), chunkIds,
+                "Chunk IDs mismatch for " + name + " after restart");
+        }
+        System.out.println("  All 6 objects verified with exact file sizes and chunk IDs");
+
+        // Verify log state
+        RaftLog raftLog2 = raftNode2.getRaftLog();
+        long logStartIndex = raftLog2.getLogStartIndex();
+        assertTrue(logStartIndex >= 7, "logStartIndex should be >= 7 after compacting through 6");
+
+        // ===== PHASE 8: Write after restart =====
+        System.out.println("\n[PHASE 8] Write after restart (G, H)");
+        for (String name : List.of("G", "H")) {
+            ObjectMetadata obj = new ObjectMetadata(name, name.hashCode(), 4096);
+            obj.addChunk(new ChunkInfo("chunk-" + name, 0, 500, List.of("node1", "node2"), "hash-" + name));
+            store2.createObject(obj);
+        }
+        System.out.println("  Now have 8 objects");
+        assertEquals(8, store2.listObjects().size());
+
+        // Take a new snapshot to include G and H
+        System.out.println("\n[PHASE 8b] Take snapshot after G, H");
+        long currentLogIndex = raftNode2.getRaftLog().getLastLogIndex();
+        raftNode2.compactLog(currentLogIndex);
+        System.out.println("  Snapshot taken at index " + currentLogIndex);
+
+        // Capture state before second restart
+        Map<String, Long> stateBeforeRestart2 = new HashMap<>();
+        for (String name : store2.listObjects()) {
+            ObjectMetadata obj = store2.getObject(name).orElseThrow();
+            stateBeforeRestart2.put(name, obj.getFileSize());
+        }
+
+        // ===== PHASE 9: RESTART AGAIN =====
+        System.out.println("\n[PHASE 9] RESTART AGAIN");
+        server2.stop();
+        Thread.sleep(300);
+
+        MetadataServer server3 = new MetadataServer(port, metadataFile, 2, 6000, 2000, config, raftStateDir);
+        MetadataStore store3 = server3.getMetadataStore();
+
+        Thread.sleep(500);
+        System.out.println("  Server restarted again");
+
+        // ===== PHASE 10: VERIFY after second restart =====
+        System.out.println("\n[PHASE 10] VERIFY after second restart");
+
+        Collection<String> objectsAfterRestart2 = store3.listObjects();
+        assertEquals(8, objectsAfterRestart2.size(),
+            "Should have 8 objects after second restart, got " + objectsAfterRestart2.size());
+
+        for (String name : stateBeforeRestart2.keySet()) {
+            ObjectMetadata obj = store3.getObject(name)
+                .orElseThrow(() -> new AssertionError("Object " + name + " should exist after second restart"));
+            assertEquals(stateBeforeRestart2.get(name), obj.getFileSize(),
+                "File size mismatch for " + name + " after second restart");
+        }
+        System.out.println("  All 8 objects verified");
+
+        // Cleanup
+        server3.stop();
+
+        System.out.println("\n=== COMPLETE ACCEPTANCE TEST PASSED ===");
+        System.out.println("All 10 phases completed successfully:");
+        System.out.println("  ✓ START → WRITE → SNAPSHOT → MORE WRITE");
+        System.out.println("  ✓ CAPTURE STATE → COMPACT → SHUTDOWN");
+        System.out.println("  ✓ RESTART → AUTO RECOVER → VERIFY EXACT STATE");
+        System.out.println("  ✓ WRITE → RESTART AGAIN → VERIFY");
+    }
 }
