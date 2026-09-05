@@ -252,8 +252,9 @@ public class MetadataStore {
     /**
      * Creates a new object metadata entry.
      * @throws IllegalStateException if object already exists
+     * @throws IOException if persistence fails
      */
-    public void createObject(ObjectMetadata metadata) {
+    public void createObject(ObjectMetadata metadata) throws IOException {
         ObjectMetadata existing = objects.putIfAbsent(metadata.getObjectName(), metadata);
         if (existing != null) {
             throw new IllegalStateException("Object already exists: " + metadata.getObjectName());
@@ -271,8 +272,9 @@ public class MetadataStore {
     /**
      * Updates existing object metadata.
      * @throws IllegalArgumentException if object doesn't exist
+     * @throws IOException if persistence fails
      */
-    public void updateObject(ObjectMetadata metadata) {
+    public void updateObject(ObjectMetadata metadata) throws IOException {
         if (!objects.containsKey(metadata.getObjectName())) {
             throw new IllegalArgumentException("Object not found: " + metadata.getObjectName());
         }
@@ -283,8 +285,9 @@ public class MetadataStore {
     /**
      * Deletes object metadata.
      * @return true if object was deleted, false if it didn't exist
+     * @throws IOException if persistence fails
      */
-    public boolean deleteObject(String objectName) {
+    public boolean deleteObject(String objectName) throws IOException {
         boolean removed = objects.remove(objectName) != null;
         if (removed) {
             save();
@@ -330,21 +333,20 @@ public class MetadataStore {
     /**
      * Explicitly saves the current state to disk.
      * Used after batch operations (like snapshot restoration) to persist the final state.
+     *
+     * @throws IOException if the save fails - callers must handle this
      */
-    public void save() {
-        try {
-            objectMapper.writeValue(storageFile.toFile(), objects);
-        } catch (IOException e) {
-            System.err.println("Failed to save metadata: " + e.getMessage());
-        }
+    public void save() throws IOException {
+        objectMapper.writeValue(storageFile.toFile(), objects);
     }
 
     /**
      * Batch restore from a snapshot - clears existing state and rebuilds from snapshot.
      * More efficient than individual creates/updates as it saves only once at the end.
      * @param snapshotData Map of object name to ObjectMetadata
+     * @throws IOException if persistence fails
      */
-    public void restoreFromSnapshot(Map<String, ObjectMetadata> snapshotData) {
+    public void restoreFromSnapshot(Map<String, ObjectMetadata> snapshotData) throws IOException {
         // Clear existing state using direct method
         objects.clear();
 
@@ -536,7 +538,7 @@ public class MetadataStore {
      * @param chunkId the chunk ID
      * @param nodeId the new replica node ID to add
      */
-    public void updateChunkReplica(String objectName, String chunkId, String nodeId) {
+    public void updateChunkReplica(String objectName, String chunkId, String nodeId) throws IOException {
         ObjectMetadata metadata = objects.get(objectName);
         if (metadata == null) {
             return;

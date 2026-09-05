@@ -220,7 +220,7 @@ public class RepairManager {
     /**
      * Removes a node ID from all chunk replica lists (called when a node is permanently removed).
      */
-    public void removeNodeFromReplicas(String nodeId) {
+    public void removeNodeFromReplicas(String nodeId) throws IOException {
         for (String objectName : metadataStore.listObjects()) {
             ObjectMetadata metadata = metadataStore.getObject(objectName).orElse(null);
             if (metadata == null) continue;

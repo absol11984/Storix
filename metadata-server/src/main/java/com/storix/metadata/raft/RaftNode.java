@@ -838,19 +838,6 @@ public class RaftNode implements AutoCloseable {
                     metadataBackupFile = null;
                 }
 
-                // Step 2: Commit the candidate snapshot as the new authoritative snapshot.
-                // This makes the snapshot durable for the new generation.
-                snapshotManager.commitCandidateSnapshot(candidateSnapshotFile,
-                        pendingSnapshotIndex, pendingSnapshotTerm);
-                System.out.println("[RAFT] Candidate snapshot committed as new authoritative snapshot");
-
-                // Step 3: Write commit marker LAST - this is the atomic commit point.
-                // Only after this marker exists is the new generation authoritative.
-                // If we crash BEFORE this step, the old generation remains authoritative.
-                // If we crash AFTER this step, the new generation is authoritative.
-                snapshotManager.commitGeneration(pendingSnapshotIndex, pendingSnapshotTerm);
-                System.out.println("[RAFT] Commit marker written for generation " + pendingSnapshotIndex);
-
                 // Now that commit marker exists, update Raft boundary
                 raftLog.setSnapshotBoundary(pendingSnapshotIndex, pendingSnapshotTerm);
 

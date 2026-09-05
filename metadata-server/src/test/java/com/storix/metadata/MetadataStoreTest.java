@@ -43,7 +43,7 @@ class MetadataStoreTest {
     }
 
     @Test
-    void createDuplicateObject() {
+    void createDuplicateObject() throws IOException {
         ObjectMetadata metadata = new ObjectMetadata("duplicate.txt", 100, 50);
         store.createObject(metadata);
 
@@ -83,7 +83,7 @@ class MetadataStoreTest {
     }
 
     @Test
-    void deleteNonExistentObject() {
+    void deleteNonExistentObject() throws IOException {
         assertFalse(store.deleteObject("nonexistent.txt"));
     }
 

@@ -102,7 +102,11 @@ public class MetadataServer {
                 for (String name : new ArrayList<>(metadataStore.listObjects())) {
                     metadataStore.deleteObjectDirect(name);
                 }
-                metadataStore.save();
+                try {
+                    metadataStore.save();
+                } catch (IOException e) {
+                    throw new RuntimeException("Failed to clear metadata store before snapshot restore", e);
+                }
 
                 // Restore state from snapshot
                 snapshotManager.restoreFromSnapshot(snap, metadataStore);
@@ -161,7 +165,11 @@ public class MetadataServer {
                     for (String name : new ArrayList<>(metadataStore.listObjects())) {
                         metadataStore.deleteObjectDirect(name);
                     }
-                    metadataStore.save();
+                    try {
+                        metadataStore.save();
+                    } catch (IOException e) {
+                        throw new RuntimeException("Failed to clear metadata store before WAL rebuild", e);
+                    }
 
                     raftLog.loadEntries(
                         recoveryData.entries,
