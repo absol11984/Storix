@@ -89,7 +89,11 @@ public class RaftNode implements AutoCloseable {
 
     @FunctionalInterface
     public interface LogEntryApplier {
-        void apply(LogEntry entry);
+        /**
+         * Applies a log entry to the state machine.
+         * @throws IOException if application fails - this will cause InstallSnapshot to return failure
+         */
+        void apply(LogEntry entry) throws IOException;
     }
 
     // Additional constructor for when WAL is managed externally
@@ -507,13 +511,18 @@ public class RaftNode implements AutoCloseable {
 
         // Check if previous log entry matches
         if (prevLogIndex > 0) {
-            if (prevLogIndex > raftLog.getLastLogIndex()) {
-                return new RaftMessage.AppendEntriesResponse(currentTerm, false, 0);
+            // If prevLogIndex is within the snapshot range (before logStartIndex),
+            // the follower has this state via the installed snapshot - consider it a match
+            if (prevLogIndex >= raftLog.getLogStartIndex()) {
+                if (prevLogIndex > raftLog.getLastLogIndex()) {
+                    return new RaftMessage.AppendEntriesResponse(currentTerm, false, 0);
+                }
+                if (!raftLog.containsEntry(prevLogIndex, prevLogTerm)) {
+                    // Log inconsistency - truncate
+                    return new RaftMessage.AppendEntriesResponse(currentTerm, false, 0);
+                }
             }
-            if (!raftLog.containsEntry(prevLogIndex, prevLogTerm)) {
-                // Log inconsistency - truncate
-                return new RaftMessage.AppendEntriesResponse(currentTerm, false, 0);
-            }
+            // If prevLogIndex < logStartIndex, it's in the snapshot range - considered a match
         }
 
         // Append new entries (this handles conflicts by overwriting)
@@ -582,8 +591,9 @@ public class RaftNode implements AutoCloseable {
                 // Ensure state directory exists
                 Files.createDirectories(stateDir);
 
-                // Create temporary file for assembling snapshot
-                pendingSnapshotFile = stateDir.resolve("snapshot-transfer-" + System.currentTimeMillis() + ".tmp");
+                // Create temporary file for assembling snapshot (without extension to avoid issues)
+                String filename = "snapshot-transfer-" + System.nanoTime();
+                pendingSnapshotFile = stateDir.resolve(filename);
                 pendingSnapshotOffset = 0;
                 pendingSnapshotIndex = lastIncludedIndex;
                 pendingSnapshotTerm = lastIncludedTerm;
@@ -608,20 +618,21 @@ public class RaftNode implements AutoCloseable {
         // Write chunk at correct offset
         if (data != null && data.length > 0) {
             try {
-                // Ensure file is large enough
                 Path tempFile = pendingSnapshotFile;
-                long neededSize = offset + data.length;
-                long currentSize = Files.size(tempFile);
 
-                if (currentSize < neededSize) {
-                    // Extend file
-                    try (FileOutputStream fos = new FileOutputStream(tempFile.toFile(), true)) {
-                        long padding = neededSize - currentSize;
-                        fos.write(new byte[(int) Math.min(padding, 8192)]);
-                    }
+                // Validate offset is sequential (must match expected next offset)
+                // This ensures no gaps or overlapping chunks in the transfer
+                if (offset < 0 || offset > 100 * 1024 * 1024) { // Max 100MB
+                    throw new IOException("Invalid offset: " + offset);
+                }
+                if (offset != pendingSnapshotOffset) {
+                    // Offset must be sequential - this chunk must start where the last one ended
+                    throw new IOException("Out-of-order snapshot chunk: expected offset " +
+                            pendingSnapshotOffset + ", got " + offset);
                 }
 
-                // Write chunk at correct offset
+                // Use RandomAccessFile to write at specific offset
+                // This will create the file if it doesn't exist
                 try (RandomAccessFile raf = new RandomAccessFile(tempFile.toFile(), "rw")) {
                     raf.seek(offset);
                     raf.write(data);
@@ -644,7 +655,7 @@ public class RaftNode implements AutoCloseable {
                 System.out.println("[RAFT] All chunks received, installing snapshot: index=" +
                         pendingSnapshotIndex + ", term=" + pendingSnapshotTerm);
 
-                // Read complete snapshot data
+                // Read complete snapshot data from temp file
                 byte[] completeData = Files.readAllBytes(pendingSnapshotFile);
 
                 // Validate the snapshot data
@@ -662,27 +673,42 @@ public class RaftNode implements AutoCloseable {
                     System.out.println("[RAFT] Snapshot checksum validated: " + computedChecksum);
                 }
 
-                // APPLY SNAPSHOT TO STATE MACHINE FIRST
-                // Only after successful application, update the boundary
+                // STEP 1: PERSIST DURABLE SNAPSHOT FIRST
+                // This must succeed before any other changes
+                // Uses atomic write: temp file -> fsync -> rename
+                if (snapshotManager != null) {
+                    snapshotManager.installSnapshot(completeData, pendingSnapshotIndex,
+                            pendingSnapshotTerm, pendingChecksum);
+                    System.out.println("[RAFT] Durable snapshot persisted");
+                } else {
+                    throw new IOException("SnapshotManager not configured - cannot persist snapshot");
+                }
+
+                // STEP 2: RESTORE STATE MACHINE FROM SNAPSHOT DATA
+                // Only after durable snapshot is written
                 if (stateMachineApplier != null) {
-                    // Create a special snapshot entry to trigger state machine restoration
                     LogEntry snapshotEntry = new LogEntry(pendingSnapshotTerm, pendingSnapshotIndex,
                             System.currentTimeMillis(), LogEntry.OpType.SNAPSHOT_RESTORE, completeData);
                     stateMachineApplier.accept(snapshotEntry);
+                    System.out.println("[RAFT] State machine restored");
                 }
 
-                // NOW update the snapshot boundary in RaftLog
-                // This is done AFTER successful state machine restoration
+                // STEP 3: UPDATE RAFT BOUNDARY
+                // Only after state machine is restored
                 raftLog.setSnapshotBoundary(pendingSnapshotIndex, pendingSnapshotTerm);
 
                 // Advance commit index to include the snapshot
                 if (pendingSnapshotIndex > raftLog.getCommitIndex()) {
                     raftLog.advanceCommitIndex(pendingSnapshotIndex);
                 }
+                raftLog.advanceLastApplied();
 
-                // Compact WAL through snapshot boundary
+                // STEP 4: COMPACT WAL THROUGH SNAPSHOT BOUNDARY
+                // Only after durable snapshot and boundary are set
+                // This is safe because snapshot is already persisted
                 if (wal != null) {
                     wal.compact(pendingSnapshotIndex, raftLog.getCommitIndex(), currentTerm, votedFor);
+                    System.out.println("[RAFT] WAL compacted");
                 }
 
                 System.out.println("[RAFT] Snapshot installed successfully, logStartIndex=" +
@@ -698,7 +724,11 @@ public class RaftNode implements AutoCloseable {
                 // Return success=false to signal leader to retry
                 return new RaftMessage.InstallSnapshotResponse(currentTerm, false, 0);
             } finally {
-                cleanupPendingSnapshot();
+                // Clean up temp file AFTER durable snapshot is written
+                // DO NOT clean up if installation failed - temp file might be needed for debugging
+                if (transferInProgress) {
+                    cleanupPendingSnapshot();
+                }
             }
         }
 
@@ -854,9 +884,10 @@ public class RaftNode implements AutoCloseable {
                 }
 
                 var snapshot = snapshotOpt.get();
-                byte[] data = Files.readAllBytes(snapshot.filePath());
+                // Use the extracted state data, not the raw file bytes (which include binary header)
+                byte[] data = snapshot.stateData();
 
-                // Compute checksum of complete snapshot
+                // Compute checksum of state data (NOT file bytes)
                 int checksum = computeChecksum(data);
 
                 // Send snapshot in chunks
@@ -868,8 +899,9 @@ public class RaftNode implements AutoCloseable {
                     System.arraycopy(data, (int) offset, chunk, 0, len);
                     boolean done = offset + len >= data.length;
 
-                    // Send checksum only with final chunk (done=true)
-                    int chunkChecksum = done ? checksum : 0;
+                    // Send checksum with FIRST chunk so follower knows expected checksum for complete snapshot
+                    // For multi-chunk transfers, the follower needs the checksum upfront
+                    int chunkChecksum = (offset == 0) ? checksum : 0;
 
                     // Use the snapshot's actual lastIncludedTerm, not current term approximation
                     RaftMessage.InstallSnapshot request = new RaftMessage.InstallSnapshot(
@@ -1282,7 +1314,7 @@ public class RaftNode implements AutoCloseable {
         reqBuf.putLong(is.offset());
         writeLengthPrefixedBytes(reqBuf, is.data());
         reqBuf.put(is.done() ? (byte) 1 : (byte) 0);
-        // Send checksum with final chunk
+        // Send checksum - with FIRST chunk for multi-chunk, follower retains it for validation
         reqBuf.putInt(is.checksum());
         reqBuf.flip();
         writeFully(channel, reqBuf);
@@ -1335,14 +1367,12 @@ public class RaftNode implements AutoCloseable {
         doneBuf.flip();
         boolean done = doneBuf.get() == 1;
 
-        // Read checksum (4 bytes, may be 0 if not provided)
-        int checksum = 0;
-        if (done) {
-            ByteBuffer checksumBuf = ByteBuffer.allocate(4);
-            readFully(channel, checksumBuf);
-            checksumBuf.flip();
-            checksum = checksumBuf.getInt();
-        }
+        // Read checksum (4 bytes) - sent with FIRST chunk for multi-chunk transfers
+        // so follower knows the expected checksum for the complete snapshot
+        ByteBuffer checksumBuf = ByteBuffer.allocate(4);
+        readFully(channel, checksumBuf);
+        checksumBuf.flip();
+        int checksum = checksumBuf.getInt();
 
         // Handle request
         RaftMessage.InstallSnapshotResponse response = handleInstallSnapshot(

@@ -657,9 +657,17 @@ public class WAL implements AutoCloseable {
             try {
                 recoveryResult = recover();
             } catch (WALRecoveryException e) {
-                // WAL may be truncated - start fresh with state
-                System.out.println("[WAL] WAL recovery error during compaction, starting fresh: " + e.getMessage());
-                recoveryResult = WALRecoveryResult.truncated(List.of(), term, votedFor, commitIndex, 0, e.getMessage());
+                // Distinguish between recoverable truncation and unrecoverable corruption.
+                // TRUNCATED_TAIL: WAL was cleanly cut at end - recoverable, start fresh.
+                // All other statuses: INTERNAL CORRUPTION - must not silently lose data.
+                if (e.getStatus() == WALRecoveryException.RecoveryStatus.TRUNCATED_TAIL) {
+                    System.out.println("[WAL] WAL truncated during compaction, starting fresh: " + e.getMessage());
+                    recoveryResult = WALRecoveryResult.truncated(List.of(), term, votedFor, commitIndex, 0, e.getMessage());
+                } else {
+                    // Internal corruption - re-throw to avoid silent data loss
+                    System.err.println("[WAL] WAL internal corruption during compaction, refusing to compact: " + e.getMessage());
+                    throw e;
+                }
             }
             List<LogEntry> allEntries = recoveryResult.entries;
 

@@ -410,6 +410,84 @@ public class SnapshotManager {
     }
 
     /**
+     * Installs a received snapshot from remote leader.
+     * Writes the snapshot atomically to ensure durability.
+     * This is used during InstallSnapshot RPC to persist the received snapshot.
+     *
+     * @param stateData The complete state data (JSON) to store in the snapshot
+     * @param lastIncludedIndex The last log index included in this snapshot
+     * @param lastIncludedTerm The term of the entry at lastIncludedIndex
+     * @param expectedChecksum The expected CRC32 checksum (0 to skip validation)
+     * @return The installed snapshot
+     * @throws IOException if installation fails
+     */
+    public Snapshot installSnapshot(byte[] stateData, long lastIncludedIndex,
+                                   long lastIncludedTerm, int expectedChecksum) throws IOException {
+        // Validate checksum if provided
+        if (expectedChecksum != 0) {
+            int computedChecksum = computeChecksum(stateData);
+            if (computedChecksum != expectedChecksum) {
+                throw new IOException("Snapshot checksum mismatch: expected " +
+                        expectedChecksum + ", computed " + computedChecksum);
+            }
+        }
+
+        // Validate state data
+        if (stateData == null || stateData.length == 0) {
+            throw new IOException("Snapshot state data is empty");
+        }
+
+        Files.createDirectories(snapshotDir);
+
+        // Write to temp file, then atomic rename
+        String filename = SNAPSHOT_PREFIX + lastIncludedIndex;
+        Path snapshotFile = snapshotDir.resolve(filename);
+        Path tempFile = snapshotDir.resolve(filename + ".tmp");
+
+        // Compute checksum for the snapshot file
+        int checksum = computeChecksum(stateData);
+
+        try (FileOutputStream fos = new FileOutputStream(tempFile.toFile());
+             FileChannel fc = fos.getChannel()) {
+
+            // Format:
+            // MAGIC(8) + VERSION(4) = 12 bytes header
+            // LAST_INCLUDED_INDEX(8) + LAST_INCLUDED_TERM(8) = 16 bytes
+            // STATE_LENGTH(4) + STATE(N) + CHECKSUM(4)
+            ByteBuffer headerBuf = ByteBuffer.allocate(12 + 16 + 4);
+            headerBuf.putLong(SNAPSHOT_MAGIC);
+            headerBuf.putInt(SNAPSHOT_VERSION);
+            headerBuf.putLong(lastIncludedIndex);
+            headerBuf.putLong(lastIncludedTerm);
+            headerBuf.putInt(stateData.length);
+            headerBuf.flip();
+            fc.write(headerBuf);
+
+            // Write state data
+            fc.write(ByteBuffer.wrap(stateData));
+
+            // Write checksum
+            ByteBuffer checksumBuf = ByteBuffer.allocate(4);
+            checksumBuf.putInt(checksum);
+            checksumBuf.flip();
+            fc.write(checksumBuf);
+
+            fc.force(true);
+        }
+
+        // Atomic rename - this is the durable commit point
+        Files.move(tempFile, snapshotFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+
+        System.out.println("[SNAPSHOT] Installed snapshot at index " + lastIncludedIndex +
+                ", term " + lastIncludedTerm + ", checksum " + checksum);
+
+        // Cleanup old snapshots
+        cleanupOldSnapshots();
+
+        return new Snapshot(lastIncludedIndex, lastIncludedTerm, snapshotFile, stateData);
+    }
+
+    /**
      * Represents a snapshot with its metadata.
      */
     public static class Snapshot {

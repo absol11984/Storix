@@ -260,7 +260,9 @@ public class MetadataServer {
                     try {
                         stateMachine.apply(entry);
                     } catch (IOException e) {
-                        System.err.println("[SERVER] Failed to apply entry: " + e.getMessage());
+                        // Re-throw as RuntimeException to propagate failure to InstallSnapshot handler
+                        // This is critical: snapshot restore failures must cause success=false
+                        throw new RuntimeException("State machine apply failed: " + e.getMessage(), e);
                     }
                 }
             });

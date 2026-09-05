@@ -12,7 +12,7 @@
     <property name="sun.java.launcher" value="SUN_STANDARD"/>
     <property name="user.country" value="US"/>
     <property name="sun.boot.library.path" value="/usr/lib/jvm/java-21-openjdk-amd64/lib"/>
-    <property name="sun.java.command" value="/home/arceus/Storix/storage-node/target/surefire/surefirebooter-20260905194031476_3.jar /home/arceus/Storix/storage-node/target/surefire 2026-09-05T19-40-31_427-jvmRun1 surefire-20260905194031476_1tmp surefire_0-20260905194031476_2tmp"/>
+    <property name="sun.java.command" value="/home/arceus/Storix/storage-node/target/surefire/surefirebooter-20260905223814937_3.jar /home/arceus/Storix/storage-node/target/surefire 2026-09-05T22-38-14_877-jvmRun1 surefire-20260905223814937_1tmp surefire_0-20260905223814937_2tmp"/>
     <property name="jdk.debug" value="release"/>
     <property name="surefire.test.class.path" value="/home/arceus/Storix/storage-node/target/test-classes:/home/arceus/Storix/storage-node/target/classes:/home/arceus/.m2/repository/org/junit/jupiter/junit-jupiter/5.10.1/junit-jupiter-5.10.1.jar:/home/arceus/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.10.1/junit-jupiter-api-5.10.1.jar:/home/arceus/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar:/home/arceus/.m2/repository/org/junit/platform/junit-platform-commons/1.10.1/junit-platform-commons-1.10.1.jar:/home/arceus/.m2/repository/org/apiguardian/apiguardian-api/1.1.2/apiguardian-api-1.1.2.jar:/home/arceus/.m2/repository/org/junit/jupiter/junit-jupiter-params/5.10.1/junit-jupiter-params-5.10.1.jar:/home/arceus/.m2/repository/org/junit/jupiter/junit-jupiter-engine/5.10.1/junit-jupiter-engine-5.10.1.jar:/home/arceus/.m2/repository/org/junit/platform/junit-platform-engine/1.10.1/junit-platform-engine-1.10.1.jar:"/>
     <property name="sun.cpu.endian" value="little"/>
@@ -27,7 +27,7 @@
     <property name="line.separator" value="&#10;"/>
     <property name="java.specification.name" value="Java Platform API Specification"/>
     <property name="java.vm.specification.vendor" value="Oracle Corporation"/>
-    <property name="surefire.real.class.path" value="/home/arceus/Storix/storage-node/target/surefire/surefirebooter-20260905194031476_3.jar"/>
+    <property name="surefire.real.class.path" value="/home/arceus/Storix/storage-node/target/surefire/surefirebooter-20260905223814937_3.jar"/>
     <property name="sun.management.compiler" value="HotSpot 64-Bit Tiered Compilers"/>
     <property name="java.runtime.version" value="21.0.12+8-1-26.04-Ubuntu"/>
     <property name="user.name" value="arceus"/>
@@ -54,12 +54,12 @@
     <property name="java.class.version" value="65.0"/>
   </properties>
   <testcase name="deleteChunk" classname="com.storix.storage.ChunkStorageTest" time="0.003"/>
-  <testcase name="emptyChunk" classname="com.storix.storage.ChunkStorageTest" time="0.002"/>
-  <testcase name="putOverwritesExisting" classname="com.storix.storage.ChunkStorageTest" time="0.003"/>
-  <testcase name="chunkExists" classname="com.storix.storage.ChunkStorageTest" time="0.002"/>
+  <testcase name="emptyChunk" classname="com.storix.storage.ChunkStorageTest" time="0.001"/>
+  <testcase name="putOverwritesExisting" classname="com.storix.storage.ChunkStorageTest" time="0.002"/>
+  <testcase name="chunkExists" classname="com.storix.storage.ChunkStorageTest" time="0.001"/>
   <testcase name="sanitizesChunkId" classname="com.storix.storage.ChunkStorageTest" time="0.002"/>
-  <testcase name="getNonExistentChunk" classname="com.storix.storage.ChunkStorageTest" time="0.002"/>
+  <testcase name="getNonExistentChunk" classname="com.storix.storage.ChunkStorageTest" time="0.003"/>
   <testcase name="deleteNonExistentChunk" classname="com.storix.storage.ChunkStorageTest" time="0.002"/>
   <testcase name="putAndGetChunk" classname="com.storix.storage.ChunkStorageTest" time="0.003"/>
-  <testcase name="largeChunk" classname="com.storix.storage.ChunkStorageTest" time="0.011"/>
+  <testcase name="largeChunk" classname="com.storix.storage.ChunkStorageTest" time="0.012"/>
 </testsuite>

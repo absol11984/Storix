@@ -2,11 +2,14 @@
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/MetadataStoreTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/NodeRegistryTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/PlacementManagerTest.java
+/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/InstallSnapshotIntegrationTest.java
+/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/InstallSnapshotPersistenceTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RaftClusterIntegrationTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RaftLogCompactionTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RaftLogRepeatedCompactionTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RaftLogTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RaftStateTest.java
+/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RecoveredRaftLogValidationTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/DebugCompactTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/DebugCompactTest2.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/DebugHeaderTest.java
