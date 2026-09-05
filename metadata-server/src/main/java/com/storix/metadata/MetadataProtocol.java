@@ -30,6 +30,7 @@ public final class MetadataProtocol {
     public static final byte OK = 0;
     public static final byte ERROR = 1;
     public static final byte NOT_FOUND = 2;
+    public static final byte NOT_LEADER = 3;
 
     private MetadataProtocol() {}
 

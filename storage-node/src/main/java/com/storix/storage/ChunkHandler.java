@@ -74,11 +74,35 @@ public class ChunkHandler {
                 }
                 case Protocol.GET_CHUNK -> {
                     byte[] data = storage.getChunk(request.chunkId());
+
+                    // Verify checksum if provided
+                    String expectedChecksum = request.expectedChecksum();
+                    if (expectedChecksum != null && !expectedChecksum.isEmpty()) {
+                        if (!storage.verifyIntegrity(request.chunkId(), expectedChecksum)) {
+                            // Chunk is corrupted - quarantine it
+                            storage.quarantineCorruptChunk(request.chunkId());
+                            yield ChunkResponse.error("CHUNK_CORRUPTED: " + request.chunkId());
+                        }
+                    }
+
                     yield ChunkResponse.ok(data);
                 }
                 case Protocol.DELETE_CHUNK -> {
                     storage.deleteChunk(request.chunkId());
                     yield ChunkResponse.ok(new byte[0]);
+                }
+                case Protocol.VERIFY_CHUNK -> {
+                    // Explicit integrity check
+                    String expectedChecksum = request.expectedChecksum();
+                    if (expectedChecksum == null || expectedChecksum.isEmpty()) {
+                        yield ChunkResponse.error("VERIFY_CHUNK requires checksum");
+                    }
+                    if (storage.verifyIntegrity(request.chunkId(), expectedChecksum)) {
+                        yield ChunkResponse.ok(new byte[0]);
+                    } else {
+                        storage.quarantineCorruptChunk(request.chunkId());
+                        yield ChunkResponse.error("CHUNK_CORRUPTED: " + request.chunkId());
+                    }
                 }
                 default -> ChunkResponse.error("Unknown opcode: " + request.opcode());
             };

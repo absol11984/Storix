@@ -1,6 +1,7 @@
 package com.storix.client;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -14,11 +15,23 @@ import java.util.List;
  */
 public class StorixClient implements AutoCloseable {
 
-    private final MetadataClient metadataClient;
+    private final ClusterMetadataClient metadataClient;
     private final Chunker chunker;
 
+    /**
+     * Creates a client with a single metadata server (backward compatible).
+     */
     public StorixClient(String metadataHost, int metadataPort, int chunkSize) {
-        this.metadataClient = new MetadataClient(metadataHost, metadataPort);
+        this.metadataClient = new ClusterMetadataClient(
+                List.of(new InetSocketAddress(metadataHost, metadataPort)));
+        this.chunker = new Chunker(chunkSize);
+    }
+
+    /**
+     * Creates a client with multiple metadata servers for failover.
+     */
+    public StorixClient(List<InetSocketAddress> metadataServers, int chunkSize) {
+        this.metadataClient = new ClusterMetadataClient(metadataServers);
         this.chunker = new Chunker(chunkSize);
     }
 
@@ -233,7 +246,7 @@ public class StorixClient implements AutoCloseable {
         return metadataClient.listObjects();
     }
 
-    public MetadataClient getMetadataClient() {
+    public ClusterMetadataClient getMetadataClient() {
         return metadataClient;
     }
 

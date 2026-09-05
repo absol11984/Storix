@@ -6,42 +6,111 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.*;
 
 /**
  * Manages automatic repair of under-replicated chunks.
  * Detects degraded chunks and re-replicates from a healthy source to a healthy destination.
+ * Uses bounded concurrency to limit the number of simultaneous repair operations.
  */
 public class RepairManager {
+
+    private static final int DEFAULT_MAX_CONCURRENT_REPAIRS = 4;
 
     private final MetadataStore metadataStore;
     private final NodeRegistry nodeRegistry;
     private final PlacementManager placementManager;
+    private final Semaphore repairSemaphore;
+    private final ExecutorService repairExecutor;
 
+    /**
+     * Creates a RepairManager with default max concurrent repairs (4).
+     */
     public RepairManager(MetadataStore metadataStore, NodeRegistry nodeRegistry, PlacementManager placementManager) {
+        this(metadataStore, nodeRegistry, placementManager, DEFAULT_MAX_CONCURRENT_REPAIRS);
+    }
+
+    /**
+     * Creates a RepairManager with custom max concurrent repairs.
+     */
+    public RepairManager(MetadataStore metadataStore, NodeRegistry nodeRegistry,
+                        PlacementManager placementManager, int maxConcurrentRepairs) {
         this.metadataStore = metadataStore;
         this.nodeRegistry = nodeRegistry;
         this.placementManager = placementManager;
+        this.repairSemaphore = new Semaphore(maxConcurrentRepairs);
+        this.repairExecutor = Executors.newFixedThreadPool(maxConcurrentRepairs,
+                r -> {
+                    Thread t = new Thread(r, "repair-worker");
+                    t.setDaemon(true);
+                    return t;
+                });
+    }
+
+    /**
+     * Returns the max concurrent repairs limit.
+     */
+    public int getMaxConcurrentRepairs() {
+        return repairSemaphore.availablePermits();
     }
 
     /**
      * Scans all objects for under-replicated chunks and repairs them.
+     * Uses bounded concurrency to limit simultaneous repairs.
      * @return summary of repair actions
      */
     public RepairResult repairAll() {
-        int chunksScanned = 0;
+        // First, collect all repair tasks
+        List<RepairTask> tasks = collectRepairTasks();
+
+        if (tasks.isEmpty()) {
+            return new RepairResult(0, 0, 0, 0);
+        }
+
+        // Execute repairs with bounded concurrency
+        int chunksScanned = tasks.size();
         int chunksRepaired = 0;
         int chunksFailed = 0;
-        int chunksAlreadyHealthy = 0;
+
+        List<Future<RepairOutcome>> futures = new ArrayList<>();
+        for (RepairTask task : tasks) {
+            Future<RepairOutcome> future = repairExecutor.submit(() -> repairChunk(task));
+            futures.add(future);
+        }
+
+        // Wait for all repairs to complete
+        for (Future<RepairOutcome> future : futures) {
+            try {
+                RepairOutcome outcome = future.get(30, TimeUnit.SECONDS);
+                if (outcome == RepairOutcome.SUCCESS) {
+                    chunksRepaired++;
+                } else if (outcome == RepairOutcome.FAILED) {
+                    chunksFailed++;
+                }
+            } catch (ExecutionException e) {
+                chunksFailed++;
+            } catch (TimeoutException e) {
+                chunksFailed++;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        return new RepairResult(chunksScanned, chunksRepaired, chunksFailed, 0);
+    }
+
+    /**
+     * Collects all repair tasks from metadata.
+     */
+    private List<RepairTask> collectRepairTasks() {
+        List<RepairTask> tasks = new ArrayList<>();
 
         for (String objectName : metadataStore.listObjects()) {
             ObjectMetadata metadata = metadataStore.getObject(objectName).orElse(null);
             if (metadata == null) continue;
 
-            boolean objectModified = false;
-
             for (ChunkInfo chunk : metadata.getChunks()) {
-                chunksScanned++;
-
                 // Filter replica nodes to only those currently healthy
                 List<String> healthyReplicas = new ArrayList<>();
                 for (String nodeId : chunk.getReplicaNodeIds()) {
@@ -52,84 +121,100 @@ public class RepairManager {
                 }
 
                 if (healthyReplicas.size() >= placementManager.getReplicationFactor()) {
-                    chunksAlreadyHealthy++;
+                    // Already healthy
                     continue;
                 }
 
                 if (healthyReplicas.isEmpty()) {
-                    System.out.println("[REPAIR] chunk " + chunk.getChunkId() +
-                            " has NO healthy replicas — cannot repair");
-                    chunksFailed++;
+                    // Cannot repair - no healthy source
                     continue;
                 }
 
-                // Need to add replicas
+                // Add repair task
                 int needed = placementManager.getReplicationFactor() - healthyReplicas.size();
-
-                for (int i = 0; i < needed; i++) {
-                    // All existing replicas (healthy + unhealthy) to avoid placing on any of them
-                    List<String> allExisting = new ArrayList<>(chunk.getReplicaNodeIds());
-                    NodeInfo target = placementManager.selectRepairTarget(allExisting);
-
-                    if (target == null) {
-                        System.out.println("[REPAIR] chunk " + chunk.getChunkId() +
-                                " — no available target node for additional replica");
-                        chunksFailed++;
-                        break;
-                    }
-
-                    // Pick a healthy source
-                    String sourceNodeId = healthyReplicas.get(0);
-                    NodeInfo sourceNode = nodeRegistry.getNode(sourceNodeId).orElse(null);
-                    if (sourceNode == null) {
-                        chunksFailed++;
-                        continue;
-                    }
-
-                    System.out.println("[REPAIR] chunk " + chunk.getChunkId() +
-                            " source=" + sourceNodeId +
-                            " destination=" + target.getNodeId());
-
-                    try {
-                        // GET from source
-                        byte[] data = getChunkFromNode(sourceNode, chunk.getChunkId());
-
-                        // Verify checksum if present
-                        if (chunk.getChecksum() != null && !chunk.getChecksum().isEmpty()) {
-                            String actualChecksum = computeSha256(data);
-                            if (!actualChecksum.equals(chunk.getChecksum())) {
-                                System.out.println("[REPAIR] FAILED — source data checksum mismatch for " +
-                                        chunk.getChunkId());
-                                chunksFailed++;
-                                continue;
-                            }
-                        }
-
-                        // PUT to destination
-                        putChunkToNode(target, chunk.getChunkId(), data);
-
-                        // Update metadata only after successful copy
-                        chunk.getReplicaNodeIds().add(target.getNodeId());
-                        allExisting.add(target.getNodeId());
-                        objectModified = true;
-                        chunksRepaired++;
-
-                        System.out.println("[REPAIR] chunk " + chunk.getChunkId() +
-                                " SUCCESS — replicated to " + target.getNodeId());
-                    } catch (IOException e) {
-                        System.out.println("[REPAIR] FAILED — chunk " + chunk.getChunkId() +
-                                " error: " + e.getMessage());
-                        chunksFailed++;
-                    }
-                }
-            }
-
-            if (objectModified) {
-                metadataStore.updateObject(metadata);
+                tasks.add(new RepairTask(chunk.getChunkId(), objectName, healthyReplicas.get(0),
+                        chunk.getChecksum(), needed));
             }
         }
 
-        return new RepairResult(chunksScanned, chunksRepaired, chunksFailed, chunksAlreadyHealthy);
+        return tasks;
+    }
+
+    /**
+     * Repairs a single chunk with semaphore-based concurrency control.
+     */
+    private RepairOutcome repairChunk(RepairTask task) {
+        // Acquire semaphore permit
+        try {
+            repairSemaphore.acquire();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return RepairOutcome.FAILED;
+        }
+
+        try {
+            // Get source and target nodes
+            NodeInfo sourceNode = nodeRegistry.getNode(task.sourceNodeId).orElse(null);
+            if (sourceNode == null) {
+                return RepairOutcome.FAILED;
+            }
+
+            // Find the chunk metadata to get existing replicas
+            ObjectMetadata metadata = metadataStore.getObject(task.objectName).orElse(null);
+            if (metadata == null) {
+                return RepairOutcome.FAILED;
+            }
+
+            List<String> existingReplicas = new ArrayList<>();
+            for (ChunkInfo chunk : metadata.getChunks()) {
+                if (chunk.getChunkId().equals(task.chunkId)) {
+                    existingReplicas.addAll(chunk.getReplicaNodeIds());
+                    break;
+                }
+            }
+
+            // Find a target node (not currently hosting this chunk)
+            NodeInfo targetNode = placementManager.selectRepairTarget(existingReplicas);
+            if (targetNode == null) {
+                System.out.println("[REPAIR] FAILED — no available target node for " + task.chunkId);
+                return RepairOutcome.FAILED;
+            }
+
+            System.out.println("[REPAIR] chunk " + task.chunkId +
+                    " source=" + task.sourceNodeId +
+                    " destination=" + targetNode.getNodeId());
+
+            // GET from source
+            byte[] data = getChunkFromNode(sourceNode, task.chunkId);
+
+            // Verify checksum if present
+            if (task.checksum != null && !task.checksum.isEmpty()) {
+                String actualChecksum = computeSha256(data);
+                if (!actualChecksum.equals(task.checksum)) {
+                    System.out.println("[REPAIR] FAILED — source data checksum mismatch for " +
+                            task.chunkId);
+                    return RepairOutcome.FAILED;
+                }
+            }
+
+            // PUT to destination
+            putChunkToNode(targetNode, task.chunkId, data);
+
+            System.out.println("[REPAIR] chunk " + task.chunkId +
+                    " SUCCESS — replicated to " + targetNode.getNodeId());
+
+            // Update metadata to include the new replica
+            metadataStore.updateChunkReplica(task.objectName, task.chunkId, targetNode.getNodeId());
+
+            return RepairOutcome.SUCCESS;
+
+        } catch (IOException e) {
+            System.out.println("[REPAIR] FAILED — chunk " + task.chunkId +
+                    " error: " + e.getMessage());
+            return RepairOutcome.FAILED;
+        } finally {
+            repairSemaphore.release();
+        }
     }
 
     /**
@@ -263,4 +348,9 @@ public class RepairManager {
      * Summary of a repair run.
      */
     public record RepairResult(int chunksScanned, int chunksRepaired, int chunksFailed, int chunksAlreadyHealthy) {}
+
+    private enum RepairOutcome { SUCCESS, FAILED }
+
+    private record RepairTask(String chunkId, String objectName, String sourceNodeId,
+                              String checksum, int replicasNeeded) {}
 }

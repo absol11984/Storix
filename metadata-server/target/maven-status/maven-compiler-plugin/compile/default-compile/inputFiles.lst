@@ -10,3 +10,14 @@
 /home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/ObjectMetadata.java
 /home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/PlacementManager.java
 /home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/RepairManager.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/raft/ClusterConfig.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/raft/LogEntry.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/raft/MetadataStateMachine.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/raft/RaftLog.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/raft/RaftMessage.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/raft/RaftNode.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/raft/RaftPeer.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/raft/RaftState.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/wal/DeduplicationCache.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/wal/SnapshotManager.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/wal/WAL.java

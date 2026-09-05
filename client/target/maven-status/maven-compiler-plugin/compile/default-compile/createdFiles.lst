@@ -1,12 +1,14 @@
+com/storix/client/ClusterMetadataClient$Operation.class
+com/storix/client/MetadataClient$MetadataProtocol.class
+com/storix/client/MetadataClient.class
+com/storix/client/ClusterMetadataClient.class
+com/storix/client/StorageNodeClient.class
 com/storix/client/MetadataClient$Response.class
 com/storix/client/StorageNodeClient$ChunkResponse.class
 com/storix/client/NodeInfoDTO.class
 com/storix/client/ChunkInfoDTO.class
-com/storix/client/MetadataClient$MetadataProtocol.class
 com/storix/client/StorixCLI.class
-com/storix/client/MetadataClient.class
 com/storix/client/ObjectMetadataDTO.class
 com/storix/client/Chunker.class
 com/storix/client/Chunker$ChunkData.class
-com/storix/client/StorageNodeClient.class
 com/storix/client/StorixClient.class

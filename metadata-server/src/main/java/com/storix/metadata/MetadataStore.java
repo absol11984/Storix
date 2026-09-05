@@ -71,6 +71,71 @@ public class MetadataStore {
     }
 
     /**
+     * Creates object metadata without persisting.
+     * Used for snapshot restoration where batch save happens after all objects are restored.
+     * @throws IllegalStateException if object already exists
+     */
+    public void createObjectDirect(ObjectMetadata metadata) {
+        ObjectMetadata existing = objects.putIfAbsent(metadata.getObjectName(), metadata);
+        if (existing != null) {
+            throw new IllegalStateException("Object already exists: " + metadata.getObjectName());
+        }
+        // No save() - batch operation
+    }
+
+    /**
+     * Updates object metadata without persisting.
+     * Used for snapshot restoration where batch save happens after all objects are restored.
+     * @throws IllegalArgumentException if object doesn't exist
+     */
+    public void updateObjectDirect(ObjectMetadata metadata) {
+        if (!objects.containsKey(metadata.getObjectName())) {
+            throw new IllegalArgumentException("Object not found: " + metadata.getObjectName());
+        }
+        objects.put(metadata.getObjectName(), metadata);
+        // No save() - batch operation
+    }
+
+    /**
+     * Deletes object metadata without persisting.
+     * Used for snapshot restoration where batch save happens after all operations are complete.
+     * @return true if object was deleted, false if it didn't exist
+     */
+    public boolean deleteObjectDirect(String objectName) {
+        return objects.remove(objectName) != null;
+    }
+
+    /**
+     * Explicitly saves the current state to disk.
+     * Used after batch operations (like snapshot restoration) to persist the final state.
+     */
+    public void save() {
+        try {
+            objectMapper.writeValue(storageFile.toFile(), objects);
+        } catch (IOException e) {
+            System.err.println("Failed to save metadata: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Batch restore from a snapshot - clears existing state and rebuilds from snapshot.
+     * More efficient than individual creates/updates as it saves only once at the end.
+     * @param snapshotData Map of object name to ObjectMetadata
+     */
+    public void restoreFromSnapshot(Map<String, ObjectMetadata> snapshotData) {
+        // Clear existing state using direct method
+        objects.clear();
+
+        // Restore all objects from snapshot
+        for (Map.Entry<String, ObjectMetadata> entry : snapshotData.entrySet()) {
+            objects.put(entry.getKey(), entry.getValue());
+        }
+
+        // Save once at the end
+        save();
+    }
+
+    /**
      * Lists all object names.
      */
     public Collection<String> listObjects() {
@@ -82,6 +147,34 @@ public class MetadataStore {
      */
     public boolean objectExists(String objectName) {
         return objects.containsKey(objectName);
+    }
+
+    /**
+     * Adds a new replica node to a chunk.
+     * @param objectName the object name
+     * @param chunkId the chunk ID
+     * @param nodeId the new replica node ID to add
+     */
+    public void updateChunkReplica(String objectName, String chunkId, String nodeId) {
+        ObjectMetadata metadata = objects.get(objectName);
+        if (metadata == null) {
+            return;
+        }
+
+        boolean updated = false;
+        for (ChunkInfo chunk : metadata.getChunks()) {
+            if (chunk.getChunkId().equals(chunkId)) {
+                if (!chunk.getReplicaNodeIds().contains(nodeId)) {
+                    chunk.addReplicaNode(nodeId);
+                    updated = true;
+                }
+                break;
+            }
+        }
+
+        if (updated) {
+            save();
+        }
     }
 
     /**
@@ -102,17 +195,6 @@ public class MetadataStore {
             }
         } catch (IOException e) {
             throw new IOException("Failed to load metadata from " + storageFile, e);
-        }
-    }
-
-    /**
-     * Saves metadata to disk.
-     */
-    private void save() {
-        try {
-            objectMapper.writeValue(storageFile.toFile(), objects);
-        } catch (IOException e) {
-            System.err.println("Failed to save metadata: " + e.getMessage());
         }
     }
 }

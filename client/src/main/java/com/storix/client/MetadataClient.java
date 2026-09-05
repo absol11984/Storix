@@ -227,5 +227,6 @@ public class MetadataClient implements AutoCloseable {
         static final byte OK = 0;
         static final byte ERROR = 1;
         static final byte NOT_FOUND = 2;
+        static final byte NOT_LEADER = 3;
     }
 }

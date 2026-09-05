@@ -1,5 +1,6 @@
 /home/arceus/Storix/client/src/main/java/com/storix/client/ChunkInfoDTO.java
 /home/arceus/Storix/client/src/main/java/com/storix/client/Chunker.java
+/home/arceus/Storix/client/src/main/java/com/storix/client/ClusterMetadataClient.java
 /home/arceus/Storix/client/src/main/java/com/storix/client/MetadataClient.java
 /home/arceus/Storix/client/src/main/java/com/storix/client/NodeInfoDTO.java
 /home/arceus/Storix/client/src/main/java/com/storix/client/ObjectMetadataDTO.java

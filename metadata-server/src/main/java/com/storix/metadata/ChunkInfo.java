@@ -84,6 +84,18 @@ public class ChunkInfo {
         this.replicaNodeIds = replicaNodeIds != null ? new ArrayList<>(replicaNodeIds) : new ArrayList<>();
     }
 
+    /**
+     * Adds a new replica node to this chunk.
+     */
+    public void addReplicaNode(String nodeId) {
+        if (replicaNodeIds == null) {
+            replicaNodeIds = new ArrayList<>();
+        }
+        if (!replicaNodeIds.contains(nodeId)) {
+            replicaNodeIds.add(nodeId);
+        }
+    }
+
     // Backward compatibility getters/setters for Prompt 1 metadata
     public String getStorageNodeId() { return storageNodeId; }
     public void setStorageNodeId(String storageNodeId) { this.storageNodeId = storageNodeId; }

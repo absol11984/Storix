@@ -1,6 +1,8 @@
 package com.storix.metadata;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.storix.metadata.raft.*;
+import com.storix.metadata.wal.DeduplicationCache;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -9,10 +11,12 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Handles metadata client requests.
  * Processes multiple requests on the same connection in a loop.
+ * Supports request deduplication for idempotent operations.
  */
 public class MetadataHandler {
 
@@ -20,14 +24,32 @@ public class MetadataHandler {
     private final NodeRegistry nodeRegistry;
     private final PlacementManager placementManager;
     private final RepairManager repairManager;
+    private final RaftNode raftNode;
+    private final MetadataStateMachine stateMachine;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    // Request deduplication cache (TTL 1 hour)
+    private final DeduplicationCache deduplicationCache = new DeduplicationCache();
+
+    // Deduplication key prefix per operation type
+    private static final String CREATE_PREFIX = "CREATE:";
+    private static final String UPDATE_PREFIX = "UPDATE:";
+    private static final String DELETE_PREFIX = "DELETE:";
+
     public MetadataHandler(MetadataStore store, NodeRegistry nodeRegistry,
-                           PlacementManager placementManager, RepairManager repairManager) {
+                          PlacementManager placementManager, RepairManager repairManager) {
+        this(store, nodeRegistry, placementManager, repairManager, null, null);
+    }
+
+    public MetadataHandler(MetadataStore store, NodeRegistry nodeRegistry,
+                          PlacementManager placementManager, RepairManager repairManager,
+                          RaftNode raftNode, MetadataStateMachine stateMachine) {
         this.store = store;
         this.nodeRegistry = nodeRegistry;
         this.placementManager = placementManager;
         this.repairManager = repairManager;
+        this.raftNode = raftNode;
+        this.stateMachine = stateMachine;
     }
 
     /**
@@ -105,9 +127,43 @@ public class MetadataHandler {
     }
 
     private ByteBuffer handleCreateObject(byte[] payload) throws IOException {
+        // Check if we're the leader (if Raft is enabled)
+        if (raftNode != null && !raftNode.isLeader()) {
+            return createNotLeaderResponse();
+        }
+
         ObjectMetadata metadata = objectMapper.readValue(payload, ObjectMetadata.class);
-        store.createObject(metadata);
-        return createSuccessResponse(new byte[0]);
+
+        // Check deduplication cache
+        String dedupKey = CREATE_PREFIX + metadata.getObjectName();
+        Optional<DeduplicationCache.CachedResult> cached = deduplicationCache.get(dedupKey);
+        if (cached.isPresent()) {
+            // Return cached result for idempotent operation
+            if (cached.get().success()) {
+                return createSuccessResponse(cached.get().responseData());
+            } else {
+                return createErrorResponse(MetadataProtocol.ERROR, cached.get().errorMessage());
+            }
+        }
+
+        if (raftNode != null && stateMachine != null) {
+            // Submit to Raft for replication
+            byte[] data = objectMapper.writeValueAsBytes(metadata);
+            LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data);
+
+            if (!raftNode.submit(entry)) {
+                return createErrorResponse(MetadataProtocol.ERROR, "Failed to submit to Raft");
+            }
+            // Cache successful result
+            deduplicationCache.put(dedupKey, DeduplicationCache.CachedResult.success(new byte[0]));
+            return createSuccessResponse(new byte[0]);
+        } else {
+            // Direct write (single-node mode)
+            store.createObject(metadata);
+            // Cache successful result
+            deduplicationCache.put(dedupKey, DeduplicationCache.CachedResult.success(new byte[0]));
+            return createSuccessResponse(new byte[0]);
+        }
     }
 
     private ByteBuffer handleGetObject(byte[] payload) throws IOException {
@@ -127,20 +183,86 @@ public class MetadataHandler {
     }
 
     private ByteBuffer handleUpdateObject(byte[] payload) throws IOException {
+        // Check if we're the leader (if Raft is enabled)
+        if (raftNode != null && !raftNode.isLeader()) {
+            return createNotLeaderResponse();
+        }
+
         ObjectMetadata metadata = objectMapper.readValue(payload, ObjectMetadata.class);
-        store.updateObject(metadata);
-        return createSuccessResponse(new byte[0]);
+
+        // Check deduplication cache
+        String dedupKey = UPDATE_PREFIX + metadata.getObjectName();
+        Optional<DeduplicationCache.CachedResult> cached = deduplicationCache.get(dedupKey);
+        if (cached.isPresent()) {
+            if (cached.get().success()) {
+                return createSuccessResponse(cached.get().responseData());
+            } else {
+                return createErrorResponse(MetadataProtocol.ERROR, cached.get().errorMessage());
+            }
+        }
+
+        if (raftNode != null && stateMachine != null) {
+            // Submit to Raft for replication
+            byte[] data = objectMapper.writeValueAsBytes(metadata);
+            LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.UPDATE_OBJECT, data);
+
+            if (!raftNode.submit(entry)) {
+                return createErrorResponse(MetadataProtocol.ERROR, "Failed to submit to Raft");
+            }
+            // Cache successful result
+            deduplicationCache.put(dedupKey, DeduplicationCache.CachedResult.success(new byte[0]));
+            return createSuccessResponse(new byte[0]);
+        } else {
+            // Direct write (single-node mode)
+            store.updateObject(metadata);
+            // Cache successful result
+            deduplicationCache.put(dedupKey, DeduplicationCache.CachedResult.success(new byte[0]));
+            return createSuccessResponse(new byte[0]);
+        }
     }
 
     private ByteBuffer handleDeleteObject(byte[] payload) throws IOException {
+        // Check if we're the leader (if Raft is enabled)
+        if (raftNode != null && !raftNode.isLeader()) {
+            return createNotLeaderResponse();
+        }
+
         Map<String, String> request = objectMapper.readValue(payload, Map.class);
         String objectName = request.get("objectName");
 
-        boolean deleted = store.deleteObject(objectName);
-        if (deleted) {
+        // Check deduplication cache
+        String dedupKey = DELETE_PREFIX + objectName;
+        Optional<DeduplicationCache.CachedResult> cached = deduplicationCache.get(dedupKey);
+        if (cached.isPresent()) {
+            if (cached.get().success()) {
+                return createSuccessResponse(cached.get().responseData());
+            } else {
+                return createErrorResponse(MetadataProtocol.ERROR, cached.get().errorMessage());
+            }
+        }
+
+        if (raftNode != null && stateMachine != null) {
+            // Submit to Raft for replication
+            LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.DELETE_OBJECT, objectName.getBytes());
+
+            if (!raftNode.submit(entry)) {
+                return createErrorResponse(MetadataProtocol.ERROR, "Failed to submit to Raft");
+            }
+            // Cache successful result
+            deduplicationCache.put(dedupKey, DeduplicationCache.CachedResult.success(new byte[0]));
             return createSuccessResponse(new byte[0]);
         } else {
-            return createErrorResponse(MetadataProtocol.NOT_FOUND, "Object not found");
+            // Direct write (single-node mode)
+            boolean deleted = store.deleteObject(objectName);
+            // Cache result (even if not found, for idempotency)
+            deduplicationCache.put(dedupKey,
+                deleted ? DeduplicationCache.CachedResult.success(new byte[0])
+                        : DeduplicationCache.CachedResult.error("Object not found"));
+            if (deleted) {
+                return createSuccessResponse(new byte[0]);
+            } else {
+                return createErrorResponse(MetadataProtocol.NOT_FOUND, "Object not found");
+            }
         }
     }
 
@@ -226,6 +348,8 @@ public class MetadataHandler {
         status.put("healthyChunks", healthyChunks);
         status.put("degradedChunks", degradedChunks);
         status.put("replicationFactor", placementManager.getReplicationFactor());
+        status.put("isLeader", raftNode != null ? raftNode.isLeader() : true);
+        status.put("raftState", raftNode != null ? raftNode.getState().name() : "SINGLE");
 
         byte[] data = objectMapper.writeValueAsBytes(status);
         return createSuccessResponse(data);
@@ -235,6 +359,27 @@ public class MetadataHandler {
         RepairManager.RepairResult result = repairManager.repairAll();
         byte[] data = objectMapper.writeValueAsBytes(result);
         return createSuccessResponse(data);
+    }
+
+    /**
+     * Creates a NOT_LEADER response with leader info.
+     */
+    private ByteBuffer createNotLeaderResponse() {
+        Map<String, String> leaderInfo = new HashMap<>();
+
+        if (raftNode != null) {
+            raftNode.getLeader().ifPresent(leader -> {
+                leaderInfo.put("leaderHost", leader.host());
+                leaderInfo.put("leaderPort", String.valueOf(leader.port()));
+            });
+        }
+
+        try {
+            byte[] data = objectMapper.writeValueAsBytes(leaderInfo);
+            return createErrorResponse(MetadataProtocol.NOT_LEADER, objectMapper.writeValueAsString(leaderInfo));
+        } catch (IOException e) {
+            return createErrorResponse(MetadataProtocol.NOT_LEADER, "{}");
+        }
     }
 
     private ByteBuffer createSuccessResponse(byte[] data) {
