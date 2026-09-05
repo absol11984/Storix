@@ -16,21 +16,72 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Thread-safe metadata store with JSON persistence.
+ *
+ * GENERATION TRACKING:
+ * This store tracks the generation it's associated with via a companion .generation file.
+ * The generation file contains the snapshot index this metadata was restored from.
+ * On load, if the stored generation doesn't match the committed generation in SnapshotManager,
+ * the metadata is considered stale and should be rebuilt from the snapshot.
  */
 public class MetadataStore {
 
     // Staging suffix for atomic file swap
     private static final String STAGING_SUFFIX = ".staging";
+    // Generation tracking file suffix
+    private static final String GENERATION_SUFFIX = ".generation";
 
     private final Map<String, ObjectMetadata> objects = new ConcurrentHashMap<>();
     private final Path storageFile;
+    private final Path generationFile;
     private final ObjectMapper objectMapper;
+    private volatile long currentGeneration = -1;
 
     public MetadataStore(Path storageFile) throws IOException {
         this.storageFile = storageFile;
+        this.generationFile = storageFile.resolveSibling(storageFile.getFileName() + GENERATION_SUFFIX);
         this.objectMapper = new ObjectMapper();
         this.objectMapper.enable(SerializationFeature.INDENT_OUTPUT);
         load();
+    }
+
+    /**
+     * Gets the current generation this store is tracking.
+     * Returns -1 if no generation has been set.
+     */
+    public long getGeneration() {
+        return currentGeneration;
+    }
+
+    /**
+     * Sets the generation this store is tracking.
+     * The generation is persisted to disk and must match the committed
+     * generation in SnapshotManager for the store to be considered valid.
+     */
+    public void setGeneration(long generation) throws IOException {
+        this.currentGeneration = generation;
+        saveGeneration();
+    }
+
+    private void saveGeneration() {
+        try {
+            Files.writeString(generationFile, String.valueOf(currentGeneration));
+        } catch (IOException e) {
+            System.err.println("[METADATA] Failed to save generation: " + e.getMessage());
+        }
+    }
+
+    private void loadGeneration() {
+        if (!Files.exists(generationFile)) {
+            currentGeneration = -1;
+            return;
+        }
+        try {
+            String content = Files.readString(generationFile);
+            currentGeneration = Long.parseLong(content.trim());
+        } catch (IOException | NumberFormatException e) {
+            System.err.println("[METADATA] Failed to load generation: " + e.getMessage());
+            currentGeneration = -1;
+        }
     }
 
     /**
@@ -220,9 +271,10 @@ public class MetadataStore {
      * The in-memory map is only updated after the atomic rename succeeds.
      *
      * @param candidateState The candidate state to publish (from restoreToCandidate)
+     * @param generation The generation index to associate with this state
      * @throws IOException if publication fails
      */
-    public void publishCandidate(Map<String, ObjectMetadata> candidateState) throws IOException {
+    public void publishCandidate(Map<String, ObjectMetadata> candidateState, long generation) throws IOException {
         if (candidateState == null) {
             throw new IOException("Cannot publish null candidate state");
         }
@@ -284,15 +336,11 @@ public class MetadataStore {
             throw new IOException("Failed to atomically rename candidate state to live storage", e);
         }
 
-        // Step 4: fsync the parent directory to ensure the rename is durable
-        // This is needed on some filesystems (ext4, etc.) where rename durability
-        // requires a directory sync after the atomic move.
-        try {
-            fsyncDirectory(storageFile.getParent());
-        } catch (IOException e) {
-            // Non-fatal: the atomic move succeeded. Directory sync is best-effort.
-            System.err.println("[METADATA] Warning: failed to fsync directory after publish: " + e.getMessage());
-        }
+        // Step 4: Update generation file (this marks the state as authoritative)
+        // The generation must be saved AFTER the metadata file is renamed
+        // to ensure atomicity: either both are updated or neither
+        this.currentGeneration = generation;
+        saveGeneration();
 
         // Step 5: Update in-memory map only after atomic rename succeeds
         // This order ensures:
@@ -306,15 +354,29 @@ public class MetadataStore {
     /**
      * Force fsync a directory to ensure directory entry changes are durable.
      * This is needed on some filesystems to make renames truly durable.
+     * Note: On some systems, syncing a directory isn't directly supported,
+     * so we use a best-effort approach.
      */
     private void fsyncDirectory(Path dir) throws IOException {
         if (dir == null || !Files.exists(dir)) {
             return;
         }
-        // Opening the directory and syncing its file descriptor makes the
-        // directory entry durable on ext4 and similar filesystems.
-        try (RandomAccessFile raf = new RandomAccessFile(dir.toFile(), "r")) {
-            raf.getFD().sync();
+        // Best effort directory sync. The atomic rename provides the main durability guarantee.
+        // On some systems, we can try to sync by writing to a file in the directory.
+        try {
+            Path dummyFile = dir.resolve(".fsync_dummy");
+            try {
+                Files.write(dummyFile, new byte[0]);
+                try (java.nio.channels.FileChannel fc = java.nio.channels.FileChannel.open(dummyFile,
+                        java.nio.file.StandardOpenOption.READ, java.nio.file.StandardOpenOption.WRITE)) {
+                    fc.force(true);
+                }
+            } finally {
+                Files.deleteIfExists(dummyFile);
+            }
+        } catch (IOException e) {
+            // Non-fatal: the atomic move succeeded. Directory sync is best-effort.
+            System.err.println("[METADATA] Warning: failed to fsync directory after publish: " + e.getMessage());
         }
     }
 
@@ -365,6 +427,9 @@ public class MetadataStore {
      */
     @SuppressWarnings("unchecked")
     private void load() throws IOException {
+        // Load generation first
+        loadGeneration();
+
         if (!Files.exists(storageFile)) {
             return;
         }

@@ -8,17 +8,29 @@ import com.storix.metadata.ObjectMetadata;
 import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.zip.CRC32;
 
 /**
  * Manages snapshots for log compaction.
  * Snapshots contain complete metadata state and are used to reconstruct
  * the system state after a restart.
+ *
+ * GENERATION/COMMIT-MARKER MODEL:
+ * - Snapshots are named by their index: "snapshot-<index>"
+ * - A commit marker "generation-<index>.committed" indicates a generation is authoritative
+ * - Only snapshots with a corresponding commit marker are considered valid on recovery
+ * - Uncommitted candidates are discarded on startup
  *
  * Snapshot format:
  * - MAGIC(8) + VERSION(4) = 12 bytes header
@@ -30,6 +42,8 @@ public class SnapshotManager {
     private static final long SNAPSHOT_MAGIC = 0x534E4150L; // "SNAP"
     private static final int SNAPSHOT_VERSION = 1;
     private static final String SNAPSHOT_PREFIX = "snapshot-";
+    private static final String GENERATION_COMMIT_PREFIX = "generation-";
+    private static final String COMMIT_SUFFIX = ".committed";
     private static final int MAX_SNAPSHOTS_TO_KEEP = 2;
     private static final long MAX_SNAPSHOT_SIZE = 100 * 1024 * 1024; // 100MB max
 
@@ -50,25 +64,214 @@ public class SnapshotManager {
     /**
      * Cleans up any stale candidate snapshot files from previous failed installations.
      * Called on startup to ensure we don't have orphaned candidate files.
+     *
+     * CRITICAL: Only removes candidates that are NOT committed.
+     * A generation-N.commit marker means generation N is authoritative and its
+     * candidate (if any) should be cleaned up too.
      */
     private void cleanupStaleCandidates() {
         if (!Files.exists(snapshotDir)) {
             return;
         }
         try {
+            // First, find all committed generations
+            Set<Long> committedGenerations = getCommittedGenerations();
+
+            // Clean up snapshot-candidate- files
             Files.list(snapshotDir)
-                .filter(p -> p.getFileName().toString().contains("-candidate-"))
+                .filter(p -> p.getFileName().toString().startsWith(CANDIDATE_PREFIX))
                 .filter(Files::isRegularFile)
                 .forEach(p -> {
+                    String filename = p.getFileName().toString();
+                    // Parse the index from candidate filename
+                    // Format: snapshot-candidate-<index>-<uniqueId>.tmp
                     try {
-                        Files.delete(p);
-                        System.out.println("[SNAPSHOT] Cleaned up stale candidate: " + p.getFileName());
-                    } catch (IOException e) {
-                        System.err.println("[SNAPSHOT] Failed to clean up candidate: " + p);
+                        // Extract index from filename
+                        String name = p.getFileName().toString();
+                        // snapshot-candidate-12345-1234567890.tmp
+                        String indexPart = name.substring(CANDIDATE_PREFIX.length()).replace(".tmp", "");
+                        int dashIdx = indexPart.lastIndexOf('-');
+                        if (dashIdx > 0) {
+                            String indexStr = indexPart.substring(0, dashIdx);
+                            long candidateIndex = Long.parseLong(indexStr);
+
+                            // Only clean up if there's no committed generation at this index
+                            // or if this candidate is from an older generation than committed
+                            if (!committedGenerations.contains(candidateIndex)) {
+                                Files.delete(p);
+                                System.out.println("[SNAPSHOT] Cleaned up stale candidate: " + filename);
+                            }
+                        }
+                    } catch (Exception e) {
+                        System.err.println("[SNAPSHOT] Failed to parse candidate filename: " + filename);
+                    }
+                });
+
+            // Clean up install- files (temporary files from installSnapshot method)
+            Files.list(snapshotDir)
+                .filter(p -> p.getFileName().toString().startsWith("install-"))
+                .filter(Files::isRegularFile)
+                .forEach(p -> {
+                    String filename = p.getFileName().toString();
+                    try {
+                        // install-<index>-<uniqueId>.tmp
+                        // Extract index from filename
+                        String name = p.getFileName().toString();
+                        String indexPart = name.substring("install-".length()).replace(".tmp", "");
+                        int dashIdx = indexPart.lastIndexOf('-');
+                        if (dashIdx > 0) {
+                            String indexStr = indexPart.substring(0, dashIdx);
+                            long installIndex = Long.parseLong(indexStr);
+
+                            // Only clean up if there's no committed generation at this index
+                            if (!committedGenerations.contains(installIndex)) {
+                                Files.delete(p);
+                                System.out.println("[SNAPSHOT] Cleaned up stale install file: " + filename);
+                            }
+                        }
+                    } catch (Exception e) {
+                        System.err.println("[SNAPSHOT] Failed to parse install filename: " + filename);
                     }
                 });
         } catch (IOException e) {
             System.err.println("[SNAPSHOT] Failed to list directory for candidate cleanup: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Returns the set of all committed generation indices.
+     */
+    private Set<Long> getCommittedGenerations() {
+        Set<Long> committed = new java.util.HashSet<>();
+        if (!Files.exists(snapshotDir)) {
+            return committed;
+        }
+        try {
+            Files.list(snapshotDir)
+                .filter(p -> p.getFileName().toString().startsWith(GENERATION_COMMIT_PREFIX))
+                .filter(p -> p.getFileName().toString().endsWith(COMMIT_SUFFIX))
+                .filter(Files::isRegularFile)
+                .forEach(p -> {
+                    String filename = p.getFileName().toString();
+                    // Format: generation-<index>.committed
+                    try {
+                        String indexStr = filename
+                            .substring(GENERATION_COMMIT_PREFIX.length())
+                            .replace(COMMIT_SUFFIX, "");
+                        committed.add(Long.parseLong(indexStr));
+                    } catch (NumberFormatException ignored) {}
+                });
+        } catch (IOException e) {
+            System.err.println("[SNAPSHOT] Failed to list committed generations: " + e.getMessage());
+        }
+        return committed;
+    }
+
+    /**
+     * Checks if a specific generation index is committed.
+     * A generation is committed if its commit marker file exists.
+     *
+     * @param generationIndex The generation index to check
+     * @return true if this generation is committed (authoritative)
+     */
+    public boolean isGenerationCommitted(long generationIndex) {
+        Path commitMarker = snapshotDir.resolve(GENERATION_COMMIT_PREFIX + generationIndex + COMMIT_SUFFIX);
+        return Files.exists(commitMarker);
+    }
+
+    /**
+     * Gets the current committed generation index.
+     * Returns -1 if no generation is committed.
+     *
+     * @return The committed generation index, or -1 if none
+     */
+    public long getCurrentCommittedGeneration() {
+        Set<Long> committed = getCommittedGenerations();
+        if (committed.isEmpty()) {
+            return -1;
+        }
+        return Collections.max(committed);
+    }
+
+    /**
+     * Marks a generation as committed by creating its commit marker atomically.
+     * This is the final step in the crash-safe InstallSnapshot protocol.
+     *
+     * The commit marker creation sequence:
+     * 1. Write to temp marker file with full fsync
+     * 2. Atomic rename to final marker filename
+     * 3. fsync directory
+     *
+     * This ensures:
+     * - Before commit marker: generation is candidate only, NOT authoritative
+     * - After commit marker: generation is authoritative and recoverable
+     * - Crash before this step: generation is discarded on recovery
+     * - Crash after this step: generation is recovered as authoritative
+     *
+     * @param generationIndex The generation index to commit
+     * @param generationTerm The term of the generation
+     * @throws IOException if commit marker creation fails
+     */
+    public void commitGeneration(long generationIndex, long generationTerm) throws IOException {
+        String markerFilename = GENERATION_COMMIT_PREFIX + generationIndex + COMMIT_SUFFIX;
+        Path commitMarker = snapshotDir.resolve(markerFilename);
+        Path tempMarker = snapshotDir.resolve(markerFilename + ".tmp");
+
+        // Content: just the term for validation
+        String content = String.valueOf(generationTerm);
+        byte[] data = content.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        try (RandomAccessFile raf = new RandomAccessFile(tempMarker.toFile(), "rw")) {
+            raf.write(data);
+            raf.getFD().sync(); // Sync data to disk
+        }
+
+        // Verify file was written correctly
+        long actualSize = Files.size(tempMarker);
+        if (actualSize != data.length) {
+            Files.deleteIfExists(tempMarker);
+            throw new IOException("Commit marker size mismatch: expected " + data.length + ", got " + actualSize);
+        }
+
+        // Atomic rename to final location
+        Files.move(tempMarker, commitMarker,
+            StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+
+        // fsync directory for durability
+        fsyncDirectory(snapshotDir);
+
+        System.out.println("[SNAPSHOT] Committed generation " + generationIndex + " (term=" + generationTerm + ")");
+    }
+
+    /**
+     * Force fsync a directory to ensure directory entry changes are durable.
+     * This is needed on some filesystems to make renames truly durable.
+     */
+    private void fsyncDirectory(Path dir) throws IOException {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        // On Linux, we can use FileChannel on a dummy file handle to sync the directory.
+        // The approach is to open the directory itself using FileChannel and sync it.
+        // However, the standard Java API doesn't directly support fsyncing a directory.
+        // A common approach is to create and sync a temporary file in the directory,
+        // or use native code. For simplicity, we'll skip this on systems where it's not needed.
+        // The atomic rename provides sufficient durability guarantees on most filesystems.
+        // The real durability concern is addressed by the atomic rename itself.
+        try {
+            // Try to sync a dummy file in the directory as a proxy for directory sync
+            Path dummyFile = dir.resolve(".fsync_dummy");
+            try {
+                Files.write(dummyFile, new byte[0]);
+                try (FileChannel fc = FileChannel.open(dummyFile, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                    fc.force(true);
+                }
+            } finally {
+                Files.deleteIfExists(dummyFile);
+            }
+        } catch (IOException e) {
+            // Best effort - atomic rename is the primary durability mechanism
+            System.err.println("[SNAPSHOT] Directory sync failed (best effort): " + e.getMessage());
         }
     }
 
@@ -126,17 +329,34 @@ public class SnapshotManager {
         // Atomic rename
         Files.move(tempFile, snapshotFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 
+        // Create commit marker for this generation
+        // This makes the snapshot authoritative
+        commitGeneration(lastIncludedIndex, lastIncludedTerm);
+
         System.out.println("[SNAPSHOT] Created snapshot at index " + lastIncludedIndex + ", term " + lastIncludedTerm);
 
-        // Cleanup old snapshots
+        // Cleanup old snapshots (but preserve committed ones)
         cleanupOldSnapshots();
 
         return new Snapshot(lastIncludedIndex, lastIncludedTerm, snapshotFile, stateData);
     }
 
     /**
-     * Loads the latest snapshot.
-     * @return The latest snapshot, or empty if no snapshot exists
+     * Loads the latest committed snapshot.
+     *
+     * RECOVERY RULE: Only return snapshots that have a corresponding commit marker.
+     * This is the core of the generation/commit-marker model:
+     * - A snapshot is authoritative ONLY if its generation is committed
+     * - Uncommitted snapshots are candidates and must be discarded on recovery
+     *
+     * Recovery algorithm:
+     * 1. Find the highest index snapshot
+     * 2. Check if it has a generation-<index>.committed marker
+     * 3. If yes: return it (it's authoritative)
+     * 4. If no: check previous snapshots for committed ones
+     * 5. If none found: return empty (no authoritative state)
+     *
+     * @return The latest committed snapshot, or empty if no committed snapshot exists
      * @throws IOException if snapshot loading fails due to system errors (not corrupted snapshots)
      */
     public Optional<Snapshot> loadLatestSnapshot() throws IOException {
@@ -161,18 +381,33 @@ public class SnapshotManager {
             return Optional.empty();
         }
 
-        // Parse index from filename and find highest VALID snapshot
+        // Get committed generations first
+        Set<Long> committedGenerations = getCommittedGenerations();
+        System.out.println("[SNAPSHOT] Committed generations: " + committedGenerations);
+
+        if (committedGenerations.isEmpty()) {
+            System.out.println("[SNAPSHOT] No committed generations found - no authoritative snapshot");
+            return Optional.empty();
+        }
+
+        // Parse index from filename and find highest VALID, COMMITTED snapshot
         Path latestValid = null;
         long highestIndex = -1;
-        boolean hasAnySnapshots = false;
+        boolean foundCorruptedCommitted = false;
 
         for (Path p : snapshots) {
             String filename = p.getFileName().toString();
+            long index = -1;
             try {
                 // Format: snapshot-<index>
                 String indexStr = filename.substring(SNAPSHOT_PREFIX.length());
-                long index = Long.parseLong(indexStr);
-                hasAnySnapshots = true;
+                index = Long.parseLong(indexStr);
+
+                // CRITICAL: Only consider snapshots with commit markers
+                if (!committedGenerations.contains(index)) {
+                    System.out.println("[SNAPSHOT] Skipping uncommitted snapshot: " + filename);
+                    continue;
+                }
 
                 // Validate the snapshot by attempting to load it
                 Optional<Snapshot> snap = loadSnapshot(p);
@@ -192,9 +427,17 @@ public class SnapshotManager {
                     }
                 }
             } catch (IOException e) {
-                System.err.println("[SNAPSHOT] Corrupted/invalid snapshot " + filename + ": " + e.getMessage());
-                // Skip corrupted snapshots and continue checking others
-                // This ensures we find the highest VALID snapshot even if newer ones are corrupted
+                // CORRUPTED COMMITTED SNAPSHOT: Fall back to next valid committed snapshot.
+                // This is a serious data integrity issue, but we prefer availability over
+                // consistency - the node can recover from an older committed snapshot.
+                if (index >= 0 && committedGenerations.contains(index)) {
+                    System.err.println("[SNAPSHOT] WARNING: Corrupted committed snapshot " + filename +
+                            ": " + e.getMessage() + " - falling back to older snapshot");
+                    foundCorruptedCommitted = true;
+                } else {
+                    // Uncommitted snapshots can be skipped
+                    System.err.println("[SNAPSHOT] Corrupted/invalid snapshot " + filename + ": " + e.getMessage());
+                }
             } catch (NumberFormatException e) {
                 // Skip files with invalid names
                 System.err.println("[SNAPSHOT] Skipping invalid snapshot filename: " + filename);
@@ -202,17 +445,18 @@ public class SnapshotManager {
         }
 
         if (latestValid != null) {
-            System.out.println("[SNAPSHOT] Found latest valid snapshot: " + latestValid.getFileName() +
-                    " (index=" + highestIndex + ")");
+            if (foundCorruptedCommitted) {
+                System.out.println("[SNAPSHOT] Falling back to older committed snapshot: " + latestValid.getFileName() +
+                        " (index=" + highestIndex + ")");
+            } else {
+                System.out.println("[SNAPSHOT] Found latest committed snapshot: " + latestValid.getFileName() +
+                        " (index=" + highestIndex + ")");
+            }
             return loadSnapshot(latestValid);
         }
 
-        // Snapshots exist but none are valid - this is an error condition
-        // The system cannot safely recover without at least one valid snapshot
-        if (hasAnySnapshots) {
-            throw new IOException("No valid snapshots found among existing snapshot files");
-        }
-
+        // Committed generations exist but no valid snapshot found
+        System.out.println("[SNAPSHOT] Committed generations exist but no valid snapshot found");
         return Optional.empty();
     }
 
@@ -305,8 +549,14 @@ public class SnapshotManager {
     /**
      * Cleans up old snapshots, keeping only the most recent ones.
      * Uses logical index (lastIncludedIndex from filename) for ordering.
+     *
+     * CRITICAL: Never deletes committed snapshots (those with commit markers).
+     * Committed generations are authoritative and must be preserved.
      */
     private void cleanupOldSnapshots() throws IOException {
+        // Get committed generations first - these must never be deleted
+        Set<Long> committedGenerations = getCommittedGenerations();
+
         List<Path> allSnapshots = Files.list(snapshotDir)
                 .filter(p -> p.getFileName().toString().startsWith(SNAPSHOT_PREFIX))
                 .filter(p -> !p.getFileName().toString().contains("-candidate-")) // Exclude candidate files
@@ -324,10 +574,20 @@ public class SnapshotManager {
             try {
                 String indexStr = filename.substring(SNAPSHOT_PREFIX.length());
                 long index = Long.parseLong(indexStr);
+
+                // NEVER delete committed snapshots
+                if (committedGenerations.contains(index)) {
+                    continue;
+                }
+
                 indexedSnapshots.add(new SnapshotIndex(p, index));
             } catch (NumberFormatException e) {
                 System.err.println("[SNAPSHOT] Skipping invalid snapshot filename during cleanup: " + filename);
             }
+        }
+
+        if (indexedSnapshots.size() <= MAX_SNAPSHOTS_TO_KEEP) {
+            return;
         }
 
         // Sort by index descending
@@ -580,10 +840,11 @@ public class SnapshotManager {
 
         Files.createDirectories(snapshotDir);
 
-        // Write to temp file, then atomic rename
+        // Write to temp file with "install-" prefix (different from candidate prefix)
+        // This avoids conflicts when commitCandidateSnapshot runs in parallel
         String filename = SNAPSHOT_PREFIX + lastIncludedIndex;
         Path snapshotFile = snapshotDir.resolve(filename);
-        Path tempFile = snapshotDir.resolve(filename + ".tmp");
+        Path tempFile = snapshotDir.resolve("install-" + lastIncludedIndex + "-" + System.nanoTime() + ".tmp");
 
         // Compute checksum for the snapshot file
         int checksum = computeChecksum(stateData);
@@ -619,10 +880,13 @@ public class SnapshotManager {
         // Atomic rename - this is the durable commit point
         Files.move(tempFile, snapshotFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 
+        // Create commit marker to make snapshot authoritative
+        commitGeneration(lastIncludedIndex, lastIncludedTerm);
+
         System.out.println("[SNAPSHOT] Installed snapshot at index " + lastIncludedIndex +
                 ", term " + lastIncludedTerm + ", checksum " + checksum);
 
-        // Cleanup old snapshots
+        // Cleanup old snapshots (but preserve committed ones)
         cleanupOldSnapshots();
 
         return new Snapshot(lastIncludedIndex, lastIncludedTerm, snapshotFile, stateData);

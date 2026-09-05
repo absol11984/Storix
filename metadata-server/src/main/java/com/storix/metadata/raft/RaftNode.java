@@ -587,21 +587,29 @@ public class RaftNode implements AutoCloseable {
     /**
      * Handles InstallSnapshot RPC with a crash-safe installation protocol.
      *
+     * GENERATION/COMMIT-MARKER MODEL:
+     * The commit marker (generation-<index>.committed) is the point of truth.
+     * Only snapshots with a commit marker are authoritative on recovery.
+     *
      * CRASH-SAFE PROTOCOL:
      * 1. RECEIVING: Assemble chunks into temp file
      * 2. VALIDATED: Validate checksum and data integrity
      * 3. PERSISTED: Write candidate snapshot (NOT yet committed)
      * 4. RESTORED: Restore state machine from candidate
-     * 5. COMMITTED: Update boundary and optionally compact WAL
+     * 5. COMMITTED: Commit snapshot, publish state, write commit marker
      *
-     * On failure at any step before COMMITTED:
-     * - Old snapshot remains authoritative
-     * - Old boundary remains valid
-     * - Candidate snapshot is rolled back
+     * CRITICAL ORDER (commit marker is last):
+     * - commitCandidateSnapshot() makes snapshot file authoritative
+     * - publishCandidate() updates live metadata atomically
+     * - commitGeneration() WRITES THE COMMIT MARKER (final step)
      *
-     * On crash after COMMITTED:
-     * - Snapshot is durable and recoverable
-     * - WAL state is recoverable
+     * On failure at any step:
+     * - Before commit marker: old generation remains authoritative
+     * - Old state is recoverable from old committed generation
+     * - New candidate is discarded on restart (no commit marker = not authoritative)
+     *
+     * On crash after commit marker:
+     * - New generation is authoritative and recovered
      *
      * @return response with success=false if any step fails
      */
@@ -764,19 +772,28 @@ public class RaftNode implements AutoCloseable {
                 System.out.println("[RAFT] [STATE: COMMITTING]");
 
                 // Step 1: Commit the candidate snapshot as the new authoritative snapshot FIRST.
-                // This is atomic and durable. If this fails, we haven't modified the live store yet.
-                // If this succeeds, we have a valid snapshot on disk that we can recover from.
+                // This makes the snapshot file authoritative but not yet committed (no commit marker).
+                // If this fails, we haven't modified anything yet.
                 snapshotManager.commitCandidateSnapshot(candidateSnapshotFile,
                         pendingSnapshotIndex, pendingSnapshotTerm);
                 System.out.println("[RAFT] Candidate snapshot committed as new authoritative snapshot");
 
-                // Step 2: Publish candidate state to live store atomically AFTER snapshot is committed.
-                // With the atomic file swap in MetadataStore.publishCandidate, if this fails,
-                // the old storage file is still intact and recoverable.
-                // On crash after successful publish, load() will read the new storage file.
+                // Step 2: Write commit marker SECOND - this is the point of authority.
+                // Only snapshots with commit markers are authoritative on recovery.
+                // If we crash BEFORE this step, the old generation remains authoritative.
+                // If we crash AFTER this step, the new generation is authoritative.
+                snapshotManager.commitGeneration(pendingSnapshotIndex, pendingSnapshotTerm);
+                System.out.println("[RAFT] Commit marker written for generation " + pendingSnapshotIndex);
+
+                // Step 3: Publish candidate state to live store LAST.
+                // This is the final step - metadata is only authoritative if commit marker exists.
+                // If we crash AFTER successful commit marker but BEFORE publish:
+                // - Commit marker exists → new generation is authoritative
+                // - Metadata may be stale → recovery rebuilds from snapshot
+                // This ensures: no commit marker = no metadata modification
                 if (candidateState != null && !candidateState.isEmpty()) {
-                    metadataStore.publishCandidate(candidateState);
-                    System.out.println("[RAFT] Candidate state published to live store");
+                    metadataStore.publishCandidate(candidateState, pendingSnapshotIndex);
+                    System.out.println("[RAFT] Candidate state published to live store (generation=" + pendingSnapshotIndex + ")");
                 }
 
                 // Update Raft boundary
@@ -807,7 +824,8 @@ public class RaftNode implements AutoCloseable {
 
                 installationState = InstallationState.COMMITTED;
                 System.out.println("[RAFT] [STATE: COMMITTED] - Snapshot installed successfully");
-                System.out.println("[RAFT]   logStartIndex=" + raftLog.getLogStartIndex() +
+                System.out.println("[RAFT]   generation=" + pendingSnapshotIndex +
+                        ", logStartIndex=" + raftLog.getLogStartIndex() +
                         ", commitIndex=" + raftLog.getCommitIndex() +
                         ", walCompacted=" + walCompacted);
 
@@ -826,6 +844,23 @@ public class RaftNode implements AutoCloseable {
                     try {
                         Files.delete(candidateSnapshotFile);
                         System.out.println("[RAFT] Candidate snapshot discarded");
+                    } catch (IOException ignored) {}
+                }
+
+                // Remove commit marker if it was created.
+                // If we failed after commitGeneration but before/at publishCandidate:
+                // - Commit marker exists (generation is "committed")
+                // - Metadata may NOT be updated
+                // - This is an inconsistent state - must roll back
+                // Removing the commit marker ensures recovery will use old generation.
+                if (snapshotManager != null && pendingSnapshotIndex > 0) {
+                    try {
+                        Path commitMarker = snapshotManager.getSnapshotDir()
+                            .resolve("generation-" + pendingSnapshotIndex + ".committed");
+                        if (Files.exists(commitMarker)) {
+                            Files.delete(commitMarker);
+                            System.out.println("[RAFT] Commit marker removed during rollback: generation-" + pendingSnapshotIndex);
+                        }
                     } catch (IOException ignored) {}
                 }
 

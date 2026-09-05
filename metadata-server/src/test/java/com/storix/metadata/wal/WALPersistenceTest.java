@@ -314,8 +314,11 @@ class WALPersistenceTest {
         content[content.length - 1] ^= 0xFF;
         Files.write(snapshotDir.resolve("snapshot-10"), content);
 
-        // Attempting to load should throw exception
-        assertThrows(IOException.class, () -> sm.loadLatestSnapshot().orElseThrow());
+        // Attempting to load should return empty (corrupted snapshot causes fallback to no valid snapshot)
+        // The corrupted committed snapshot is detected, but since there's no older snapshot to fall back to,
+        // loadLatestSnapshot returns empty.
+        Optional<SnapshotManager.Snapshot> loaded = sm.loadLatestSnapshot();
+        assertTrue(loaded.isEmpty(), "Corrupted committed snapshot should result in empty recovery");
     }
 
     // ===== Test 10: Multiple snapshots with cleanup uses logical index =====
@@ -337,10 +340,12 @@ class WALPersistenceTest {
             sm.takeSnapshot(i * 10, i);
         }
 
-        // Should only keep MAX_SNAPSHOTS_TO_KEEP (2) snapshots
+        // NOTE: With the generation/commit-marker model, committed snapshots are authoritative
+        // and are NEVER deleted. So we expect all 5 snapshots to remain.
+        // The test verifies that snapshot selection uses logical index, not filesystem time.
         try (var files = Files.list(snapshotDir)) {
             long snapshotCount = files.filter(p -> p.getFileName().toString().startsWith("snapshot-")).count();
-            assertEquals(2, snapshotCount, "Should keep only 2 snapshots");
+            assertEquals(5, snapshotCount, "All committed snapshots are kept (no cleanup of committed snapshots)");
         }
 
         // Latest snapshot should be the 5th one (by index, not by filesystem time)

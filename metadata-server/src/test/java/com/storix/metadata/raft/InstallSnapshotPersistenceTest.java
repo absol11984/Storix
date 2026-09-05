@@ -715,13 +715,15 @@ class InstallSnapshotPersistenceTest {
             // Before install - no snapshots
             var beforeSnapshots = Files.list(followerSnapDir)
                 .filter(p -> !p.getFileName().toString().contains("-candidate-"))
+                .filter(p -> !p.getFileName().toString().startsWith("install-"))
+                .filter(p -> !p.getFileName().toString().startsWith("generation-"))
                 .filter(Files::isRegularFile)
                 .count();
             assertEquals(0, beforeSnapshots, "Should have no snapshots before install");
 
             // Count candidate files before
             long beforeCandidates = Files.list(followerSnapDir)
-                .filter(p -> p.getFileName().toString().contains("-candidate-"))
+                .filter(p -> p.getFileName().toString().contains("-candidate-") || p.getFileName().toString().startsWith("install-"))
                 .count();
 
             // Install snapshot
@@ -743,13 +745,15 @@ class InstallSnapshotPersistenceTest {
             // After install - verify committed snapshot exists
             var afterSnapshots = Files.list(followerSnapDir)
                 .filter(p -> !p.getFileName().toString().contains("-candidate-"))
+                .filter(p -> !p.getFileName().toString().startsWith("install-"))
+                .filter(p -> !p.getFileName().toString().startsWith("generation-"))
                 .filter(Files::isRegularFile)
                 .count();
             assertEquals(1, afterSnapshots, "Should have exactly 1 committed snapshot");
 
             // Count candidate files after - should be cleaned up
             long afterCandidates = Files.list(followerSnapDir)
-                .filter(p -> p.getFileName().toString().contains("-candidate-"))
+                .filter(p -> p.getFileName().toString().contains("-candidate-") || p.getFileName().toString().startsWith("install-"))
                 .count();
             assertEquals(beforeCandidates, afterCandidates, "Candidate files should be cleaned up after install");
 

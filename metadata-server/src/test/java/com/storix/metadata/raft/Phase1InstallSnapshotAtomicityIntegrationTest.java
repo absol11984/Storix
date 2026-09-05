@@ -611,6 +611,299 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
 
     // ===== TEST 5: SECOND RESTART =====
 
+    // ===== TEST 5b: COMMIT MARKER RECOVERY =====
+
+    /**
+     * TEST: Commit marker determines authoritative generation on recovery.
+     *
+     * This test verifies the core invariant:
+     * - Commit marker exists → new generation is authoritative
+     * - No commit marker → old generation is authoritative
+     *
+     * Scenario:
+     * 1. Install snapshot with commit marker
+     * 2. Restart and verify new state recovered (commit marker ensures new generation)
+     * 3. Simulate crash BEFORE commit marker: delete commit marker
+     * 4. Restart and verify old state recovered
+     */
+    @Test
+    void testCommitMarkerDeterminesAuthoritativeGeneration() throws Exception {
+        System.out.println("\n========================================");
+        System.out.println("TEST: Commit Marker Determines Authoritative Generation");
+        System.out.println("========================================\n");
+
+        int leaderPort = BASE_PORT + 600;
+
+        Path leaderRaftDir = tempDir.resolve("leader-raft-commitmarker");
+        Path followerRaftDir = tempDir.resolve("follower-raft-commitmarker");
+        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Files.createDirectories(leaderRaftDir);
+        Files.createDirectories(followerRaftDir);
+        Files.createDirectories(followerSnapDir);
+
+        // Setup leader
+        ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
+        MetadataStore leaderStore = new MetadataStore(tempDir.resolve("leader-meta-commitmarker.json"));
+        SnapshotManager leaderSnapshotMgr = new SnapshotManager(leaderRaftDir.resolve("snapshots"), leaderStore);
+        WAL leaderWal = new WAL(leaderRaftDir.resolve("wal.dat"));
+        RaftLog leaderLog = new RaftLog(leaderWal);
+        RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
+        leader.setSnapshotManager(leaderSnapshotMgr);
+        MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
+        leader.setLogEntryApplier(entry -> {
+            try { leaderStateMachine.apply(entry); }
+            catch (IOException e) { throw new RuntimeException(e); }
+        });
+
+        // Setup follower with initial state (created directly in store)
+        ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
+        Path followerMetaFile = tempDir.resolve("follower-meta-commitmarker.json");
+        MetadataStore followerStore = new MetadataStore(followerMetaFile);
+        // Create initial object directly in the store
+        ObjectMetadata initialObj = makeObject("initial-obj", 500L);
+        followerStore.createObject(initialObj);
+        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerSnapDir, followerStore);
+        WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
+        RaftLog followerLog = new RaftLog(followerWal);
+        RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
+        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore);
+        MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
+        follower.setLogEntryApplier(entry -> {
+            try { followerStateMachine.apply(entry); }
+            catch (IOException e) { throw new RuntimeException(e); }
+        });
+
+        Thread leaderThread = startNode(leader);
+
+        try {
+            waitForLeader(leader, 5000);
+
+            assertEquals(1, followerStore.listObjects().size(), "Follower should have 1 initial object");
+            System.out.println("Follower has initial state: 1 object");
+
+            // Leader creates new state with 5 objects
+            System.out.println("Leader creates 5 new objects...");
+            for (int i = 1; i <= 5; i++) {
+                ObjectMetadata obj = makeObject("new-obj" + i, i * 1000L);
+                byte[] data = objectMapper.writeValueAsBytes(obj);
+                LogEntry entry = LogEntry.create(leader.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data);
+                leader.submit(entry);
+            }
+            Thread.sleep(300);
+            leader.compactLog(3);
+
+            var snapshotOpt = leaderSnapshotMgr.loadLatestSnapshot();
+            assertTrue(snapshotOpt.isPresent());
+            var snapshot = snapshotOpt.get();
+            byte[] snapshotData = snapshot.stateData();
+            int checksum = computeChecksum(snapshotData);
+
+            // Install snapshot on follower
+            System.out.println("Installing snapshot index=" + snapshot.lastIncludedIndex() + " on follower...");
+            RaftMessage.InstallSnapshot request = new RaftMessage.InstallSnapshot(
+                leader.getCurrentTerm(), "leader",
+                snapshot.lastIncludedIndex(), snapshot.lastIncludedTerm(),
+                0, snapshotData, true, checksum
+            );
+
+            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+                request.term(), request.leaderId(),
+                request.lastIncludedIndex(), request.lastIncludedTerm(),
+                request.offset(), request.data(), request.done(), request.checksum()
+            );
+
+            assertTrue(response.success(), "InstallSnapshot should succeed");
+
+            // Verify commit marker exists
+            Path commitMarker = followerSnapDir.resolve("generation-" + snapshot.lastIncludedIndex() + ".committed");
+            assertTrue(Files.exists(commitMarker),
+                "Commit marker should exist after successful InstallSnapshot");
+            System.out.println("Commit marker exists: " + commitMarker.getFileName());
+
+            // Verify live state has new objects
+            assertEquals(5, followerStore.listObjects().size(), "Follower should have 5 new objects");
+            System.out.println("Follower has 5 new objects after InstallSnapshot");
+
+            // Shutdown and restart - commit marker should ensure new state is recovered
+            System.out.println("Shutting down and restarting...");
+            follower.stop();
+
+            MetadataStore restartedStore = new MetadataStore(followerMetaFile);
+            SnapshotManager restartedSnapshotMgr = new SnapshotManager(followerSnapDir, restartedStore);
+
+            assertEquals(5, restartedStore.listObjects().size(),
+                "Restarted store should have 5 new objects (commit marker ensures new generation)");
+            System.out.println("Restarted store correctly has 5 new objects");
+
+            // Now simulate crash BEFORE commit marker was written.
+            // In this scenario:
+            // - New snapshot file exists (snapshot-3)
+            // - No commit marker for generation 3
+            // - Metadata file may or may not exist (depending on when crash occurred)
+            //
+            // The system should:
+            // - Not use the new snapshot (no commit marker)
+            // - If no old committed snapshot exists, start empty
+            System.out.println("\nSimulating crash BEFORE commit marker was written...");
+            Files.delete(commitMarker);
+            System.out.println("Commit marker deleted: " + commitMarker.getFileName());
+
+            // Delete metadata file to simulate crash before metadata was published
+            // This tests that without the commit marker, the system doesn't use the new snapshot
+            Files.deleteIfExists(followerMetaFile);
+            System.out.println("Metadata file deleted to simulate crash before publish");
+
+            // Restart - no committed generation → empty state
+            System.out.println("Restarting after deleting commit marker...");
+            MetadataStore afterDeleteStore = new MetadataStore(followerMetaFile);
+            SnapshotManager afterDeleteSnapshotMgr = new SnapshotManager(followerSnapDir, afterDeleteStore);
+
+            // Since commit marker was deleted, generation 3 is NOT committed
+            // No committed generation exists → empty state
+            assertEquals(0, afterDeleteStore.listObjects().size(),
+                "Without commit marker, no committed generation exists → empty state");
+            System.out.println("Correctly recovered empty state (no committed generation)");
+
+            // Verify the new snapshot is NOT loaded (no commit marker = not authoritative)
+            var latestSnapshot = afterDeleteSnapshotMgr.loadLatestSnapshot();
+            assertTrue(latestSnapshot.isEmpty(),
+                "Without commit marker, no snapshot should be considered authoritative");
+            System.out.println("Verified: No authoritative snapshot without commit marker");
+
+            System.out.println("\n========================================");
+            System.out.println("TEST: Commit Marker Determines Authoritative Generation - PASSED");
+            System.out.println("========================================\n");
+
+        } finally {
+            leader.stop();
+            leaderThread.interrupt();
+        }
+    }
+
+    // ===== TEST 6: FAILURE BEFORE COMMIT MARKER =====
+
+    /**
+     * TEST: Failure BEFORE commit marker is written should recover old generation.
+     *
+     * Scenario:
+     * 1. Install snapshot: candidate persisted, state restored, snapshot committed
+     * 2. FAIL during publishCandidate (before commitGeneration)
+     * 3. Restart should recover old state (no commit marker = old generation)
+     */
+    @Test
+    void testFailureBeforeCommitMarkerRecoversOldGeneration() throws Exception {
+        System.out.println("\n========================================");
+        System.out.println("TEST: Failure Before Commit Marker Recovers Old Generation");
+        System.out.println("========================================\n");
+
+        int leaderPort = BASE_PORT + 700;
+
+        Path leaderRaftDir = tempDir.resolve("leader-raft-precommit");
+        Path followerRaftDir = tempDir.resolve("follower-raft-precommit");
+        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Files.createDirectories(leaderRaftDir);
+        Files.createDirectories(followerRaftDir);
+        Files.createDirectories(followerSnapDir);
+
+        // Setup leader
+        ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
+        MetadataStore leaderStore = new MetadataStore(tempDir.resolve("leader-meta-precommit.json"));
+        SnapshotManager leaderSnapshotMgr = new SnapshotManager(leaderRaftDir.resolve("snapshots"), leaderStore);
+        WAL leaderWal = new WAL(leaderRaftDir.resolve("wal.dat"));
+        RaftLog leaderLog = new RaftLog(leaderWal);
+        RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
+        leader.setSnapshotManager(leaderSnapshotMgr);
+        MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
+        leader.setLogEntryApplier(entry -> {
+            try { leaderStateMachine.apply(entry); }
+            catch (IOException e) { throw new RuntimeException(e); }
+        });
+
+        // Setup follower with FailingSnapshotManager that fails on commitGeneration
+        ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
+        Path followerMetaFile = tempDir.resolve("follower-meta-precommit.json");
+        MetadataStore followerStore = new MetadataStore(followerMetaFile);
+        FailingSnapshotManager followerSnapshotMgr = new FailingSnapshotManager(
+            followerSnapDir, followerStore, true); // failOnCommit = true
+        WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
+        RaftLog followerLog = new RaftLog(followerWal);
+        RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
+        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore);
+        MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
+        follower.setLogEntryApplier(entry -> {
+            try { followerStateMachine.apply(entry); }
+            catch (IOException e) { throw new RuntimeException(e); }
+        });
+
+        Thread leaderThread = startNode(leader);
+
+        try {
+            waitForLeader(leader, 5000);
+
+            // Leader creates 5 objects
+            System.out.println("Leader creates 5 objects...");
+            for (int i = 1; i <= 5; i++) {
+                ObjectMetadata obj = makeObject("new-obj" + i, i * 1000L);
+                byte[] data = objectMapper.writeValueAsBytes(obj);
+                LogEntry entry = LogEntry.create(leader.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data);
+                leader.submit(entry);
+            }
+            Thread.sleep(300);
+            leader.compactLog(3);
+
+            var snapshotOpt = leaderSnapshotMgr.loadLatestSnapshot();
+            assertTrue(snapshotOpt.isPresent());
+            var snapshot = snapshotOpt.get();
+            byte[] snapshotData = snapshot.stateData();
+            int checksum = computeChecksum(snapshotData);
+
+            System.out.println("Installing snapshot (will fail during commitGeneration)...");
+            RaftMessage.InstallSnapshot request = new RaftMessage.InstallSnapshot(
+                leader.getCurrentTerm(), "leader",
+                snapshot.lastIncludedIndex(), snapshot.lastIncludedTerm(),
+                0, snapshotData, true, checksum
+            );
+
+            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+                request.term(), request.leaderId(),
+                request.lastIncludedIndex(), request.lastIncludedTerm(),
+                request.offset(), request.data(), request.done(), request.checksum()
+            );
+
+            assertFalse(response.success(), "InstallSnapshot should fail");
+
+            // No commit marker should exist
+            Path commitMarker = followerSnapDir.resolve("generation-" + snapshot.lastIncludedIndex() + ".committed");
+            assertFalse(Files.exists(commitMarker),
+                "No commit marker should exist after failed InstallSnapshot");
+            System.out.println("Confirmed: No commit marker exists (as expected)");
+
+            // Live state should be unchanged (empty)
+            assertEquals(0, followerStore.listObjects().size(),
+                "Live state should be empty (old state unchanged)");
+            System.out.println("Live state is empty (old state unchanged)");
+
+            // Restart should recover old state
+            System.out.println("Restarting...");
+            follower.stop();
+
+            MetadataStore restartedStore = new MetadataStore(followerMetaFile);
+            assertEquals(0, restartedStore.listObjects().size(),
+                "Restarted store should have empty state (old generation, no commit marker)");
+            System.out.println("Correctly recovered old state: empty");
+
+            System.out.println("\n========================================");
+            System.out.println("TEST: Failure Before Commit Marker - PASSED");
+            System.out.println("========================================\n");
+
+        } finally {
+            leader.stop();
+            leaderThread.interrupt();
+        }
+    }
+
     /**
      * TEST: After successful install, two consecutive restarts must yield exact same state.
      */
@@ -751,6 +1044,14 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
                 throw new IOException("Simulated commit failure for atomicity test");
             }
             super.commitCandidateSnapshot(candidateFile, lastIncludedIndex, lastIncludedTerm);
+        }
+
+        @Override
+        public void commitGeneration(long generationIndex, long generationTerm) throws IOException {
+            if (failOnCommit) {
+                throw new IOException("Simulated commit generation failure for atomicity test");
+            }
+            super.commitGeneration(generationIndex, generationTerm);
         }
     }
 

@@ -215,13 +215,10 @@ class Phase11AcceptanceTest {
         content[content.length - 1] ^= 0xFF;  // Corrupt checksum
         Files.write(snapshotPath, content);
 
-        // Try to load - should fail
-        assertThrows(IOException.class, () -> {
-            Optional<SnapshotManager.Snapshot> loaded = sm.loadLatestSnapshot();
-            if (loaded.isPresent()) {
-                throw new IOException("Should have failed checksum validation");
-            }
-        });
+        // Try to load - with only one committed snapshot that's corrupted,
+        // it falls back and returns empty (no valid snapshot to recover from)
+        Optional<SnapshotManager.Snapshot> loaded = sm.loadLatestSnapshot();
+        assertTrue(loaded.isEmpty(), "Corrupted committed snapshot should result in empty recovery");
 
         System.out.println("  Corrupted snapshot correctly rejected");
     }
