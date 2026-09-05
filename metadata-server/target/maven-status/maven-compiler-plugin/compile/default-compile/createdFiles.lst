@@ -26,6 +26,7 @@ com/storix/metadata/NodeRegistry.class
 com/storix/metadata/raft/RaftMessage$ClusterConfiguration.class
 com/storix/metadata/RepairManager$RepairOutcome.class
 com/storix/metadata/wal/WAL.class
+com/storix/metadata/raft/RaftNode$InstallationState.class
 com/storix/metadata/raft/RaftMessage$RequestVoteResponse.class
 com/storix/metadata/MetadataStore.class
 com/storix/metadata/wal/WAL$WALRecoveryData.class

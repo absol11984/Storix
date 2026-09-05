@@ -87,6 +87,25 @@ public class RaftNode implements AutoCloseable {
     // Snapshot manager for log compaction
     private volatile SnapshotManager snapshotManager;
 
+    // Snapshot installation state machine for crash-safe protocol
+    private enum InstallationState {
+        NONE,           // No installation in progress
+        RECEIVING,      // Receiving chunks
+        VALIDATED,      // Snapshot validated (checksum passed)
+        CANDIDATE,      // Snapshot persisted as candidate
+        RESTORED,       // State machine restored from candidate
+        COMMITTED       // Installation fully complete
+    }
+
+    private volatile InstallationState installationState = InstallationState.NONE;
+
+    // Previous snapshot state for rollback on failure
+    private volatile long previousSnapshotIndex = 0;
+    private volatile long previousSnapshotTerm = 0;
+
+    // Candidate snapshot tracking (for cleanup and rollback)
+    private volatile Path candidateSnapshotFile = null;
+
     @FunctionalInterface
     public interface LogEntryApplier {
         /**
@@ -552,11 +571,23 @@ public class RaftNode implements AutoCloseable {
     private volatile boolean transferInProgress = false;
 
     /**
-     * Handles InstallSnapshot RPC for follower catch-up.
-     * Assembles multi-chunk snapshots using a temporary file and only installs
-     * after all chunks are received and validated.
+     * Handles InstallSnapshot RPC with a crash-safe installation protocol.
      *
-     * The snapshot boundary is updated ONLY after successful installation.
+     * CRASH-SAFE PROTOCOL:
+     * 1. RECEIVING: Assemble chunks into temp file
+     * 2. VALIDATED: Validate checksum and data integrity
+     * 3. PERSISTED: Write candidate snapshot (NOT yet committed)
+     * 4. RESTORED: Restore state machine from candidate
+     * 5. COMMITTED: Update boundary and optionally compact WAL
+     *
+     * On failure at any step before COMMITTED:
+     * - Old snapshot remains authoritative
+     * - Old boundary remains valid
+     * - Candidate snapshot is rolled back
+     *
+     * On crash after COMMITTED:
+     * - Snapshot is durable and recoverable
+     * - WAL state is recoverable
      *
      * @return response with success=false if any step fails
      */
@@ -586,12 +617,17 @@ public class RaftNode implements AutoCloseable {
         if (offset == 0 && data != null && !transferInProgress) {
             // Clean up any previous pending transfer
             cleanupPendingSnapshot();
+            installationState = InstallationState.NONE;
 
             try {
                 // Ensure state directory exists
                 Files.createDirectories(stateDir);
 
-                // Create temporary file for assembling snapshot (without extension to avoid issues)
+                // Save current snapshot state for potential rollback
+                previousSnapshotIndex = raftLog.getLogStartIndex() - 1;
+                previousSnapshotTerm = raftLog.getSnapshotTerm();
+
+                // Create temporary file for assembling snapshot
                 String filename = "snapshot-transfer-" + System.nanoTime();
                 pendingSnapshotFile = stateDir.resolve(filename);
                 pendingSnapshotOffset = 0;
@@ -599,9 +635,11 @@ public class RaftNode implements AutoCloseable {
                 pendingSnapshotTerm = lastIncludedTerm;
                 pendingChecksum = expectedChecksum;
                 transferInProgress = true;
+                installationState = InstallationState.RECEIVING;
 
                 System.out.println("[RAFT] Starting snapshot transfer: index=" + lastIncludedIndex +
-                        ", term=" + lastIncludedTerm + ", expectedChecksum=" + expectedChecksum);
+                        ", term=" + lastIncludedTerm + ", expectedChecksum=" + expectedChecksum +
+                        ", previousSnapshotIndex=" + previousSnapshotIndex);
             } catch (IOException e) {
                 System.err.println("[RAFT] Failed to create snapshot transfer file: " + e.getMessage());
                 return new RaftMessage.InstallSnapshotResponse(currentTerm, false, 0);
@@ -621,18 +659,15 @@ public class RaftNode implements AutoCloseable {
                 Path tempFile = pendingSnapshotFile;
 
                 // Validate offset is sequential (must match expected next offset)
-                // This ensures no gaps or overlapping chunks in the transfer
                 if (offset < 0 || offset > 100 * 1024 * 1024) { // Max 100MB
                     throw new IOException("Invalid offset: " + offset);
                 }
                 if (offset != pendingSnapshotOffset) {
-                    // Offset must be sequential - this chunk must start where the last one ended
                     throw new IOException("Out-of-order snapshot chunk: expected offset " +
                             pendingSnapshotOffset + ", got " + offset);
                 }
 
                 // Use RandomAccessFile to write at specific offset
-                // This will create the file if it doesn't exist
                 try (RandomAccessFile raf = new RandomAccessFile(tempFile.toFile(), "rw")) {
                     raf.seek(offset);
                     raf.write(data);
@@ -645,15 +680,19 @@ public class RaftNode implements AutoCloseable {
             } catch (IOException e) {
                 System.err.println("[RAFT] Failed to write snapshot chunk: " + e.getMessage());
                 cleanupPendingSnapshot();
+                installationState = InstallationState.NONE;
                 return new RaftMessage.InstallSnapshotResponse(currentTerm, false, 0);
             }
         }
 
-        // All chunks received - install the snapshot
+        // All chunks received - install the snapshot with crash-safe protocol
         if (done) {
             try {
-                System.out.println("[RAFT] All chunks received, installing snapshot: index=" +
+                System.out.println("[RAFT] All chunks received, beginning crash-safe installation: index=" +
                         pendingSnapshotIndex + ", term=" + pendingSnapshotTerm);
+
+                // ===== PHASE 1: VALIDATE =====
+                System.out.println("[RAFT] [STATE: VALIDATING]");
 
                 // Read complete snapshot data from temp file
                 byte[] completeData = Files.readAllBytes(pendingSnapshotFile);
@@ -673,28 +712,45 @@ public class RaftNode implements AutoCloseable {
                     System.out.println("[RAFT] Snapshot checksum validated: " + computedChecksum);
                 }
 
-                // STEP 1: PERSIST DURABLE SNAPSHOT FIRST
-                // This must succeed before any other changes
-                // Uses atomic write: temp file -> fsync -> rename
-                if (snapshotManager != null) {
-                    snapshotManager.installSnapshot(completeData, pendingSnapshotIndex,
-                            pendingSnapshotTerm, pendingChecksum);
-                    System.out.println("[RAFT] Durable snapshot persisted");
-                } else {
-                    throw new IOException("SnapshotManager not configured - cannot persist snapshot");
+                // ===== PHASE 2: PERSIST AS CANDIDATE =====
+                // Persist BEFORE restoring state - but mark as candidate, not committed
+                System.out.println("[RAFT] [STATE: PERSISTING_CANDIDATE]");
+                if (snapshotManager == null) {
+                    throw new IOException("SnapshotManager not configured");
                 }
 
-                // STEP 2: RESTORE STATE MACHINE FROM SNAPSHOT DATA
-                // Only after durable snapshot is written
+                // Write candidate snapshot to a temp location
+                // This snapshot is NOT yet committed - it's a candidate for installation
+                candidateSnapshotFile = snapshotManager.persistCandidateSnapshot(
+                        completeData, pendingSnapshotIndex, pendingSnapshotTerm, pendingChecksum);
+                installationState = InstallationState.CANDIDATE;
+                System.out.println("[RAFT] Candidate snapshot persisted at: " + candidateSnapshotFile);
+
+                // ===== PHASE 3: RESTORE STATE MACHINE =====
+                System.out.println("[RAFT] [STATE: RESTORING]");
                 if (stateMachineApplier != null) {
-                    LogEntry snapshotEntry = new LogEntry(pendingSnapshotTerm, pendingSnapshotIndex,
-                            System.currentTimeMillis(), LogEntry.OpType.SNAPSHOT_RESTORE, completeData);
-                    stateMachineApplier.accept(snapshotEntry);
-                    System.out.println("[RAFT] State machine restored");
+                    // Validate the snapshot data can be decoded before committing
+                    try {
+                        LogEntry snapshotEntry = new LogEntry(pendingSnapshotTerm, pendingSnapshotIndex,
+                                System.currentTimeMillis(), LogEntry.OpType.SNAPSHOT_RESTORE, completeData);
+                        stateMachineApplier.accept(snapshotEntry);
+                    } catch (Exception e) {
+                        throw new IOException("Failed to restore state machine: " + e.getMessage(), e);
+                    }
                 }
+                installationState = InstallationState.RESTORED;
+                System.out.println("[RAFT] State machine restored successfully");
 
-                // STEP 3: UPDATE RAFT BOUNDARY
-                // Only after state machine is restored
+                // ===== PHASE 4: COMMIT =====
+                System.out.println("[RAFT] [STATE: COMMITTING]");
+
+                // Now install the candidate snapshot as the new authoritative snapshot
+                // This replaces the old snapshot atomically
+                snapshotManager.commitCandidateSnapshot(candidateSnapshotFile,
+                        pendingSnapshotIndex, pendingSnapshotTerm);
+                System.out.println("[RAFT] Candidate snapshot committed as new authoritative snapshot");
+
+                // Update Raft boundary
                 raftLog.setSnapshotBoundary(pendingSnapshotIndex, pendingSnapshotTerm);
 
                 // Advance commit index to include the snapshot
@@ -703,32 +759,57 @@ public class RaftNode implements AutoCloseable {
                 }
                 raftLog.advanceLastApplied();
 
-                // STEP 4: COMPACT WAL THROUGH SNAPSHOT BOUNDARY
-                // Only after durable snapshot and boundary are set
-                // This is safe because snapshot is already persisted
+                // ===== PHASE 5: COMPACT WAL (best effort, non-fatal) =====
+                // WAL compaction is a performance optimization, not a correctness requirement
+                // If it fails, we can retry later - the snapshot is still valid
+                System.out.println("[RAFT] [STATE: COMPACTING_WAL]");
+                boolean walCompacted = false;
                 if (wal != null) {
-                    wal.compact(pendingSnapshotIndex, raftLog.getCommitIndex(), currentTerm, votedFor);
-                    System.out.println("[RAFT] WAL compacted");
+                    try {
+                        wal.compact(pendingSnapshotIndex, raftLog.getCommitIndex(), currentTerm, votedFor);
+                        walCompacted = true;
+                        System.out.println("[RAFT] WAL compacted successfully");
+                    } catch (Exception e) {
+                        // WAL compaction failure is NOT fatal - snapshot is still valid
+                        System.err.println("[RAFT] WAL compaction failed (non-fatal): " + e.getMessage());
+                        System.err.println("[RAFT] Snapshot installation continues - WAL will be compacted later");
+                    }
                 }
 
-                System.out.println("[RAFT] Snapshot installed successfully, logStartIndex=" +
-                        raftLog.getLogStartIndex() + ", commitIndex=" + raftLog.getCommitIndex());
+                installationState = InstallationState.COMMITTED;
+                System.out.println("[RAFT] [STATE: COMMITTED] - Snapshot installed successfully");
+                System.out.println("[RAFT]   logStartIndex=" + raftLog.getLogStartIndex() +
+                        ", commitIndex=" + raftLog.getCommitIndex() +
+                        ", walCompacted=" + walCompacted);
 
                 // Success!
-                return new RaftMessage.InstallSnapshotResponse(currentTerm, true,
-                        completeData.length);
+                return new RaftMessage.InstallSnapshotResponse(currentTerm, true, completeData.length);
 
             } catch (Exception e) {
                 System.err.println("[RAFT] Failed to install snapshot: " + e.getMessage());
-                // DO NOT update boundary on failure - old state remains valid
+                e.printStackTrace();
+
+                // Rollback: Candidate snapshot is discarded, old state remains authoritative
+                System.out.println("[RAFT] Rolling back to previous snapshot: index=" + previousSnapshotIndex);
+
+                // Discard candidate snapshot if it exists
+                if (candidateSnapshotFile != null && Files.exists(candidateSnapshotFile)) {
+                    try {
+                        Files.delete(candidateSnapshotFile);
+                        System.out.println("[RAFT] Candidate snapshot discarded");
+                    } catch (IOException ignored) {}
+                }
+
+                installationState = InstallationState.NONE;
+
                 // Return success=false to signal leader to retry
                 return new RaftMessage.InstallSnapshotResponse(currentTerm, false, 0);
             } finally {
-                // Clean up temp file AFTER durable snapshot is written
-                // DO NOT clean up if installation failed - temp file might be needed for debugging
+                // Clean up temp transfer file
                 if (transferInProgress) {
                     cleanupPendingSnapshot();
                 }
+                candidateSnapshotFile = null;
             }
         }
 

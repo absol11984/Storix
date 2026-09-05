@@ -42,6 +42,34 @@ public class SnapshotManager {
         this.store = store;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.enable(SerializationFeature.INDENT_OUTPUT);
+
+        // Clean up any stale candidate files from previous failed installations
+        cleanupStaleCandidates();
+    }
+
+    /**
+     * Cleans up any stale candidate snapshot files from previous failed installations.
+     * Called on startup to ensure we don't have orphaned candidate files.
+     */
+    private void cleanupStaleCandidates() {
+        if (!Files.exists(snapshotDir)) {
+            return;
+        }
+        try {
+            Files.list(snapshotDir)
+                .filter(p -> p.getFileName().toString().contains("-candidate-"))
+                .filter(Files::isRegularFile)
+                .forEach(p -> {
+                    try {
+                        Files.delete(p);
+                        System.out.println("[SNAPSHOT] Cleaned up stale candidate: " + p.getFileName());
+                    } catch (IOException e) {
+                        System.err.println("[SNAPSHOT] Failed to clean up candidate: " + p);
+                    }
+                });
+        } catch (IOException e) {
+            System.err.println("[SNAPSHOT] Failed to list directory for candidate cleanup: " + e.getMessage());
+        }
     }
 
     /**
@@ -121,6 +149,7 @@ public class SnapshotManager {
         try {
             snapshots = Files.list(snapshotDir)
                     .filter(p -> p.getFileName().toString().startsWith(SNAPSHOT_PREFIX))
+                    .filter(p -> !p.getFileName().toString().contains("-candidate-")) // Exclude candidate files
                     .filter(Files::isRegularFile)
                     .collect(java.util.stream.Collectors.toList());
         } catch (IOException e) {
@@ -280,6 +309,7 @@ public class SnapshotManager {
     private void cleanupOldSnapshots() throws IOException {
         List<Path> allSnapshots = Files.list(snapshotDir)
                 .filter(p -> p.getFileName().toString().startsWith(SNAPSHOT_PREFIX))
+                .filter(p -> !p.getFileName().toString().contains("-candidate-")) // Exclude candidate files
                 .filter(Files::isRegularFile)
                 .collect(java.util.stream.Collectors.toList());
 
@@ -407,6 +437,117 @@ public class SnapshotManager {
      */
     public Path getSnapshotDir() {
         return snapshotDir;
+    }
+
+    private static final String CANDIDATE_PREFIX = "snapshot-candidate-";
+
+    /**
+     * Persists a snapshot as a candidate (not yet committed).
+     * The snapshot is written to a candidate file that will not replace
+     * the current authoritative snapshot until commitCandidateSnapshot is called.
+     *
+     * @param stateData The complete state data (JSON) to store in the snapshot
+     * @param lastIncludedIndex The last log index included in this snapshot
+     * @param lastIncludedTerm The term of the entry at lastIncludedIndex
+     * @param expectedChecksum The expected CRC32 checksum (0 to skip validation)
+     * @return Path to the candidate snapshot file
+     * @throws IOException if persistence fails
+     */
+    public Path persistCandidateSnapshot(byte[] stateData, long lastIncludedIndex,
+                                        long lastIncludedTerm, int expectedChecksum) throws IOException {
+        // Validate checksum if provided
+        if (expectedChecksum != 0) {
+            int computedChecksum = computeChecksum(stateData);
+            if (computedChecksum != expectedChecksum) {
+                throw new IOException("Snapshot checksum mismatch: expected " +
+                        expectedChecksum + ", computed " + computedChecksum);
+            }
+        }
+
+        // Validate state data
+        if (stateData == null || stateData.length == 0) {
+            throw new IOException("Snapshot state data is empty");
+        }
+
+        Files.createDirectories(snapshotDir);
+
+        // Write to candidate file with unique ID
+        long candidateId = System.nanoTime();
+        String candidateFilename = CANDIDATE_PREFIX + lastIncludedIndex + "-" + candidateId + ".tmp";
+        Path candidateFile = snapshotDir.resolve(candidateFilename);
+
+        // Compute checksum for the snapshot file
+        int checksum = computeChecksum(stateData);
+
+        try (FileOutputStream fos = new FileOutputStream(candidateFile.toFile());
+             FileChannel fc = fos.getChannel()) {
+
+            // Format same as regular snapshots
+            ByteBuffer headerBuf = ByteBuffer.allocate(12 + 16 + 4);
+            headerBuf.putLong(SNAPSHOT_MAGIC);
+            headerBuf.putInt(SNAPSHOT_VERSION);
+            headerBuf.putLong(lastIncludedIndex);
+            headerBuf.putLong(lastIncludedTerm);
+            headerBuf.putInt(stateData.length);
+            headerBuf.flip();
+            fc.write(headerBuf);
+
+            fc.write(ByteBuffer.wrap(stateData));
+
+            ByteBuffer checksumBuf = ByteBuffer.allocate(4);
+            checksumBuf.putInt(checksum);
+            checksumBuf.flip();
+            fc.write(checksumBuf);
+
+            fc.force(true);
+        }
+
+        System.out.println("[SNAPSHOT] Persisted candidate snapshot at: " + candidateFile);
+
+        return candidateFile;
+    }
+
+    /**
+     * Commits a candidate snapshot as the new authoritative snapshot.
+     * This atomically replaces any existing snapshot at the same index.
+     *
+     * @param candidateFile The candidate snapshot file to commit
+     * @param lastIncludedIndex The last log index included in this snapshot
+     * @param lastIncludedTerm The term of the entry at lastIncludedIndex
+     * @throws IOException if commit fails
+     */
+    public void commitCandidateSnapshot(Path candidateFile, long lastIncludedIndex, long lastIncludedTerm) throws IOException {
+        if (candidateFile == null || !Files.exists(candidateFile)) {
+            throw new IOException("Candidate snapshot file does not exist: " + candidateFile);
+        }
+
+        // The authoritative snapshot filename
+        String filename = SNAPSHOT_PREFIX + lastIncludedIndex;
+        Path snapshotFile = snapshotDir.resolve(filename);
+
+        // Validate the candidate snapshot can be loaded before committing
+        Optional<Snapshot> candidateSnapshot = loadSnapshot(candidateFile);
+        if (candidateSnapshot.isEmpty()) {
+            throw new IOException("Candidate snapshot is corrupted and cannot be loaded");
+        }
+
+        // Verify metadata matches
+        Snapshot snap = candidateSnapshot.get();
+        if (snap.lastIncludedIndex() != lastIncludedIndex || snap.lastIncludedTerm() != lastIncludedTerm) {
+            throw new IOException("Candidate snapshot metadata mismatch: expected index=" +
+                    lastIncludedIndex + ", term=" + lastIncludedTerm +
+                    ", got index=" + snap.lastIncludedIndex() + ", term=" + snap.lastIncludedTerm());
+        }
+
+        // Atomic rename - candidate becomes the new authoritative snapshot
+        Files.move(candidateFile, snapshotFile,
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+
+        System.out.println("[SNAPSHOT] Committed candidate snapshot as authoritative: index=" +
+                lastIncludedIndex + ", term=" + lastIncludedTerm);
+
+        // Cleanup old snapshots
+        cleanupOldSnapshots();
     }
 
     /**

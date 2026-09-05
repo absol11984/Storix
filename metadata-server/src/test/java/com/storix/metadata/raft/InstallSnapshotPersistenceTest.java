@@ -625,6 +625,385 @@ class InstallSnapshotPersistenceTest {
     }
 
     /**
+     * TEST 5: Candidate snapshot not visible until committed
+     * Verifies that the candidate file pattern is used and candidate files
+     * are not visible to external callers during installation.
+     */
+    @Test
+    void testCandidateSnapshotNotVisibleDuringInstallation() throws Exception {
+        System.out.println("\n========================================");
+        System.out.println("TEST: Candidate Snapshot Not Visible During Installation");
+        System.out.println("========================================\n");
+
+        int leaderPort = BASE_PORT + 500;
+
+        Path leaderRaftDir = tempDir.resolve("leader-raft5");
+        Path followerRaftDir = tempDir.resolve("follower-raft5");
+        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Files.createDirectories(leaderRaftDir);
+        Files.createDirectories(followerSnapDir);
+
+        // Create leader
+        ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
+        MetadataStore leaderStore = new MetadataStore(tempDir.resolve("leader-meta5.json"));
+        SnapshotManager leaderSnapshotMgr = new SnapshotManager(leaderRaftDir.resolve("snapshots"), leaderStore);
+        WAL leaderWal = new WAL(leaderRaftDir.resolve("wal.dat"));
+        RaftLog leaderLog = new RaftLog(leaderWal);
+        RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
+        leader.setSnapshotManager(leaderSnapshotMgr);
+        MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
+        leader.setLogEntryApplier(entry -> {
+            try {
+                leaderStateMachine.apply(entry);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        // Create follower
+        ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
+        MetadataStore followerStore = new MetadataStore(tempDir.resolve("follower-meta5.json"));
+        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerSnapDir, followerStore);
+        WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
+        RaftLog followerLog = new RaftLog(followerWal);
+        RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
+        follower.setSnapshotManager(followerSnapshotMgr);
+        MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
+        follower.setLogEntryApplier(entry -> {
+            try {
+                followerStateMachine.apply(entry);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        Thread leaderThread = startNode(leader);
+
+        try {
+            waitForLeader(leader, 5000);
+
+            // Create leader data and snapshot
+            System.out.println("Creating leader data and snapshot...");
+            for (int i = 1; i <= 20; i++) {
+                ObjectMetadata obj = makeObject("obj" + i, i * 1000);
+                byte[] data = objectMapper.writeValueAsBytes(obj);
+                LogEntry entry = LogEntry.create(leader.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data);
+                leader.submit(entry);
+            }
+            Thread.sleep(300);
+            leader.compactLog(10);
+
+            var snapshotOpt = leaderSnapshotMgr.loadLatestSnapshot();
+            assertTrue(snapshotOpt.isPresent());
+            var snapshot = snapshotOpt.get();
+            byte[] snapshotData = snapshot.stateData();
+            int checksum = computeChecksum(snapshotData);
+
+            // Clear follower snapshot dir and install
+            follower.compactLog(0); // Start fresh
+
+            // Before install - no snapshots
+            var beforeSnapshots = Files.list(followerSnapDir)
+                .filter(p -> !p.getFileName().toString().contains("-candidate-"))
+                .filter(Files::isRegularFile)
+                .count();
+            assertEquals(0, beforeSnapshots, "Should have no snapshots before install");
+
+            // Count candidate files before
+            long beforeCandidates = Files.list(followerSnapDir)
+                .filter(p -> p.getFileName().toString().contains("-candidate-"))
+                .count();
+
+            // Install snapshot
+            System.out.println("Installing snapshot...");
+            RaftMessage.InstallSnapshot request = new RaftMessage.InstallSnapshot(
+                leader.getCurrentTerm(), "leader",
+                snapshot.lastIncludedIndex(), snapshot.lastIncludedTerm(),
+                0, snapshotData, true, checksum
+            );
+
+            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+                request.term(), request.leaderId(),
+                request.lastIncludedIndex(), request.lastIncludedTerm(),
+                request.offset(), request.data(), request.done(), request.checksum()
+            );
+
+            assertTrue(response.success(), "InstallSnapshot should succeed");
+
+            // After install - verify committed snapshot exists
+            var afterSnapshots = Files.list(followerSnapDir)
+                .filter(p -> !p.getFileName().toString().contains("-candidate-"))
+                .filter(Files::isRegularFile)
+                .count();
+            assertEquals(1, afterSnapshots, "Should have exactly 1 committed snapshot");
+
+            // Count candidate files after - should be cleaned up
+            long afterCandidates = Files.list(followerSnapDir)
+                .filter(p -> p.getFileName().toString().contains("-candidate-"))
+                .count();
+            assertEquals(beforeCandidates, afterCandidates, "Candidate files should be cleaned up after install");
+
+            System.out.println("  Before: " + beforeSnapshots + " committed, " + beforeCandidates + " candidates");
+            System.out.println("  After: " + afterSnapshots + " committed, " + afterCandidates + " candidates");
+
+            System.out.println("\n========================================");
+            System.out.println("TEST: Candidate Snapshot Not Visible During Installation - PASSED");
+            System.out.println("========================================\n");
+
+        } finally {
+            leader.stop();
+            leaderThread.interrupt();
+        }
+    }
+
+    /**
+     * TEST 6: Corrupted snapshot during multi-chunk transfer
+     * Verifies that corruption in any chunk causes installation failure
+     * and leaves old state intact.
+     */
+    @Test
+    void testCorruptedSnapshotInTransferFails() throws Exception {
+        System.out.println("\n========================================");
+        System.out.println("TEST: Corrupted Snapshot In Transfer Fails");
+        System.out.println("========================================\n");
+
+        int leaderPort = BASE_PORT + 600;
+
+        Path leaderRaftDir = tempDir.resolve("leader-raft6");
+        Path followerRaftDir = tempDir.resolve("follower-raft6");
+        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Files.createDirectories(leaderRaftDir);
+        Files.createDirectories(followerSnapDir);
+
+        // Create leader
+        ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
+        MetadataStore leaderStore = new MetadataStore(tempDir.resolve("leader-meta6.json"));
+        SnapshotManager leaderSnapshotMgr = new SnapshotManager(leaderRaftDir.resolve("snapshots"), leaderStore);
+        WAL leaderWal = new WAL(leaderRaftDir.resolve("wal.dat"));
+        RaftLog leaderLog = new RaftLog(leaderWal);
+        RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
+        leader.setSnapshotManager(leaderSnapshotMgr);
+        MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
+        leader.setLogEntryApplier(entry -> {
+            try {
+                leaderStateMachine.apply(entry);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        // Create follower
+        ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
+        MetadataStore followerStore = new MetadataStore(tempDir.resolve("follower-meta6.json"));
+        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerSnapDir, followerStore);
+        WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
+        RaftLog followerLog = new RaftLog(followerWal);
+        RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
+        follower.setSnapshotManager(followerSnapshotMgr);
+        MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
+        follower.setLogEntryApplier(entry -> {
+            try {
+                followerStateMachine.apply(entry);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        Thread leaderThread = startNode(leader);
+
+        try {
+            waitForLeader(leader, 5000);
+
+            // Create initial follower state
+            System.out.println("Creating initial follower state...");
+            for (int i = 1; i <= 5; i++) {
+                ObjectMetadata obj = makeObject("initial" + i, i * 100);
+                byte[] data = objectMapper.writeValueAsBytes(obj);
+                LogEntry entry = LogEntry.create(leader.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data);
+                follower.submit(entry);
+            }
+            Thread.sleep(300);
+
+            // Record initial state
+            Map<String, Long> initialState = new HashMap<>();
+            for (String name : followerStore.listObjects()) {
+                followerStore.getObject(name).ifPresent(obj -> initialState.put(name, obj.getFileSize()));
+            }
+
+            // Create leader snapshot
+            for (int i = 6; i <= 20; i++) {
+                ObjectMetadata obj = makeObject("new" + i, i * 100);
+                byte[] data = objectMapper.writeValueAsBytes(obj);
+                LogEntry entry = LogEntry.create(leader.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data);
+                leader.submit(entry);
+            }
+            Thread.sleep(300);
+            leader.compactLog(10);
+
+            var snapshotOpt = leaderSnapshotMgr.loadLatestSnapshot();
+            assertTrue(snapshotOpt.isPresent());
+            var snapshot = snapshotOpt.get();
+            byte[] snapshotData = snapshot.stateData();
+            int correctChecksum = computeChecksum(snapshotData);
+
+            // CORRUPT the data before sending
+            byte[] corruptedData = snapshotData.clone();
+            if (corruptedData.length > 100) {
+                corruptedData[100] = (byte) ~corruptedData[100]; // Flip a bit
+            }
+
+            System.out.println("Installing CORRUPTED snapshot (checksum=" + correctChecksum + ")...");
+
+            // First chunk with corrupted data but wrong checksum
+            RaftMessage.InstallSnapshot request = new RaftMessage.InstallSnapshot(
+                leader.getCurrentTerm(), "leader",
+                snapshot.lastIncludedIndex(), snapshot.lastIncludedTerm(),
+                0, corruptedData, true, correctChecksum + 1 // Wrong checksum
+            );
+
+            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+                request.term(), request.leaderId(),
+                request.lastIncludedIndex(), request.lastIncludedTerm(),
+                request.offset(), request.data(), request.done(), request.checksum()
+            );
+
+            assertFalse(response.success(), "InstallSnapshot should fail with corrupted data");
+
+            // VERIFY: Old state is intact
+            Map<String, Long> stateAfterFail = new HashMap<>();
+            for (String name : followerStore.listObjects()) {
+                followerStore.getObject(name).ifPresent(obj -> stateAfterFail.put(name, obj.getFileSize()));
+            }
+
+            assertEquals(initialState.size(), stateAfterFail.size(),
+                "State should be unchanged after failed InstallSnapshot");
+            for (String name : initialState.keySet()) {
+                assertTrue(stateAfterFail.containsKey(name),
+                    "Object " + name + " should still exist");
+            }
+
+            System.out.println("  Old state verified intact after corrupted snapshot install");
+
+            System.out.println("\n========================================");
+            System.out.println("TEST: Corrupted Snapshot In Transfer Fails - PASSED");
+            System.out.println("========================================\n");
+
+        } finally {
+            leader.stop();
+            leaderThread.interrupt();
+        }
+    }
+
+    /**
+     * TEST 7: InstallSnapshot with stale/old term is rejected
+     * Ensures that InstallSnapshot from an outdated leader is properly rejected.
+     */
+    @Test
+    void testInstallSnapshotFromStaleTermRejected() throws Exception {
+        System.out.println("\n========================================");
+        System.out.println("TEST: InstallSnapshot From Stale Term Rejected");
+        System.out.println("========================================\n");
+
+        int leaderPort = BASE_PORT + 700;
+
+        Path leaderRaftDir = tempDir.resolve("leader-raft7");
+        Path followerRaftDir = tempDir.resolve("follower-raft7");
+        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Files.createDirectories(leaderRaftDir);
+        Files.createDirectories(followerSnapDir);
+
+        // Create leader
+        ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
+        MetadataStore leaderStore = new MetadataStore(tempDir.resolve("leader-meta7.json"));
+        SnapshotManager leaderSnapshotMgr = new SnapshotManager(leaderRaftDir.resolve("snapshots"), leaderStore);
+        WAL leaderWal = new WAL(leaderRaftDir.resolve("wal.dat"));
+        RaftLog leaderLog = new RaftLog(leaderWal);
+        RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
+        leader.setSnapshotManager(leaderSnapshotMgr);
+        MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
+        leader.setLogEntryApplier(entry -> {
+            try {
+                leaderStateMachine.apply(entry);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        // Create follower
+        ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
+        MetadataStore followerStore = new MetadataStore(tempDir.resolve("follower-meta7.json"));
+        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerSnapDir, followerStore);
+        WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
+        RaftLog followerLog = new RaftLog(followerWal);
+        RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
+        follower.setSnapshotManager(followerSnapshotMgr);
+        MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
+        follower.setLogEntryApplier(entry -> {
+            try {
+                followerStateMachine.apply(entry);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        Thread leaderThread = startNode(leader);
+
+        try {
+            waitForLeader(leader, 5000);
+            long leaderTerm = leader.getCurrentTerm();
+
+            // Create leader data
+            for (int i = 1; i <= 10; i++) {
+                ObjectMetadata obj = makeObject("obj" + i, i * 1000);
+                byte[] data = objectMapper.writeValueAsBytes(obj);
+                LogEntry entry = LogEntry.create(leader.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data);
+                leader.submit(entry);
+            }
+            Thread.sleep(300);
+            leader.compactLog(5);
+
+            var snapshotOpt = leaderSnapshotMgr.loadLatestSnapshot();
+            assertTrue(snapshotOpt.isPresent());
+            var snapshot = snapshotOpt.get();
+            byte[] snapshotData = snapshot.stateData();
+            int checksum = computeChecksum(snapshotData);
+
+            // Try to install snapshot with STALE term (leaderTerm - 1)
+            long staleTerm = leaderTerm - 1;
+            System.out.println("Trying to install snapshot with stale term " + staleTerm +
+                    " (current term=" + leaderTerm + ")...");
+
+            RaftMessage.InstallSnapshot request = new RaftMessage.InstallSnapshot(
+                staleTerm, "leader",
+                snapshot.lastIncludedIndex(), snapshot.lastIncludedTerm(),
+                0, snapshotData, true, checksum
+            );
+
+            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+                request.term(), request.leaderId(),
+                request.lastIncludedIndex(), request.lastIncludedTerm(),
+                request.offset(), request.data(), request.done(), request.checksum()
+            );
+
+            assertFalse(response.success(), "InstallSnapshot should be rejected from stale term");
+
+            // Verify follower state is unchanged
+            int objectCount = followerStore.listObjects().size();
+            assertEquals(0, objectCount, "Follower should not have any objects");
+
+            System.out.println("  Stale term snapshot rejected, state unchanged");
+
+            System.out.println("\n========================================");
+            System.out.println("TEST: InstallSnapshot From Stale Term Rejected - PASSED");
+            System.out.println("========================================\n");
+
+        } finally {
+            leader.stop();
+            leaderThread.interrupt();
+        }
+    }
+
+    /**
      * Helper: Wait for node to become leader.
      */
     private void waitForLeader(RaftNode node, long timeoutMs) throws InterruptedException {
