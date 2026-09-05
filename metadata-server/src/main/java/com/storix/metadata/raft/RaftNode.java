@@ -104,13 +104,19 @@ public class RaftNode implements AutoCloseable {
 
     // Previous snapshot state for rollback on failure
     private volatile long previousSnapshotIndex = 0;
-    private volatile long previousSnapshotTerm = 0;
+    private volatile long previousSnapshotIndexTerm = 0;
 
     // Candidate snapshot tracking (for cleanup and rollback)
     private volatile Path candidateSnapshotFile = null;
 
     // Candidate state for isolated restoration (prevents partial live state modification)
     private volatile Map<String, com.storix.metadata.ObjectMetadata> candidateState = null;
+
+    // Backup file for metadata rollback - created before publishing candidate
+    private volatile Path metadataBackupFile = null;
+
+    // Track whether metadata was published during this installation attempt
+    private volatile boolean metadataPublished = false;
 
     @FunctionalInterface
     public interface LogEntryApplier {
@@ -647,7 +653,7 @@ public class RaftNode implements AutoCloseable {
 
                 // Save current snapshot state for potential rollback
                 previousSnapshotIndex = raftLog.getLogStartIndex() - 1;
-                previousSnapshotTerm = raftLog.getSnapshotTerm();
+                previousSnapshotIndexTerm = raftLog.getSnapshotTerm();
 
                 // Create temporary file for assembling snapshot
                 String filename = "snapshot-transfer-" + System.nanoTime();
@@ -771,32 +777,81 @@ public class RaftNode implements AutoCloseable {
                 // ===== PHASE 4: COMMIT =====
                 System.out.println("[RAFT] [STATE: COMMITTING]");
 
-                // Step 1: Commit the candidate snapshot as the new authoritative snapshot FIRST.
-                // This makes the snapshot file authoritative but not yet committed (no commit marker).
-                // If this fails, we haven't modified anything yet.
+                // CRITICAL ORDERING: The commit marker is the atomic decision point.
+                // Before the commit marker, the new generation is NOT authoritative.
+                // After the commit marker, everything must be ready.
+                //
+                // Order:
+                // 1. Publish candidate metadata FIRST - makes metadata durable
+                // 2. Commit candidate snapshot SECOND - makes snapshot durable
+                // 3. Write commit marker THIRD - this is the atomic commit point
+                //
+                // If we crash:
+                // - Before step 1: Old generation remains authoritative
+                // - Before step 3: Old generation remains authoritative (no commit marker)
+                // - After step 3: New generation is authoritative (both snapshot and metadata are durable)
+
+                // Step 1: Backup current metadata before publishing candidate.
+                // This allows us to rollback if later steps fail.
+                // We backup BEFORE any modification so we can restore old state.
+                metadataBackupFile = null;
+                metadataPublished = false;
+                if (candidateState != null && !candidateState.isEmpty()) {
+                    try {
+                        metadataBackupFile = metadataStore.backupStorage();
+                        if (metadataBackupFile != null) {
+                            System.out.println("[RAFT] Metadata backed up to: " + metadataBackupFile.getFileName());
+                        } else {
+                            System.out.println("[RAFT] No existing metadata to backup (empty generation)");
+                        }
+                    } catch (IOException e) {
+                        System.err.println("[RAFT] Failed to backup metadata: " + e.getMessage());
+                        // Continue without backup - if we fail later, we'll restore from old snapshot
+                    }
+                }
+
+                // Step 2: Publish candidate state to live store.
+                // This makes the metadata durable for the new generation.
+                // If this fails, we rollback to the backup.
+                if (candidateState != null && !candidateState.isEmpty()) {
+                    metadataStore.publishCandidate(candidateState, pendingSnapshotIndex);
+                    metadataPublished = true;
+                    System.out.println("[RAFT] Candidate metadata published to live store (generation=" + pendingSnapshotIndex + ")");
+                }
+
+                // Step 3: Commit the candidate snapshot as the new authoritative snapshot.
+                // This makes the snapshot durable for the new generation.
                 snapshotManager.commitCandidateSnapshot(candidateSnapshotFile,
                         pendingSnapshotIndex, pendingSnapshotTerm);
                 System.out.println("[RAFT] Candidate snapshot committed as new authoritative snapshot");
 
-                // Step 2: Write commit marker SECOND - this is the point of authority.
-                // Only snapshots with commit markers are authoritative on recovery.
+                // Step 4: Write commit marker LAST - this is the atomic commit point.
+                // Only after this marker exists is the new generation authoritative.
                 // If we crash BEFORE this step, the old generation remains authoritative.
                 // If we crash AFTER this step, the new generation is authoritative.
                 snapshotManager.commitGeneration(pendingSnapshotIndex, pendingSnapshotTerm);
                 System.out.println("[RAFT] Commit marker written for generation " + pendingSnapshotIndex);
 
-                // Step 3: Publish candidate state to live store LAST.
-                // This is the final step - metadata is only authoritative if commit marker exists.
-                // If we crash AFTER successful commit marker but BEFORE publish:
-                // - Commit marker exists → new generation is authoritative
-                // - Metadata may be stale → recovery rebuilds from snapshot
-                // This ensures: no commit marker = no metadata modification
-                if (candidateState != null && !candidateState.isEmpty()) {
-                    metadataStore.publishCandidate(candidateState, pendingSnapshotIndex);
-                    System.out.println("[RAFT] Candidate state published to live store (generation=" + pendingSnapshotIndex + ")");
+                // Clean up metadata backup after successful commit
+                if (metadataBackupFile != null) {
+                    metadataStore.deleteBackup(metadataBackupFile);
+                    metadataBackupFile = null;
                 }
 
-                // Update Raft boundary
+                // Step 2: Commit the candidate snapshot as the new authoritative snapshot.
+                // This makes the snapshot durable for the new generation.
+                snapshotManager.commitCandidateSnapshot(candidateSnapshotFile,
+                        pendingSnapshotIndex, pendingSnapshotTerm);
+                System.out.println("[RAFT] Candidate snapshot committed as new authoritative snapshot");
+
+                // Step 3: Write commit marker LAST - this is the atomic commit point.
+                // Only after this marker exists is the new generation authoritative.
+                // If we crash BEFORE this step, the old generation remains authoritative.
+                // If we crash AFTER this step, the new generation is authoritative.
+                snapshotManager.commitGeneration(pendingSnapshotIndex, pendingSnapshotTerm);
+                System.out.println("[RAFT] Commit marker written for generation " + pendingSnapshotIndex);
+
+                // Now that commit marker exists, update Raft boundary
                 raftLog.setSnapshotBoundary(pendingSnapshotIndex, pendingSnapshotTerm);
 
                 // Advance commit index to include the snapshot
@@ -839,20 +894,20 @@ public class RaftNode implements AutoCloseable {
                 // Rollback: Candidate snapshot is discarded, old state remains authoritative
                 System.out.println("[RAFT] Rolling back to previous snapshot: index=" + previousSnapshotIndex);
 
-                // Discard candidate snapshot if it exists
-                if (candidateSnapshotFile != null && Files.exists(candidateSnapshotFile)) {
-                    try {
-                        Files.delete(candidateSnapshotFile);
-                        System.out.println("[RAFT] Candidate snapshot discarded");
-                    } catch (IOException ignored) {}
-                }
+                // Rollback strategy depends on where we failed in the commit sequence:
+                //
+                // 1. After metadata published but before snapshot committed:
+                //    - Metadata has new generation but snapshot still old
+                //    - Must NOT remove metadata (it's valid old data), but need to fix generation
+                // 2. After snapshot committed but before commit marker:
+                //    - Snapshot has new generation, metadata has new generation
+                //    - Need to remove committed snapshot (rename it away)
+                // 3. After commit marker:
+                //    - Need to remove commit marker
+                //
+                // Common: always remove commit marker if it exists (step 3)
 
-                // Remove commit marker if it was created.
-                // If we failed after commitGeneration but before/at publishCandidate:
-                // - Commit marker exists (generation is "committed")
-                // - Metadata may NOT be updated
-                // - This is an inconsistent state - must roll back
-                // Removing the commit marker ensures recovery will use old generation.
+                // Step 1: Remove commit marker if it exists (handles cases 2 and 3)
                 if (snapshotManager != null && pendingSnapshotIndex > 0) {
                     try {
                         Path commitMarker = snapshotManager.getSnapshotDir()
@@ -861,6 +916,61 @@ public class RaftNode implements AutoCloseable {
                             Files.delete(commitMarker);
                             System.out.println("[RAFT] Commit marker removed during rollback: generation-" + pendingSnapshotIndex);
                         }
+                    } catch (IOException ignored) {}
+                }
+
+                // Step 2: Remove committed snapshot if it exists (handles case 2)
+                // The committed snapshot would be at snapshot-<index>
+                if (snapshotManager != null && pendingSnapshotIndex > 0) {
+                    try {
+                        Path committedSnapshot = snapshotManager.getSnapshotDir()
+                            .resolve("snapshot-" + pendingSnapshotIndex);
+                        if (Files.exists(committedSnapshot)) {
+                            Files.delete(committedSnapshot);
+                            System.out.println("[RAFT] Committed snapshot removed during rollback: snapshot-" + pendingSnapshotIndex);
+                        }
+                    } catch (IOException ignored) {}
+                }
+
+                // Step 3: Discard candidate snapshot if it exists (handles case 1)
+                if (candidateSnapshotFile != null && Files.exists(candidateSnapshotFile)) {
+                    try {
+                        Files.delete(candidateSnapshotFile);
+                        System.out.println("[RAFT] Candidate snapshot discarded");
+                    } catch (IOException ignored) {}
+                }
+
+                // Step 4: Restore metadata from backup if it was published
+                // If metadata was published with new generation, we need to restore old state
+                // The backup was created BEFORE publishing, so it contains the old state
+                if (metadataPublished) {
+                    if (metadataBackupFile != null) {
+                        // Restore from backup (backup contains old state)
+                        try {
+                            metadataStore.restoreFromBackup(metadataBackupFile);
+                            System.out.println("[RAFT] Metadata restored from backup (generation=" + previousSnapshotIndex + ")");
+                        } catch (IOException ex) {
+                            System.err.println("[RAFT] Failed to restore metadata from backup: " + ex.getMessage());
+                            // Fall through - try to at least restore generation
+                            try {
+                                metadataStore.setGeneration(previousSnapshotIndex);
+                            } catch (IOException ignored) {}
+                        }
+                    } else {
+                        // No backup existed (old state was empty/no storage file)
+                        // Delete the storage file to restore empty state
+                        try {
+                            metadataStore.deleteStorageFile();
+                            System.out.println("[RAFT] Metadata storage file deleted (restoring empty state)");
+                        } catch (IOException ex) {
+                            System.err.println("[RAFT] Failed to delete metadata storage file: " + ex.getMessage());
+                        }
+                    }
+                } else if (metadataStore != null && pendingSnapshotIndex > 0 && previousSnapshotIndex > 0) {
+                    // No metadata was published, but ensure generation is reset
+                    try {
+                        metadataStore.setGeneration(previousSnapshotIndex);
+                        System.out.println("[RAFT] Metadata generation reset to: " + previousSnapshotIndex);
                     } catch (IOException ignored) {}
                 }
 
@@ -875,6 +985,12 @@ public class RaftNode implements AutoCloseable {
                 }
                 candidateSnapshotFile = null;
                 candidateState = null; // Clear candidate state
+                // Clean up metadata backup if still exists (on failure path)
+                if (metadataBackupFile != null && metadataPublished) {
+                    metadataStore.deleteBackup(metadataBackupFile);
+                }
+                metadataBackupFile = null;
+                metadataPublished = false;
             }
         }
 

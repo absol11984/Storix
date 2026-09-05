@@ -56,17 +56,182 @@ public class MetadataStore {
      * Sets the generation this store is tracking.
      * The generation is persisted to disk and must match the committed
      * generation in SnapshotManager for the store to be considered valid.
+     *
+     * @throws IOException if generation persistence fails
      */
     public void setGeneration(long generation) throws IOException {
         this.currentGeneration = generation;
-        saveGeneration();
+        saveGeneration(); // Propagates IOException
     }
 
-    private void saveGeneration() {
+    // Backup suffix for storage file backup during candidate publication
+    private static final String BACKUP_SUFFIX = ".backup";
+
+    /**
+     * Creates a backup of the current storage file.
+     * This is used before publishing candidate state so we can rollback if commit fails.
+     *
+     * @return Path to the backup file, or null if no storage file exists to backup
+     * @throws IOException if backup creation fails
+     */
+    public Path backupStorage() throws IOException {
+        if (!Files.exists(storageFile)) {
+            return null;
+        }
+
+        Path backupFile = storageFile.resolveSibling(storageFile.getFileName() + BACKUP_SUFFIX);
+
+        // Copy with fsync to ensure backup is durable
+        try (RandomAccessFile src = new RandomAccessFile(storageFile.toFile(), "r");
+             RandomAccessFile dst = new RandomAccessFile(backupFile.toFile(), "rw")) {
+            // Copy all bytes
+            byte[] buffer = new byte[8192];
+            long totalRead = 0;
+            long fileSize = src.length();
+            while (totalRead < fileSize) {
+                int read = src.read(buffer);
+                if (read > 0) {
+                    dst.write(buffer, 0, read);
+                    totalRead += read;
+                }
+            }
+            dst.getFD().sync(); // Sync backup to disk
+        }
+
+        fsyncDirectory(backupFile.getParent());
+        return backupFile;
+    }
+
+    /**
+     * Restores the storage from a backup file.
+     * This is used during rollback when candidate publication succeeded but commit failed.
+     *
+     * @param backupFile Path to the backup file to restore from
+     * @throws IOException if restore fails
+     */
+    public void restoreFromBackup(Path backupFile) throws IOException {
+        if (backupFile == null || !Files.exists(backupFile)) {
+            // No backup to restore - this is fine, it means we never published
+            return;
+        }
+
+        // Atomic restore: copy backup back to storage file location
+        Path tempRestore = storageFile.resolveSibling(storageFile.getFileName() + ".restore_tmp");
+
         try {
-            Files.writeString(generationFile, String.valueOf(currentGeneration));
+            // Copy backup to temp location
+            try (RandomAccessFile src = new RandomAccessFile(backupFile.toFile(), "r");
+                 RandomAccessFile dst = new RandomAccessFile(tempRestore.toFile(), "rw")) {
+                byte[] buffer = new byte[8192];
+                long totalRead = 0;
+                long fileSize = src.length();
+                while (totalRead < fileSize) {
+                    int read = src.read(buffer);
+                    if (read > 0) {
+                        dst.write(buffer, 0, read);
+                        totalRead += read;
+                    }
+                }
+                dst.getFD().sync();
+            }
+
+            // Atomic move to final location
+            Files.move(tempRestore, storageFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            fsyncDirectory(storageFile.getParent());
+
+            // Reload from restored storage
+            objects.clear();
+            load();
+
+        } finally {
+            // Clean up temp file if it exists
+            Files.deleteIfExists(tempRestore);
+        }
+    }
+
+    /**
+     * Deletes the backup file.
+     * Called after successful commit to clean up.
+     *
+     * @param backupFile Path to the backup file to delete
+     */
+    public void deleteBackup(Path backupFile) {
+        if (backupFile != null) {
+            try {
+                Files.deleteIfExists(backupFile);
+            } catch (IOException e) {
+                // Best effort cleanup
+                System.err.println("[METADATA] Warning: failed to delete backup file: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Deletes the storage file.
+     * Used during rollback when the old state was empty (no storage file) and
+     * candidate publication created a new storage file that needs to be removed.
+     *
+     * @throws IOException if deletion fails
+     */
+    public void deleteStorageFile() throws IOException {
+        if (Files.exists(storageFile)) {
+            Files.delete(storageFile);
+            fsyncDirectory(storageFile.getParent());
+        }
+        // Clear in-memory state
+        objects.clear();
+        currentGeneration = -1;
+    }
+
+    /**
+     * Saves the generation to disk with full durability.
+     * This MUST NOT swallow errors - if generation persistence fails,
+     * the operation must fail.
+     *
+     * @throws IOException if generation persistence fails
+     */
+    private void saveGeneration() throws IOException {
+        // Write to temp file first
+        Path tempFile = generationFile.resolveSibling(generationFile.getFileName() + ".tmp");
+        try {
+            Files.writeString(tempFile, String.valueOf(currentGeneration));
+            // Sync the temp file
+            try (RandomAccessFile raf = new RandomAccessFile(tempFile.toFile(), "rw")) {
+                raf.getFD().sync();
+            }
+            // Atomic rename to final location
+            Files.move(tempFile, generationFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            // Sync directory
+            fsyncDirectory(generationFile.getParent());
         } catch (IOException e) {
-            System.err.println("[METADATA] Failed to save generation: " + e.getMessage());
+            // Clean up temp file if it exists
+            try { Files.deleteIfExists(tempFile); } catch (IOException ignored) {}
+            throw new IOException("Failed to save generation: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Force fsync a directory to ensure directory entry changes are durable.
+     */
+    private void fsyncDirectory(Path dir) throws IOException {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        // Best effort directory sync using a dummy file
+        try {
+            Path dummyFile = dir.resolve(".fsync_dummy");
+            try {
+                Files.write(dummyFile, new byte[0]);
+                try (java.nio.channels.FileChannel fc = java.nio.channels.FileChannel.open(dummyFile,
+                        java.nio.file.StandardOpenOption.READ, java.nio.file.StandardOpenOption.WRITE)) {
+                    fc.force(true);
+                }
+            } finally {
+                Files.deleteIfExists(dummyFile);
+            }
+        } catch (IOException e) {
+            // Non-fatal: the atomic move succeeded. Directory sync is best-effort.
+            System.err.println("[METADATA] Warning: failed to fsync directory: " + e.getMessage());
         }
     }
 
@@ -349,35 +514,6 @@ public class MetadataStore {
         // - Crash AFTER in-memory update: load() recovers new state → consistent
         objects.clear();
         objects.putAll(candidateState);
-    }
-
-    /**
-     * Force fsync a directory to ensure directory entry changes are durable.
-     * This is needed on some filesystems to make renames truly durable.
-     * Note: On some systems, syncing a directory isn't directly supported,
-     * so we use a best-effort approach.
-     */
-    private void fsyncDirectory(Path dir) throws IOException {
-        if (dir == null || !Files.exists(dir)) {
-            return;
-        }
-        // Best effort directory sync. The atomic rename provides the main durability guarantee.
-        // On some systems, we can try to sync by writing to a file in the directory.
-        try {
-            Path dummyFile = dir.resolve(".fsync_dummy");
-            try {
-                Files.write(dummyFile, new byte[0]);
-                try (java.nio.channels.FileChannel fc = java.nio.channels.FileChannel.open(dummyFile,
-                        java.nio.file.StandardOpenOption.READ, java.nio.file.StandardOpenOption.WRITE)) {
-                    fc.force(true);
-                }
-            } finally {
-                Files.deleteIfExists(dummyFile);
-            }
-        } catch (IOException e) {
-            // Non-fatal: the atomic move succeeded. Directory sync is best-effort.
-            System.err.println("[METADATA] Warning: failed to fsync directory after publish: " + e.getMessage());
-        }
     }
 
     /**

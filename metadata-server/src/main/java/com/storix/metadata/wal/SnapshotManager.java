@@ -777,13 +777,31 @@ public class SnapshotManager {
      * @throws IOException if commit fails
      */
     public void commitCandidateSnapshot(Path candidateFile, long lastIncludedIndex, long lastIncludedTerm) throws IOException {
-        if (candidateFile == null || !Files.exists(candidateFile)) {
-            throw new IOException("Candidate snapshot file does not exist: " + candidateFile);
-        }
-
         // The authoritative snapshot filename
         String filename = SNAPSHOT_PREFIX + lastIncludedIndex;
         Path snapshotFile = snapshotDir.resolve(filename);
+
+        // Check if snapshot is already at the authoritative location
+        // This happens when installSnapshot was called first (writes directly to snapshot-<index>)
+        if (Files.exists(snapshotFile)) {
+            // Snapshot already committed - validate it
+            Optional<Snapshot> existing = loadSnapshot(snapshotFile);
+            if (existing.isPresent()) {
+                Snapshot snap = existing.get();
+                if (snap.lastIncludedIndex() == lastIncludedIndex && snap.lastIncludedTerm() == lastIncludedTerm) {
+                    System.out.println("[SNAPSHOT] Candidate snapshot already committed: index=" + lastIncludedIndex);
+                    return; // Already committed
+                }
+            }
+            // Snapshot exists but doesn't match - this is an error
+            throw new IOException("Snapshot at authoritative location doesn't match expected: index=" +
+                    lastIncludedIndex + ", term=" + lastIncludedTerm);
+        }
+
+        // Candidate file must exist if snapshot not already at authoritative location
+        if (candidateFile == null || !Files.exists(candidateFile)) {
+            throw new IOException("Candidate snapshot file does not exist: " + candidateFile);
+        }
 
         // Validate the candidate snapshot can be loaded before committing
         Optional<Snapshot> candidateSnapshot = loadSnapshot(candidateFile);
