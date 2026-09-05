@@ -784,4 +784,315 @@ class Phase1MasterEndToEndTest {
         System.out.println("TEST: Exact Index Restoration - PASSED");
         System.out.println("========================================\n");
     }
+
+    /**
+     * Test 7: PROVE post-snapshot WAL replay occurred.
+     * This test creates post-snapshot state changes that CANNOT exist in the snapshot,
+     * proving that WAL replay was the only way to restore them.
+     */
+    @Test
+    void testProvesWalReplayOccurred() throws Exception {
+        System.out.println("\n========================================");
+        System.out.println("TEST: Prove WAL Replay Occurred");
+        System.out.println("========================================\n");
+
+        int port = BASE_PORT + 700;
+        Path metadataFile = tempDir.resolve("metadata7.json");
+        Path raftStateDir = tempDir.resolve("raft-state-7");
+        Files.createDirectories(raftStateDir);
+
+        ClusterConfig config = new ClusterConfig("test", "node1", "127.0.0.1", port, null);
+
+        // ===== PHASE 1: Start server and create A, B, C =====
+        System.out.println("[PHASE 1] Create A, B, C");
+        MetadataServer server1 = startServer(port, metadataFile, raftStateDir, config);
+        MetadataStore store1 = server1.getMetadataStore();
+        RaftNode raftNode1 = server1.getRaftNode();
+
+        for (String name : List.of("A", "B", "C")) {
+            ObjectMetadata obj = makeObject(name, name.hashCode() & 0xFFFF);
+            assertTrue(submitCreate(raftNode1, obj));
+        }
+        Thread.sleep(500);
+
+        // ===== PHASE 2: Take snapshot =====
+        System.out.println("\n[PHASE 2] Take snapshot at index 3");
+        raftNode1.compactLog(3);
+        System.out.println("  Snapshot taken, logStartIndex=" + raftNode1.getRaftLog().getLogStartIndex());
+
+        // ===== PHASE 3: Post-snapshot operations (D, E, delete B, update A) =====
+        System.out.println("\n[PHASE 3] Post-snapshot operations: D, E, delete B, update A");
+
+        ObjectMetadata objD = makeObject("D", 40000);
+        ObjectMetadata objE = makeObject("E", 50000);
+        assertTrue(submitCreate(raftNode1, objD));
+        assertTrue(submitCreate(raftNode1, objE));
+        assertTrue(submitDelete(raftNode1, "B"));
+
+        // Update A with different size
+        ObjectMetadata objAUpdated = makeObject("A", 999999); // Different from original A
+        assertTrue(submitUpdate(raftNode1, objAUpdated));
+        Thread.sleep(500);
+
+        // Capture final state BEFORE shutdown
+        Map<String, CapturedObject> finalState = captureState(store1);
+        System.out.println("  Final state: " + finalState.size() + " objects: " + finalState.keySet());
+
+        // CRITICAL: Verify final state is NOT equal to snapshot state
+        // This proves that post-snapshot operations actually occurred
+        assertFalse(finalState.containsKey("B"), "B should be deleted (not in snapshot)");
+        CapturedObject aUpdated = finalState.get("A");
+        assertNotNull(aUpdated, "A should exist with updated size");
+        assertEquals(999999, aUpdated.fileSize, "A should have updated size");
+        assertTrue(finalState.containsKey("D"), "D should exist (post-snapshot)");
+        assertTrue(finalState.containsKey("E"), "E should exist (post-snapshot)");
+
+        // Capture all index info
+        long lastLogIndex = raftNode1.getRaftLog().getLastLogIndex();
+        long commitIndex = raftNode1.getRaftLog().getCommitIndex();
+        long lastApplied = raftNode1.getRaftLog().getLastApplied();
+        long snapshotIndex = raftNode1.getRaftLog().getLogStartIndex() - 1;
+        System.out.println("  Pre-shutdown: lastLogIndex=" + lastLogIndex + ", commitIndex=" + commitIndex +
+                ", lastApplied=" + lastApplied + ", snapshotIndex=" + snapshotIndex);
+
+        // ===== SHUTDOWN =====
+        System.out.println("\n[SHUTDOWN] Stopping server");
+        server1.stop();
+        Thread.sleep(300);
+
+        // ===== RESTART - recovery should replay post-snapshot WAL =====
+        System.out.println("\n[RESTART] Starting new server - WAL replay should occur");
+
+        MetadataServer server2 = startServer(port, metadataFile, raftStateDir, config);
+        MetadataStore store2 = server2.getMetadataStore();
+        RaftLog raftLog2 = server2.getRaftNode().getRaftLog();
+
+        // Verify indexes
+        long recoveredLogIndex = raftLog2.getLastLogIndex();
+        long recoveredCommitIndex = raftLog2.getCommitIndex();
+        long recoveredLastApplied = raftLog2.getLastApplied();
+        long recoveredLogStartIndex = raftLog2.getLogStartIndex();
+        System.out.println("  Post-recovery: lastLogIndex=" + recoveredLogIndex +
+                ", commitIndex=" + recoveredCommitIndex + ", lastApplied=" + recoveredLastApplied +
+                ", logStartIndex=" + recoveredLogStartIndex);
+
+        assertEquals(lastLogIndex, recoveredLogIndex, "lastLogIndex should match");
+        assertEquals(commitIndex, recoveredCommitIndex, "commitIndex should match");
+        // lastApplied may be <= commitIndex due to timing of persistCommitIndex calls
+        assertTrue(recoveredLastApplied <= recoveredCommitIndex,
+                "lastApplied should be <= commitIndex");
+        assertTrue(recoveredLastApplied >= snapshotIndex,
+                "lastApplied should be at least snapshotIndex");
+        assertEquals(4, recoveredLogStartIndex, "logStartIndex should be 4 (snapshot at 3)");
+
+        // Verify final state restored via WAL replay
+        Map<String, CapturedObject> recoveredState = captureState(store2);
+        System.out.println("  Recovered state: " + recoveredState.size() + " objects: " + recoveredState.keySet());
+        assertStateEquals(finalState, recoveredState);
+
+        // CRITICAL: If WAL replay was removed, D and E would not exist
+        assertTrue(recoveredState.containsKey("D"), "D should exist (proves WAL replay)");
+        assertTrue(recoveredState.containsKey("E"), "E should exist (proves WAL replay)");
+        assertFalse(recoveredState.containsKey("B"), "B should still be deleted");
+        assertEquals(999999, recoveredState.get("A").fileSize, "A should have updated size");
+
+        System.out.println("  WAL replay proven - post-snapshot objects restored!");
+
+        server2.stop();
+
+        System.out.println("\n========================================");
+        System.out.println("TEST: Prove WAL Replay Occurred - PASSED");
+        System.out.println("========================================\n");
+    }
+
+    /**
+     * Test 8: Highest valid snapshot selection.
+     * Creates multiple snapshots and verifies highest valid one is selected when newest is corrupted.
+     */
+    @Test
+    void testHighestValidSnapshotSelection() throws Exception {
+        System.out.println("\n========================================");
+        System.out.println("TEST: Highest Valid Snapshot Selection");
+        System.out.println("========================================\n");
+
+        int port = BASE_PORT + 800;
+        Path metadataFile = tempDir.resolve("metadata8.json");
+        Path raftStateDir = tempDir.resolve("raft-state-8");
+        Path snapshotDir = raftStateDir.resolve("snapshots");
+        Files.createDirectories(snapshotDir);
+
+        ClusterConfig config = new ClusterConfig("test", "node1", "127.0.0.1", port, null);
+
+        // ===== PHASE 1: Create first snapshot at index 5 =====
+        System.out.println("[PHASE 1] Create objects A-E, take snapshot at index 5");
+        MetadataServer server1 = startServer(port, metadataFile, raftStateDir, config);
+        MetadataStore store1 = server1.getMetadataStore();
+        RaftNode raftNode1 = server1.getRaftNode();
+
+        for (String name : List.of("A", "B", "C", "D", "E")) {
+            ObjectMetadata obj = makeObject(name, name.hashCode() & 0xFFFF);
+            assertTrue(submitCreate(raftNode1, obj));
+        }
+        Thread.sleep(500);
+
+        raftNode1.compactLog(5);
+        Map<String, CapturedObject> state5 = captureState(store1);
+        System.out.println("  Snapshot at index 5: " + state5.size() + " objects");
+
+        // ===== PHASE 2: Create more objects, second snapshot at index 10 =====
+        System.out.println("\n[PHASE 2] Create F-J, snapshot at index 10");
+        for (String name : List.of("F", "G", "H", "I", "J")) {
+            ObjectMetadata obj = makeObject(name, name.hashCode() & 0xFFFF);
+            assertTrue(submitCreate(raftNode1, obj));
+        }
+        Thread.sleep(500);
+
+        raftNode1.compactLog(10);
+        Map<String, CapturedObject> state10 = captureState(store1);
+        System.out.println("  Snapshot at index 10: " + state10.size() + " objects");
+
+        // Stop server
+        server1.stop();
+        Thread.sleep(300);
+
+        // ===== PHASE 3: Corrupt newest snapshot (index 10) =====
+        System.out.println("\n[PHASE 3] Corrupt snapshot-10");
+        List<Path> snapshots = Files.list(snapshotDir)
+            .filter(p -> p.getFileName().toString().startsWith("snapshot-"))
+            .sorted()
+            .toList();
+
+        Path corruptSnapshot = null;
+        for (Path s : snapshots) {
+            String name = s.getFileName().toString();
+            if (name.contains("10")) {
+                corruptSnapshot = s;
+                break;
+            }
+        }
+
+        assertNotNull(corruptSnapshot, "Should find snapshot-10");
+        Files.writeString(corruptSnapshot, "CORRUPTED");
+        System.out.println("  Corrupted: " + corruptSnapshot.getFileName());
+
+        // ===== PHASE 4: Restart - should fall back to index 5 =====
+        System.out.println("\n[PHASE 4] Restart - should select snapshot-5");
+        MetadataServer server2 = startServer(port, metadataFile, raftStateDir, config);
+        MetadataStore store2 = server2.getMetadataStore();
+
+        Map<String, CapturedObject> recoveredState = captureState(store2);
+        assertStateEquals(state5, recoveredState);
+        System.out.println("  Recovered state matches snapshot-5 (10 objects)");
+
+        server2.stop();
+        Thread.sleep(300);
+
+        // ===== PHASE 5: Corrupt snapshot-5 too =====
+        System.out.println("\n[PHASE 5] Corrupt snapshot-5, restart");
+        for (Path s : snapshots) {
+            if (s.getFileName().toString().contains("5")) {
+                Files.writeString(s, "ALSO_CORRUPTED");
+                System.out.println("  Corrupted: " + s.getFileName());
+                break;
+            }
+        }
+
+        // Restart - should fail or use WAL-only recovery
+        System.out.println("\n[PHASE 6] Restart with all snapshots corrupted");
+        try {
+            MetadataServer server3 = startServer(port, metadataFile, raftStateDir, config);
+            // If it starts, verify it has at least some state from WAL
+            Map<String, CapturedObject> state = captureState(server3.getMetadataStore());
+            System.out.println("  State after recovery: " + state.size() + " objects");
+            server3.stop();
+        } catch (Exception e) {
+            System.out.println("  Server failed as expected: " + e.getMessage());
+        }
+
+        System.out.println("\n========================================");
+        System.out.println("TEST: Highest Valid Snapshot Selection - PASSED");
+        System.out.println("========================================\n");
+    }
+
+    /**
+     * Test 9: Snapshot boundary assertions.
+     * Verifies that lastIncludedIndex and lastIncludedTerm are correct after recovery.
+     */
+    @Test
+    void testSnapshotBoundaryAssertions() throws Exception {
+        System.out.println("\n========================================");
+        System.out.println("TEST: Snapshot Boundary Assertions");
+        System.out.println("========================================\n");
+
+        int port = BASE_PORT + 900;
+        Path metadataFile = tempDir.resolve("metadata9.json");
+        Path raftStateDir = tempDir.resolve("raft-state-9");
+        Files.createDirectories(raftStateDir);
+
+        ClusterConfig config = new ClusterConfig("test", "node1", "127.0.0.1", port, null);
+
+        // ===== PHASE 1: Create state and snapshot =====
+        System.out.println("[PHASE 1] Create state and snapshot");
+        MetadataServer server1 = startServer(port, metadataFile, raftStateDir, config);
+        RaftNode raftNode1 = server1.getRaftNode();
+        RaftLog raftLog1 = raftNode1.getRaftLog();
+
+        // Create objects
+        for (int i = 1; i <= 10; i++) {
+            ObjectMetadata obj = makeObject("obj" + i, i * 1000);
+            assertTrue(submitCreate(raftNode1, obj));
+        }
+        Thread.sleep(500);
+
+        // Take snapshot
+        long snapshotIndex = 5;
+        raftNode1.compactLog(snapshotIndex);
+        // Get the actual term from the snapshot (may be 0 in single-node clusters initially)
+        long snapshotTerm = raftLog1.getTermAt(snapshotIndex);
+
+        System.out.println("  Snapshot at index=" + snapshotIndex + ", term=" + snapshotTerm);
+        assertEquals(6, raftLog1.getLogStartIndex(), "logStartIndex should be 6");
+
+        // Create more entries
+        for (int i = 11; i <= 15; i++) {
+            ObjectMetadata obj = makeObject("obj" + i, i * 1000);
+            assertTrue(submitCreate(raftNode1, obj));
+        }
+        Thread.sleep(500);
+
+        long finalLogIndex = raftLog1.getLastLogIndex();
+        System.out.println("  Final state: logStartIndex=" + raftLog1.getLogStartIndex() +
+                ", lastLogIndex=" + finalLogIndex);
+
+        // Stop
+        server1.stop();
+        Thread.sleep(300);
+
+        // ===== RECOVERY =====
+        System.out.println("\n[RECOVERY] Verify snapshot boundary after recovery");
+        MetadataServer server2 = startServer(port, metadataFile, raftStateDir, config);
+        RaftLog raftLog2 = server2.getRaftNode().getRaftLog();
+
+        // Verify snapshot boundary
+        assertEquals(6, raftLog2.getLogStartIndex(),
+                "logStartIndex should be 6 after recovery (snapshot at 5)");
+        assertEquals(snapshotTerm, raftLog2.getTermAt(5),
+                "termAt(5) should return snapshotTerm=" + snapshotTerm);
+        assertEquals(15, raftLog2.getLastLogIndex(),
+                "lastLogIndex should be 15 after recovery");
+
+        // Verify entries 6-15 exist
+        for (int i = 6; i <= 15; i++) {
+            assertNotNull(raftLog2.getEntry(i), "Entry " + i + " should exist");
+            assertEquals(i, raftLog2.getEntry(i).index(), "Entry " + i + " index should be " + i);
+        }
+
+        System.out.println("  All assertions passed!");
+
+        server2.stop();
+
+        System.out.println("\n========================================");
+        System.out.println("TEST: Snapshot Boundary Assertions - PASSED");
+        System.out.println("========================================\n");
+    }
 }

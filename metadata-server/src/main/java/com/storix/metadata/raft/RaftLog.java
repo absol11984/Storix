@@ -51,13 +51,13 @@ public class RaftLog {
     }
 
     /**
-     * Returns the number of actual log entries (excluding the dummy entry at index 0).
+     * Returns the number of active log entries.
+     * Active entries are those stored in the log after any snapshot compaction.
      */
     public int getEntryCount() {
         lock.readLock().lock();
         try {
-            // Subtract 1 to exclude the dummy entry at index 0
-            return Math.max(0, entries.size() - 1);
+            return entries.size();
         } finally {
             lock.readLock().unlock();
         }
@@ -102,10 +102,45 @@ public class RaftLog {
      * Sets commitIndex and lastApplied based on recovered values.
      * Also updates highestIndex to track the maximum index ever seen.
      * Returns the highest index loaded.
+     *
+     * @param recoveredEntries List of entries to load (must be strictly increasing and contiguous)
+     * @param recoveredCommitIndex The committed index from WAL
+     * @param recoveredLastApplied The last applied index from WAL
+     * @return The highest index loaded
+     * @throws IllegalStateException if entries are invalid (not contiguous, not increasing, behind snapshot boundary)
      */
     public long loadEntries(List<LogEntry> recoveredEntries, long recoveredCommitIndex, long recoveredLastApplied) {
         lock.writeLock().lock();
         try {
+            // Validate recovered entries BEFORE loading
+            // 1. Entries must be strictly increasing
+            // 2. Entries must be contiguous (no gaps)
+            // 3. First entry must start at snapshotIndex + 1
+            // 4. No entries behind snapshot boundary
+
+            long expectedFirstIndex = logStartIndex;
+
+            for (int i = 0; i < recoveredEntries.size(); i++) {
+                LogEntry entry = recoveredEntries.get(i);
+                long expectedIndex = expectedFirstIndex + i;
+
+                // Check index matches expected
+                if (entry.index() != expectedIndex) {
+                    throw new IllegalStateException(
+                        "Invalid recovered log entry at position " + i +
+                        ": expected index " + expectedIndex + ", got " + entry.index() +
+                        " (entries must be contiguous starting at " + expectedFirstIndex + ")");
+                }
+
+                // Check entry is not behind snapshot boundary
+                if (entry.index() < logStartIndex) {
+                    throw new IllegalStateException(
+                        "Recovered entry at index " + entry.index() +
+                        " is behind snapshot boundary " + logStartIndex +
+                        " (should have been in snapshot, not WAL)");
+                }
+            }
+
             // Clear existing entries and load recovered ones
             entries.clear();
 
@@ -116,7 +151,10 @@ public class RaftLog {
             }
 
             // Update highestIndex to track maximum index ever seen
-            this.highestIndex = Math.max(this.highestIndex, highest);
+            // Consider both recovered entries and snapshot boundary
+            // The snapshot boundary (logStartIndex - 1) represents the last compacted index
+            long snapshotBoundaryIndex = logStartIndex - 1;
+            this.highestIndex = Math.max(this.highestIndex, Math.max(highest, snapshotBoundaryIndex));
 
             // Restore commit state
             this.commitIndex = recoveredCommitIndex;
@@ -207,6 +245,10 @@ public class RaftLog {
             }
             for (LogEntry entry : newEntries) {
                 entries.add(entry);
+                // Track highest index seen
+                if (entry.index() > highestIndex) {
+                    highestIndex = entry.index();
+                }
             }
         } finally {
             lock.writeLock().unlock();
@@ -280,15 +322,20 @@ public class RaftLog {
 
     /**
      * Returns the last log index.
-     * After compaction, this returns the highest index seen, even if that entry
-     * is no longer in the log (covered by snapshot).
+     * This returns the logical last index of the Raft log.
+     * When entries exist, returns the highest index (accounting for potential deduplication).
+     * When fully compacted (no active entries), returns snapshot boundary (logStartIndex - 1).
      */
     public long getLastLogIndex() {
         lock.readLock().lock();
         try {
-            long lastInLog = logStartIndex + entries.size() - 1;
-            // Return the higher of actual log size or highest index ever seen
-            return Math.max(lastInLog, highestIndex);
+            if (entries.isEmpty()) {
+                // Fully compacted - return the snapshot boundary (logStartIndex - 1)
+                return logStartIndex - 1;
+            }
+            // Active entries exist - use highestIndex to track the actual maximum
+            // This is important because entries may be deduplicated during append
+            return highestIndex;
         } finally {
             lock.readLock().unlock();
         }
@@ -296,12 +343,16 @@ public class RaftLog {
 
     /**
      * Returns the last log term.
+     * When entries are empty (fully compacted), returns the snapshot boundary term.
+     * This ensures getLastLogTerm() correctly returns the term of the last logical
+     * entry even after the log has been completely compacted.
      */
     public long getLastLogTerm() {
         lock.readLock().lock();
         try {
             if (entries.isEmpty()) {
-                return 0;
+                // Return the snapshot boundary term for the last logical entry
+                return snapshotTerm;
             }
             return entries.get(entries.size() - 1).term();
         } finally {
@@ -479,6 +530,15 @@ public class RaftLog {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /**
+     * Returns the highest index ever assigned in this log.
+     * This is the absolute maximum index, ignoring snapshot boundaries.
+     * Used for restoring log index counters after recovery.
+     */
+    public long getHighestIndex() {
+        return highestIndex;
     }
 
     /**

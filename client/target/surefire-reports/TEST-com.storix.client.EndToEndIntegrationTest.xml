@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report-3.0.xsd" version="3.0" name="com.storix.client.EndToEndIntegrationTest" time="5.988" tests="1" errors="0" skipped="0" failures="0">
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report-3.0.xsd" version="3.0" name="com.storix.client.EndToEndIntegrationTest" time="5.617" tests="1" errors="0" skipped="0" failures="0">
   <properties>
     <property name="java.specification.version" value="21"/>
     <property name="sun.jnu.encoding" value="UTF-8"/>
@@ -13,7 +13,7 @@
     <property name="sun.java.launcher" value="SUN_STANDARD"/>
     <property name="user.country" value="US"/>
     <property name="sun.boot.library.path" value="/usr/lib/jvm/java-21-openjdk-amd64/lib"/>
-    <property name="sun.java.command" value="/home/arceus/Storix/client/target/surefire/surefirebooter-20260905201741116_3.jar /home/arceus/Storix/client/target/surefire 2026-09-05T20-17-40_929-jvmRun1 surefire-20260905201741116_1tmp surefire_0-20260905201741116_2tmp"/>
+    <property name="sun.java.command" value="/home/arceus/Storix/client/target/surefire/surefirebooter-20260905204848440_3.jar /home/arceus/Storix/client/target/surefire 2026-09-05T20-48-48_346-jvmRun1 surefire-20260905204848440_1tmp surefire_0-20260905204848440_2tmp"/>
     <property name="jdk.debug" value="release"/>
     <property name="surefire.test.class.path" value="/home/arceus/Storix/client/target/test-classes:/home/arceus/Storix/client/target/classes:/home/arceus/.m2/repository/com/storix/metadata-server/1.0.0/metadata-server-1.0.0.jar:/home/arceus/.m2/repository/com/storix/storage-node/1.0.0/storage-node-1.0.0.jar:/home/arceus/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.16.0/jackson-databind-2.16.0.jar:/home/arceus/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.16.0/jackson-annotations-2.16.0.jar:/home/arceus/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.16.0/jackson-core-2.16.0.jar:/home/arceus/.m2/repository/org/junit/jupiter/junit-jupiter/5.10.1/junit-jupiter-5.10.1.jar:/home/arceus/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.10.1/junit-jupiter-api-5.10.1.jar:/home/arceus/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar:/home/arceus/.m2/repository/org/junit/platform/junit-platform-commons/1.10.1/junit-platform-commons-1.10.1.jar:/home/arceus/.m2/repository/org/apiguardian/apiguardian-api/1.1.2/apiguardian-api-1.1.2.jar:/home/arceus/.m2/repository/org/junit/jupiter/junit-jupiter-params/5.10.1/junit-jupiter-params-5.10.1.jar:/home/arceus/.m2/repository/org/junit/jupiter/junit-jupiter-engine/5.10.1/junit-jupiter-engine-5.10.1.jar:/home/arceus/.m2/repository/org/junit/platform/junit-platform-engine/1.10.1/junit-platform-engine-1.10.1.jar:"/>
     <property name="sun.cpu.endian" value="little"/>
@@ -28,7 +28,7 @@
     <property name="line.separator" value="&#10;"/>
     <property name="java.specification.name" value="Java Platform API Specification"/>
     <property name="java.vm.specification.vendor" value="Oracle Corporation"/>
-    <property name="surefire.real.class.path" value="/home/arceus/Storix/client/target/surefire/surefirebooter-20260905201741116_3.jar"/>
+    <property name="surefire.real.class.path" value="/home/arceus/Storix/client/target/surefire/surefirebooter-20260905204848440_3.jar"/>
     <property name="sun.management.compiler" value="HotSpot 64-Bit Tiered Compilers"/>
     <property name="java.runtime.version" value="21.0.12+8-1-26.04-Ubuntu"/>
     <property name="user.name" value="arceus"/>
@@ -54,18 +54,18 @@
     <property name="sun.io.unicode.encoding" value="UnicodeLittle"/>
     <property name="java.class.version" value="65.0"/>
   </properties>
-  <testcase name="testUploadDownloadAndFailover" classname="com.storix.client.EndToEndIntegrationTest" time="5.985">
+  <testcase name="testUploadDownloadAndFailover" classname="com.storix.client.EndToEndIntegrationTest" time="5.615">
     <system-out><![CDATA[[HEALTH] Monitor started (timeout=2000ms, interval=500ms)
-Metadata server listening on port 44093
-[REGISTRY] Node registered: node-b 127.0.0.1:40075
-[REGISTRY] Node registered: node-a 127.0.0.1:40325
-[REGISTRY] Node registered: node-c 127.0.0.1:46287
-Registered with metadata server at 127.0.0.1:44093
-Registered with metadata server at 127.0.0.1:44093
-Registered with metadata server at 127.0.0.1:44093
-Storage node node-b listening on 127.0.0.1:40075
-Storage node node-a listening on 127.0.0.1:40325
-Storage node node-c listening on 127.0.0.1:46287
+Metadata server listening on port 46785
+[REGISTRY] Node registered: node-a 127.0.0.1:37369
+[REGISTRY] Node registered: node-b 127.0.0.1:46043
+[REGISTRY] Node registered: node-c 127.0.0.1:42983
+Registered with metadata server at 127.0.0.1:46785
+Registered with metadata server at 127.0.0.1:46785
+Registered with metadata server at 127.0.0.1:46785
+Storage node node-a listening on 127.0.0.1:37369
+Storage node node-c listening on 127.0.0.1:42983
+Storage node node-b listening on 127.0.0.1:46043
 Uploading test.bin
 File size: 5242880 bytes
 Uploading chunk 1
@@ -87,19 +87,19 @@ Downloading chunk 2/5
 Downloading chunk 3/5
 Downloading chunk 4/5
 Downloading chunk 5/5
-Download successful: /tmp/junit5441703501487208325/recovered.bin
+Download successful: /tmp/junit8065459972323573186/recovered.bin
 Node B stopped for failover test
 [HEALTH] Node node-b marked UNHEALTHY
 [HEALTH] Detected 1 newly unhealthy node(s): node-b
 [REPAIR] Triggering automatic repair...
-[REPAIR] chunk f0b34149-1a3c-4601-9ffd-e5c77c63d6ee-chunk-0 source=node-a destination=node-c
-[REPAIR] chunk f0b34149-1a3c-4601-9ffd-e5c77c63d6ee-chunk-3 source=node-a destination=node-c
-[REPAIR] chunk f0b34149-1a3c-4601-9ffd-e5c77c63d6ee-chunk-4 source=node-c destination=node-a
-[REPAIR] chunk f0b34149-1a3c-4601-9ffd-e5c77c63d6ee-chunk-1 source=node-c destination=node-a
-[REPAIR] chunk f0b34149-1a3c-4601-9ffd-e5c77c63d6ee-chunk-3 SUCCESS — replicated to node-c
-[REPAIR] chunk f0b34149-1a3c-4601-9ffd-e5c77c63d6ee-chunk-0 SUCCESS — replicated to node-c
-[REPAIR] chunk f0b34149-1a3c-4601-9ffd-e5c77c63d6ee-chunk-1 SUCCESS — replicated to node-a
-[REPAIR] chunk f0b34149-1a3c-4601-9ffd-e5c77c63d6ee-chunk-4 SUCCESS — replicated to node-a
+[REPAIR] chunk 528df0e1-1c5e-4eb6-9d8c-db813d1f01b6-chunk-0 source=node-a destination=node-c
+[REPAIR] chunk 528df0e1-1c5e-4eb6-9d8c-db813d1f01b6-chunk-4 source=node-c destination=node-a
+[REPAIR] chunk 528df0e1-1c5e-4eb6-9d8c-db813d1f01b6-chunk-1 source=node-c destination=node-a
+[REPAIR] chunk 528df0e1-1c5e-4eb6-9d8c-db813d1f01b6-chunk-3 source=node-a destination=node-c
+[REPAIR] chunk 528df0e1-1c5e-4eb6-9d8c-db813d1f01b6-chunk-0 SUCCESS — replicated to node-c
+[REPAIR] chunk 528df0e1-1c5e-4eb6-9d8c-db813d1f01b6-chunk-3 SUCCESS — replicated to node-c
+[REPAIR] chunk 528df0e1-1c5e-4eb6-9d8c-db813d1f01b6-chunk-1 SUCCESS — replicated to node-a
+[REPAIR] chunk 528df0e1-1c5e-4eb6-9d8c-db813d1f01b6-chunk-4 SUCCESS — replicated to node-a
 [REPAIR] Complete: scanned=4 repaired=4 failed=0 healthy=0
 Downloading test.bin
 Chunks to download: 5
@@ -110,10 +110,10 @@ Downloading chunk 3/5
 Downloading chunk 4/5
 Downloading chunk 5/5
 [GET] node-b unavailable (not in active nodes)
-Download successful: /tmp/junit5441703501487208325/recovered2.bin
-[REGISTRY] Node re-registered: node-b 127.0.0.1:40075
-Registered with metadata server at 127.0.0.1:44093
-Storage node node-b listening on 127.0.0.1:40075
+Download successful: /tmp/junit8065459972323573186/recovered2.bin
+[REGISTRY] Node re-registered: node-b 127.0.0.1:46043
+Registered with metadata server at 127.0.0.1:46785
+Storage node node-b listening on 127.0.0.1:46043
 ]]></system-out>
   </testcase>
 </testsuite>

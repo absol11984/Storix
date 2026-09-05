@@ -109,13 +109,24 @@ public class SnapshotManager {
     /**
      * Loads the latest snapshot.
      * @return The latest snapshot, or empty if no snapshot exists
-     * @throws IOException if snapshot loading fails
+     * @throws IOException if snapshot loading fails due to system errors (not corrupted snapshots)
      */
     public Optional<Snapshot> loadLatestSnapshot() throws IOException {
-        List<Path> snapshots = Files.list(snapshotDir)
-                .filter(p -> p.getFileName().toString().startsWith(SNAPSHOT_PREFIX))
-                .filter(Files::isRegularFile)
-                .collect(java.util.stream.Collectors.toList());
+        // Handle case where directory doesn't exist
+        if (!Files.exists(snapshotDir)) {
+            return Optional.empty();
+        }
+
+        List<Path> snapshots;
+        try {
+            snapshots = Files.list(snapshotDir)
+                    .filter(p -> p.getFileName().toString().startsWith(SNAPSHOT_PREFIX))
+                    .filter(Files::isRegularFile)
+                    .collect(java.util.stream.Collectors.toList());
+        } catch (IOException e) {
+            // Directory exists but can't be read - this is an error
+            throw e;
+        }
 
         if (snapshots.isEmpty()) {
             return Optional.empty();
@@ -168,6 +179,7 @@ public class SnapshotManager {
         }
 
         // Snapshots exist but none are valid - this is an error condition
+        // The system cannot safely recover without at least one valid snapshot
         if (hasAnySnapshots) {
             throw new IOException("No valid snapshots found among existing snapshot files");
         }

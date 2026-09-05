@@ -1,5 +1,6 @@
 package com.storix.metadata;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.storix.metadata.raft.*;
 import com.storix.metadata.wal.WAL;
 import com.storix.metadata.wal.SnapshotManager;
@@ -86,58 +87,81 @@ public class MetadataServer {
             WAL.WALRecoveryResult recoveryData = wal.recover();
 
             // Try to restore from snapshot if exists (restores full state before log replay)
-            try {
-                Optional<SnapshotManager.Snapshot> latestSnapshot = snapshotManager.loadLatestSnapshot();
-                if (latestSnapshot.isPresent()) {
-                    SnapshotManager.Snapshot snap = latestSnapshot.get();
-                    System.out.println("[SERVER] Found snapshot at index " + snap.lastIncludedIndex() +
-                            ", term " + snap.lastIncludedTerm());
+            // NOTE: We do NOT fall back to stale metadata.json if snapshot loading fails.
+            // The system must either recover from snapshot+WAL or fail explicitly.
+            Optional<SnapshotManager.Snapshot> latestSnapshot = snapshotManager.loadLatestSnapshot();
 
-                    // Clear metadataStore first - we're going to restore from snapshot
-                    // which provides the authoritative state. If metadata.json has any data,
-                    // it would conflict with snapshot restoration.
+            if (latestSnapshot.isPresent()) {
+                SnapshotManager.Snapshot snap = latestSnapshot.get();
+                System.out.println("[SERVER] Found snapshot at index " + snap.lastIncludedIndex() +
+                        ", term " + snap.lastIncludedTerm());
+
+                // Clear metadataStore first - we're going to restore from snapshot
+                // which provides the authoritative state. If metadata.json has any data,
+                // it would conflict with snapshot restoration.
+                for (String name : new ArrayList<>(metadataStore.listObjects())) {
+                    metadataStore.deleteObjectDirect(name);
+                }
+                metadataStore.save();
+
+                // Restore state from snapshot
+                snapshotManager.restoreFromSnapshot(snap, metadataStore);
+
+                // Set snapshot boundary in RaftLog BEFORE loading entries
+                // This ensures entries <= snapshotIndex are treated as covered by snapshot
+                raftLog.setSnapshotBoundary(snap.lastIncludedIndex(), snap.lastIncludedTerm());
+
+                // Filter WAL entries to only include post-snapshot entries
+                // Entries <= lastIncludedIndex are already in the snapshot
+                List<LogEntry> postSnapshotEntries = recoveryData.entries.stream()
+                        .filter(e -> e.index() > snap.lastIncludedIndex())
+                        .toList();
+
+                System.out.println("[SERVER] Loading " + postSnapshotEntries.size() + " post-snapshot entries");
+
+                raftLog.loadEntries(
+                    postSnapshotEntries,
+                    recoveryData.commitIndex,
+                    Math.min(recoveryData.lastApplied, recoveryData.commitIndex)
+                );
+
+                // Collect names of objects in the snapshot (already restored)
+                java.util.Set<String> snapshotObjects = new java.util.HashSet<>();
+                for (String name : metadataStore.listObjects()) {
+                    snapshotObjects.add(name);
+                }
+
+                // Apply post-snapshot entries to state machine to reconstruct complete state
+                int appliedCount = 0;
+                int skippedCount = 0;
+                for (LogEntry entry : postSnapshotEntries) {
+                    if (entry.index() <= recoveryData.commitIndex) {
+                        // Skip CREATE_OBJECT for objects already in snapshot
+                        // This can happen when snapshot is taken mid-operation
+                        if (entry.opType() == LogEntry.OpType.CREATE_OBJECT && snapshotObjects.contains(extractObjectName(entry))) {
+                            skippedCount++;
+                            continue;
+                        }
+                        stateMachine.apply(entry);
+                        // Track created objects to detect duplicates
+                        if (entry.opType() == LogEntry.OpType.CREATE_OBJECT) {
+                            snapshotObjects.add(extractObjectName(entry));
+                        }
+                        appliedCount++;
+                    }
+                }
+                System.out.println("[SERVER] Applied " + appliedCount + " entries, skipped " + skippedCount + " duplicates");
+            } else {
+                // No snapshot exists - this is allowed for fresh clusters or when snapshots
+                // haven't been taken yet. Use WAL-only recovery.
+                System.out.println("[SERVER] No snapshot found, using WAL-only recovery");
+
+                if (recoveryData.commitIndex > 0 || !recoveryData.entries.isEmpty()) {
+                    // WAL has entries - clear stale metadata and rebuild from WAL
                     for (String name : new ArrayList<>(metadataStore.listObjects())) {
                         metadataStore.deleteObjectDirect(name);
                     }
                     metadataStore.save();
-
-                    // Restore state from snapshot
-                    snapshotManager.restoreFromSnapshot(snap, metadataStore);
-
-                    // Set snapshot boundary in RaftLog BEFORE loading entries
-                    // This ensures entries <= snapshotIndex are treated as covered by snapshot
-                    raftLog.setSnapshotBoundary(snap.lastIncludedIndex(), snap.lastIncludedTerm());
-
-                    // Filter WAL entries to only include post-snapshot entries
-                    // Entries <= lastIncludedIndex are already in the snapshot
-                    List<LogEntry> postSnapshotEntries = recoveryData.entries.stream()
-                            .filter(e -> e.index() > snap.lastIncludedIndex())
-                            .toList();
-
-                    System.out.println("[SERVER] Loading " + postSnapshotEntries.size() + " post-snapshot entries");
-
-                    raftLog.loadEntries(
-                        postSnapshotEntries,
-                        recoveryData.commitIndex,
-                        Math.min(recoveryData.lastApplied, recoveryData.commitIndex)
-                    );
-
-                    // Apply post-snapshot entries to state machine to reconstruct complete state
-                    for (LogEntry entry : postSnapshotEntries) {
-                        if (entry.index() <= recoveryData.commitIndex) {
-                            stateMachine.apply(entry);
-                        }
-                    }
-                    System.out.println("[SERVER] Applied " + postSnapshotEntries.size() + " entries to state machine");
-                } else {
-                    // No snapshot - clear any stale metadata from disk and rebuild from WAL
-                    // metadataStore was loaded from metadata.json but may not match WAL state
-                    if (recoveryData.commitIndex > 0 || !recoveryData.entries.isEmpty()) {
-                        for (String name : new ArrayList<>(metadataStore.listObjects())) {
-                            metadataStore.deleteObjectDirect(name);
-                        }
-                        metadataStore.save();
-                    }
 
                     raftLog.loadEntries(
                         recoveryData.entries,
@@ -151,34 +175,11 @@ public class MetadataServer {
                         }
                     }
                     System.out.println("[SERVER] Applied " + recoveryData.entries.size() + " entries to state machine (no snapshot)");
+                } else {
+                    // Fresh cluster - no snapshot, no WAL entries
+                    // metadataStore was loaded from metadata.json which is fine for fresh start
+                    System.out.println("[SERVER] Fresh start: no snapshot, no WAL entries");
                 }
-            } catch (Exception e) {
-                System.err.println("[SERVER] Failed to load snapshot: " + e.getMessage());
-                // Snapshot restoration failed. Try to recover from WAL if entries exist.
-                // DON'T clear metadataStore - it was loaded from metadata.json and may have valid data.
-                // If WAL entries exist and were committed, replay them to update metadataStore.
-                if (recoveryData.commitIndex > 0 || !recoveryData.entries.isEmpty()) {
-                    // Clear only if we need to rebuild from WAL
-                    if (!recoveryData.entries.isEmpty()) {
-                        for (String name : new ArrayList<>(metadataStore.listObjects())) {
-                            metadataStore.deleteObjectDirect(name);
-                        }
-                    }
-                    raftLog.loadEntries(
-                        recoveryData.entries,
-                        recoveryData.commitIndex,
-                        recoveryData.lastApplied
-                    );
-                    // Apply committed entries to update state machine
-                    for (LogEntry entry : recoveryData.entries) {
-                        if (entry.index() <= recoveryData.commitIndex) {
-                            stateMachine.apply(entry);
-                        }
-                    }
-                }
-                // metadata.json fallback: if metadataStore still has data, keep it
-                // This provides a last-resort fallback when snapshot and WAL are both unreliable
-                metadataStore.save();
             }
 
             this.raftNode = new RaftNode(clusterConfig, resolvedRaftStateDir, raftLog, wal,
@@ -391,5 +392,18 @@ public class MetadataServer {
                 .toList();
 
         return new ClusterConfig("storix", nodeId, host, port, peers);
+    }
+
+    /**
+     * Extracts the object name from a CREATE_OBJECT log entry.
+     */
+    private static String extractObjectName(LogEntry entry) {
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            ObjectMetadata metadata = mapper.readValue(entry.data(), ObjectMetadata.class);
+            return metadata.getObjectName();
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

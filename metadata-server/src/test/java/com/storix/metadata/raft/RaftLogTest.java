@@ -155,4 +155,83 @@ class RaftLogTest {
         assertFalse(log.containsEntry(2, 2)); // Wrong term
         assertFalse(log.containsEntry(3, 1)); // Doesn't exist
     }
+
+    /**
+     * Regression test: getLastLogTerm() must return snapshotTerm after full compaction.
+     * When all entries are compacted away, getLastLogTerm() should return the term
+     * of the last logical entry (the snapshot boundary term), NOT 0.
+     */
+    @Test
+    void testGetLastLogTermAfterFullCompaction() {
+        RaftLog log = new RaftLog();
+
+        // Append entries 1..10 at term 2
+        for (int i = 1; i <= 10; i++) {
+            log.append(new LogEntry(2, i, System.currentTimeMillis(),
+                    LogEntry.OpType.NO_OP, new byte[0]));
+        }
+
+        // Verify initial state
+        assertEquals(10, log.getLastLogIndex());
+        assertEquals(2, log.getLastLogTerm());
+        assertEquals(10, log.size());
+        assertNotNull(log.getEntry(10));
+        assertEquals(2, log.getTermAt(10));
+
+        // Compact through index 10 - this removes all entries
+        log.compactThrough(10, 2);
+
+        // After full compaction, entries should be empty
+        assertEquals(0, log.size(), "Entries should be empty after full compaction");
+        assertEquals(10, log.getLastLogIndex(), "lastLogIndex should still be 10");
+        assertEquals(2, log.getLastLogTerm(), "getLastLogTerm should return 2 (snapshotTerm), not 0");
+        assertEquals(2, log.getTermAt(10), "getTermAt(10) should return 2");
+
+        // Append a new entry
+        log.append(new LogEntry(3, 11, System.currentTimeMillis(),
+                LogEntry.OpType.NO_OP, new byte[0]));
+
+        // Verify new entry
+        assertNotNull(log.getEntry(11));
+        assertEquals(11, log.getEntry(11).index());
+        assertEquals(11, log.getLastLogIndex());
+        assertEquals(3, log.getLastLogTerm(), "getLastLogTerm should now return 3");
+    }
+
+    /**
+     * Test: Repeated compaction preserves absolute indexes.
+     * After compactThrough, entries after the snapshot index remain in the active log.
+     */
+    @Test
+    void testRepeatedCompactionPreservesAbsoluteIndexes() {
+        RaftLog log = new RaftLog();
+
+        // Append entries 1..20 at term 1
+        for (int i = 1; i <= 20; i++) {
+            log.append(new LogEntry(1, i, System.currentTimeMillis(),
+                    LogEntry.OpType.NO_OP, new byte[0]));
+        }
+
+        // First compaction through index 10
+        // This removes entries 1-10 (by index), leaves 11-20
+        log.compactThrough(10, 1);
+        assertEquals(11, log.getLogStartIndex());
+        assertEquals(20, log.getLastLogIndex(), "lastLogIndex should be 20 (entries 11-20 remain)");
+        assertEquals(1, log.getLastLogTerm());
+        assertEquals(10, log.size(), "10 entries (11-20) should remain");
+
+        // Second compaction through index 20
+        // This removes entries 11-20 (by index), leaves nothing
+        log.compactThrough(20, 1);
+        assertEquals(21, log.getLogStartIndex());
+        assertEquals(20, log.getLastLogIndex(), "lastLogIndex should be 20 (snapshot boundary)");
+        assertEquals(1, log.getLastLogTerm());
+        assertEquals(0, log.size(), "Log should be empty after full compaction");
+
+        // Append new entry
+        log.append(new LogEntry(2, 21, System.currentTimeMillis(),
+                LogEntry.OpType.NO_OP, new byte[0]));
+        assertEquals(21, log.getLastLogIndex());
+        assertEquals(2, log.getLastLogTerm());
+    }
 }

@@ -82,11 +82,18 @@ public sealed interface RaftMessage {
         long lastIncludedTerm,
         long offset,
         byte[] data,
-        boolean done
+        boolean done,
+        int checksum  // CRC32 checksum of complete snapshot data (valid only when done=true)
     ) implements RaftMessage {
+        // Compact constructor for backward compatibility (checksum defaults to 0)
+        public InstallSnapshot(long term, String leaderId, long lastIncludedIndex, long lastIncludedTerm,
+                             long offset, byte[] data, boolean done) {
+            this(term, leaderId, lastIncludedIndex, lastIncludedTerm, offset, data, done, 0);
+        }
+
         @Override
         public int version() {
-            return CURRENT_VERSION;
+            return 2; // Increment version for new field
         }
     }
 
