@@ -87,6 +87,7 @@ class InstallSnapshotIntegrationTest {
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
             try {
@@ -250,6 +251,7 @@ class InstallSnapshotIntegrationTest {
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
             try {
@@ -398,21 +400,11 @@ class InstallSnapshotIntegrationTest {
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
 
-        AtomicBoolean restoreFailed = new AtomicBoolean(false);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
-        follower.setLogEntryApplier(entry -> {
-            if (entry.opType() == LogEntry.OpType.SNAPSHOT_RESTORE) {
-                // Simulate restore failure
-                restoreFailed.set(true);
-                try {
-                    throw new IOException("Simulated restore failure for testing");
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-            // Normal entry processing - no-op for this test
-        });
+        follower.setMetadataStore(followerStore);
+        // Note: setLogEntryApplier not used because with Option A, restoreToCandidate
+        // is called directly on MetadataStore, bypassing the log entry applier.
 
         // Start leader
         Thread leaderThread = startNode(leader);
@@ -438,7 +430,14 @@ class InstallSnapshotIntegrationTest {
             // Use state data (JSON), not the raw file bytes (which include binary header)
             byte[] snapshotData = snapshot.stateData();
 
-            // Compute checksum of state data
+            // Corrupt the snapshot data to trigger validation failure in restoreToCandidate.
+            // Strategy: truncate the JSON to cut it mid-value, which will cause a parse error.
+            // Appending garbage to valid JSON won't fail (parser stops at valid end).
+            int corruptLength = snapshotData.length - 10; // Remove last 10 bytes
+            byte[] corruptedData = new byte[corruptLength];
+            System.arraycopy(snapshotData, 0, corruptedData, 0, corruptLength);
+
+            // Compute checksum of CORRUPTED data
             int checksum = computeChecksum(snapshotData);
 
             // Manually invoke InstallSnapshot on follower with failing state machine
@@ -448,15 +447,24 @@ class InstallSnapshotIntegrationTest {
                 0, snapshotData, true, checksum
             );
 
-            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+            // Use corrupted data for the InstallSnapshot request
+            RaftMessage.InstallSnapshot corruptedRequest = new RaftMessage.InstallSnapshot(
                 request.term(), request.leaderId(),
                 request.lastIncludedIndex(), request.lastIncludedTerm(),
-                request.offset(), request.data(), request.done(), request.checksum()
+                0, corruptedData, true, computeChecksum(corruptedData)
+            );
+
+            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+                corruptedRequest.term(), corruptedRequest.leaderId(),
+                corruptedRequest.lastIncludedIndex(), corruptedRequest.lastIncludedTerm(),
+                corruptedRequest.offset(), corruptedRequest.data(), corruptedRequest.done(), corruptedRequest.checksum()
             );
 
             System.out.println("InstallSnapshot response: success=" + response.success());
-            assertTrue(restoreFailed.get(), "Restore should have been attempted and failed");
-            assertFalse(response.success(), "InstallSnapshot should return success=false on restore failure");
+            assertFalse(response.success(), "InstallSnapshot should return success=false on corrupted data");
+
+            // Verify follower store is still empty (not modified by failed restore)
+            assertTrue(followerStore.listObjects().isEmpty(), "Follower store should be empty after failed restore");
 
             System.out.println("\n========================================");
             System.out.println("TEST: Restore Failure Propagation - PASSED");
@@ -511,6 +519,7 @@ class InstallSnapshotIntegrationTest {
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
             try {
@@ -631,6 +640,7 @@ class InstallSnapshotIntegrationTest {
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
             try {

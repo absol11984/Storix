@@ -68,6 +68,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -86,6 +87,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore); // Enable isolated candidate restoration
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
             try {
@@ -201,6 +203,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -219,6 +222,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore); // Enable isolated candidate restoration
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
             try {
@@ -349,6 +353,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -367,6 +372,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore); // Enable isolated candidate restoration
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
             try {
@@ -488,6 +494,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -506,6 +513,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore); // Enable isolated candidate restoration
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
             try {
@@ -651,6 +659,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -668,6 +677,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore); // Enable isolated candidate restoration
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
             try {
@@ -783,6 +793,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -800,6 +811,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
         follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setMetadataStore(followerStore); // Enable isolated candidate restoration
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
             try {
@@ -920,6 +932,7 @@ class InstallSnapshotPersistenceTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {

@@ -87,6 +87,9 @@ public class RaftNode implements AutoCloseable {
     // Snapshot manager for log compaction
     private volatile SnapshotManager snapshotManager;
 
+    // Direct reference to MetadataStore for isolated candidate restoration
+    private volatile com.storix.metadata.MetadataStore metadataStore;
+
     // Snapshot installation state machine for crash-safe protocol
     private enum InstallationState {
         NONE,           // No installation in progress
@@ -105,6 +108,9 @@ public class RaftNode implements AutoCloseable {
 
     // Candidate snapshot tracking (for cleanup and rollback)
     private volatile Path candidateSnapshotFile = null;
+
+    // Candidate state for isolated restoration (prevents partial live state modification)
+    private volatile Map<String, com.storix.metadata.ObjectMetadata> candidateState = null;
 
     @FunctionalInterface
     public interface LogEntryApplier {
@@ -353,6 +359,14 @@ public class RaftNode implements AutoCloseable {
      */
     public void setLogEntryApplier(Consumer<LogEntry> applier) {
         this.stateMachineApplier = applier;
+    }
+
+    /**
+     * Sets the MetadataStore for isolated candidate restoration.
+     * Required for crash-safe InstallSnapshot with partial-restore protection.
+     */
+    public void setMetadataStore(com.storix.metadata.MetadataStore store) {
+        this.metadataStore = store;
     }
 
     // ===== Election and State Transitions =====
@@ -726,29 +740,44 @@ public class RaftNode implements AutoCloseable {
                 installationState = InstallationState.CANDIDATE;
                 System.out.println("[RAFT] Candidate snapshot persisted at: " + candidateSnapshotFile);
 
-                // ===== PHASE 3: RESTORE STATE MACHINE =====
-                System.out.println("[RAFT] [STATE: RESTORING]");
-                if (stateMachineApplier != null) {
-                    // Validate the snapshot data can be decoded before committing
-                    try {
+                // ===== PHASE 3: RESTORE TO ISOLATED CANDIDATE =====
+                // CRITICAL: Do NOT modify live store until candidate is fully validated
+                System.out.println("[RAFT] [STATE: RESTORING_CANDIDATE]");
+                try {
+                    if (metadataStore != null) {
+                        // Use isolated candidate restoration - restores to separate map
+                        candidateState = metadataStore.restoreToCandidate(completeData);
+                        System.out.println("[RAFT] Candidate state restored: " + candidateState.size() + " objects");
+                    } else if (stateMachineApplier != null) {
+                        // Fallback to direct state machine applier
                         LogEntry snapshotEntry = new LogEntry(pendingSnapshotTerm, pendingSnapshotIndex,
                                 System.currentTimeMillis(), LogEntry.OpType.SNAPSHOT_RESTORE, completeData);
                         stateMachineApplier.accept(snapshotEntry);
-                    } catch (Exception e) {
-                        throw new IOException("Failed to restore state machine: " + e.getMessage(), e);
                     }
+                } catch (Exception e) {
+                    throw new IOException("Failed to restore to candidate: " + e.getMessage(), e);
                 }
                 installationState = InstallationState.RESTORED;
-                System.out.println("[RAFT] State machine restored successfully");
+                System.out.println("[RAFT] Candidate state restoration complete");
 
                 // ===== PHASE 4: COMMIT =====
                 System.out.println("[RAFT] [STATE: COMMITTING]");
 
-                // Now install the candidate snapshot as the new authoritative snapshot
-                // This replaces the old snapshot atomically
+                // Step 1: Commit the candidate snapshot as the new authoritative snapshot FIRST.
+                // This is atomic and durable. If this fails, we haven't modified the live store yet.
+                // If this succeeds, we have a valid snapshot on disk that we can recover from.
                 snapshotManager.commitCandidateSnapshot(candidateSnapshotFile,
                         pendingSnapshotIndex, pendingSnapshotTerm);
                 System.out.println("[RAFT] Candidate snapshot committed as new authoritative snapshot");
+
+                // Step 2: Publish candidate state to live store atomically AFTER snapshot is committed.
+                // With the atomic file swap in MetadataStore.publishCandidate, if this fails,
+                // the old storage file is still intact and recoverable.
+                // On crash after successful publish, load() will read the new storage file.
+                if (candidateState != null && !candidateState.isEmpty()) {
+                    metadataStore.publishCandidate(candidateState);
+                    System.out.println("[RAFT] Candidate state published to live store");
+                }
 
                 // Update Raft boundary
                 raftLog.setSnapshotBoundary(pendingSnapshotIndex, pendingSnapshotTerm);
@@ -810,6 +839,7 @@ public class RaftNode implements AutoCloseable {
                     cleanupPendingSnapshot();
                 }
                 candidateSnapshotFile = null;
+                candidateState = null; // Clear candidate state
             }
         }
 

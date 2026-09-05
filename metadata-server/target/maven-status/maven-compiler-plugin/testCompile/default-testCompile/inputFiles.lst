@@ -4,6 +4,7 @@
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/PlacementManagerTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/InstallSnapshotIntegrationTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/InstallSnapshotPersistenceTest.java
+/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/Phase1InstallSnapshotAtomicityIntegrationTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RaftClusterIntegrationTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RaftLogCompactionTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RaftLogRepeatedCompactionTest.java
