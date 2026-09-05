@@ -68,10 +68,10 @@ class Phase1FailedInstallSnapshotTest {
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-fail");
         Path followerRaftDir = tempDir.resolve("follower-raft-fail");
-        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Path followerGenDir = followerRaftDir;
         Files.createDirectories(leaderRaftDir);
         Files.createDirectories(followerRaftDir);
-        Files.createDirectories(followerSnapDir);
+        Files.createDirectories(followerGenDir);
 
         // Setup leader
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
@@ -81,6 +81,11 @@ class Phase1FailedInstallSnapshotTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        // Leader needs GenerationManager for compactLog()
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
+        leader.setGenerationManager(leaderGenMgr);
+        leader.setMetadataStore(leaderStore);
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try { leaderStateMachine.apply(entry); }
@@ -91,11 +96,11 @@ class Phase1FailedInstallSnapshotTest {
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
         Path followerMetaFile = tempDir.resolve("follower-meta-fail.json");
         MetadataStore followerStore = new MetadataStore(followerMetaFile);
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerSnapDir, followerStore);
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
@@ -230,10 +235,10 @@ class Phase1FailedInstallSnapshotTest {
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-fail-restart");
         Path followerRaftDir = tempDir.resolve("follower-raft-fail-restart");
-        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Path followerGenDir = followerRaftDir;
         Files.createDirectories(leaderRaftDir);
         Files.createDirectories(followerRaftDir);
-        Files.createDirectories(followerSnapDir);
+        Files.createDirectories(followerGenDir);
 
         // Setup leader
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
@@ -243,6 +248,11 @@ class Phase1FailedInstallSnapshotTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        // Leader needs GenerationManager for compactLog()
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
+        leader.setGenerationManager(leaderGenMgr);
+        leader.setMetadataStore(leaderStore);
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try { leaderStateMachine.apply(entry); }
@@ -253,11 +263,11 @@ class Phase1FailedInstallSnapshotTest {
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
         Path followerMetaFile = tempDir.resolve("follower-meta-fail-restart.json");
         MetadataStore followerStore = new MetadataStore(followerMetaFile);
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerSnapDir, followerStore);
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
@@ -345,22 +355,21 @@ class Phase1FailedInstallSnapshotTest {
             follower.stop();
             Thread.sleep(100);
 
-            // Restart
+            // Restart - use GenerationManager to recover state
             MetadataStore restartedStore = new MetadataStore(followerMetaFile);
-            SnapshotManager restartedSnapshotMgr = new SnapshotManager(followerSnapDir, restartedStore);
-            WAL restartedWal = new WAL(followerRaftDir.resolve("wal.dat"));
-            RaftLog restartedLog = new RaftLog(restartedWal);
-            RaftNode restartedFollower = new RaftNode(followerConfig, followerRaftDir, restartedLog, restartedWal);
-            restartedFollower.setSnapshotManager(restartedSnapshotMgr);
-            restartedFollower.setMetadataStore(restartedStore);
+            GenerationManager restartedGenMgr = new GenerationManager(followerGenDir);
 
             // After restart, the old state (A B C D) should be recovered
-            assertEquals(4, restartedStore.listObjects().size(),
+            long currentGen = restartedGenMgr.getCurrentGeneration();
+            assertEquals(2, currentGen, "CURRENT should be 2");
+
+            var loadedState = restartedGenMgr.loadAuthoritativeState();
+            assertEquals(4, loadedState.objects().size(),
                 "Restarted store should have A B C D (original state)");
-            assertTrue(restartedStore.objectExists("A"));
-            assertTrue(restartedStore.objectExists("B"));
-            assertTrue(restartedStore.objectExists("C"));
-            assertTrue(restartedStore.objectExists("D"));
+            assertTrue(loadedState.objects().containsKey("A"));
+            assertTrue(loadedState.objects().containsKey("B"));
+            assertTrue(loadedState.objects().containsKey("C"));
+            assertTrue(loadedState.objects().containsKey("D"));
 
             System.out.println("SUCCESS: Original state A B C D recovered on restart");
 
@@ -391,10 +400,10 @@ class Phase1FailedInstallSnapshotTest {
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-old-snap");
         Path followerRaftDir = tempDir.resolve("follower-raft-old-snap");
-        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Path followerGenDir = followerRaftDir;
         Files.createDirectories(leaderRaftDir);
         Files.createDirectories(followerRaftDir);
-        Files.createDirectories(followerSnapDir);
+        Files.createDirectories(followerGenDir);
 
         // Setup leader
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
@@ -404,6 +413,11 @@ class Phase1FailedInstallSnapshotTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        // Leader needs GenerationManager for compactLog()
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
+        leader.setGenerationManager(leaderGenMgr);
+        leader.setMetadataStore(leaderStore);
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try { leaderStateMachine.apply(entry); }
@@ -414,11 +428,11 @@ class Phase1FailedInstallSnapshotTest {
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
         Path followerMetaFile = tempDir.resolve("follower-meta-old-snap.json");
         MetadataStore followerStore = new MetadataStore(followerMetaFile);
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerSnapDir, followerStore);
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
@@ -495,22 +509,19 @@ class Phase1FailedInstallSnapshotTest {
                 0, corruptedData, true, corruptedChecksum
             );
 
-            // Verify old snapshot still exists and is valid
-            var latestSnap = followerSnapshotMgr.loadLatestSnapshot();
+            // Verify old generation still exists and is valid via GenerationManager
+            long currentGen = followerGenMgr.getCurrentGeneration();
+            assertEquals(oldSnapIndex, currentGen, "CURRENT should still be old generation");
 
-            assertTrue(latestSnap.isPresent(), "Old snapshot should still exist");
-            assertEquals(oldSnapIndex, latestSnap.get().lastIncludedIndex(),
-                "Old snapshot index should be unchanged");
-            assertEquals(oldSnapTerm, latestSnap.get().lastIncludedTerm(),
-                "Old snapshot term should be unchanged");
+            var loadedState = followerGenMgr.loadAuthoritativeState();
+            assertEquals(3, loadedState.objects().size(),
+                "Old generation should have 3 objects (A B C)");
+            assertTrue(loadedState.objects().containsKey("A"));
+            assertTrue(loadedState.objects().containsKey("B"));
+            assertTrue(loadedState.objects().containsKey("C"));
 
-            // Verify content
-            assertEquals(computeChecksum(oldSnapData),
-                computeChecksum(latestSnap.get().stateData()),
-                "Old snapshot checksum should be unchanged");
-
-            System.out.println("SUCCESS: Old snapshot intact: index=" + oldSnapIndex +
-                ", term=" + oldSnapTerm + ", checksum=" + oldSnapChecksum);
+            System.out.println("SUCCESS: Old generation intact: gen=" + currentGen +
+                ", objects=" + loadedState.objects().size());
 
             System.out.println("\n========================================");
             System.out.println("TEST: Old Snapshot Remains Authoritative - PASSED");

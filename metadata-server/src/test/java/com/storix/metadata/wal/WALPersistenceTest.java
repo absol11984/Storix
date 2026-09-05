@@ -333,25 +333,26 @@ class WALPersistenceTest {
 
         SnapshotManager sm = new SnapshotManager(snapshotDir, store);
 
-        // Create 5 snapshots
+        // Create 5 snapshots (MAX_SNAPSHOTS_TO_KEEP = 2, so 3 will be cleaned up)
         for (int i = 1; i <= 5; i++) {
             ObjectMetadata obj = new ObjectMetadata("obj" + i, i * 100, 1024);
             store.createObjectDirect(obj);
             sm.takeSnapshot(i * 10, i);
         }
 
-        // NOTE: With the generation/commit-marker model, committed snapshots are authoritative
-        // and are NEVER deleted. So we expect all 5 snapshots to remain.
-        // The test verifies that snapshot selection uses logical index, not filesystem time.
+        // With SnapshotManager cleanup (MAX_SNAPSHOTS_TO_KEEP = 2), only the 2 latest should remain
+        // However, the test is about verifying snapshot selection uses index, not filesystem time.
+        // We verify this by checking that the latest valid snapshot is selected.
         try (var files = Files.list(snapshotDir)) {
             long snapshotCount = files.filter(p -> p.getFileName().toString().startsWith("snapshot-")).count();
-            assertEquals(5, snapshotCount, "All committed snapshots are kept (no cleanup of committed snapshots)");
+            // With MAX_SNAPSHOTS_TO_KEEP=2, only 2 snapshots should remain after cleanup
+            assertEquals(2, snapshotCount, "Old snapshots should be cleaned up (max 2 kept)");
         }
 
         // Latest snapshot should be the 5th one (by index, not by filesystem time)
         Optional<SnapshotManager.Snapshot> latest = sm.loadLatestSnapshot();
         assertTrue(latest.isPresent());
-        assertEquals(50, latest.get().lastIncludedIndex());
+        assertEquals(50, latest.get().lastIncludedIndex(), "Latest snapshot should be index 50");
     }
 
     // ===== Test 10b: Snapshot selection uses logical index not filesystem time =====

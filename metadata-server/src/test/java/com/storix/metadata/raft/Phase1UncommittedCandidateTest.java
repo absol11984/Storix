@@ -2,29 +2,38 @@ package com.storix.metadata.raft;
 
 import com.storix.metadata.*;
 import com.storix.metadata.wal.*;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.*;
-import java.nio.ByteBuffer;
 import java.nio.file.*;
 import java.util.List;
+import java.util.Map;
+import java.util.zip.CRC32;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Phase 1 Uncommitted Candidate Test
  *
- * CRITICAL TEST: Verifies that when a candidate snapshot exists without a commit marker,
- * the OLD committed generation is recovered (not the uncommitted candidate).
+ * CRITICAL TEST: Verifies that when a candidate generation exists WITHOUT CURRENT pointing to it,
+ * the OLD generation is recovered (not the uncommitted candidate).
  *
- * This test manually creates snapshot files to ensure we have:
- * - Generation 10: snapshot exists + commit marker (committed)
- * - Generation 11: snapshot exists only (UNCOMMITTED candidate)
+ * Architecture:
+ * - GenerationManager/CURRENT is the ONLY authoritative source
+ * - A generation is authoritative ONLY if CURRENT points to it
+ * - Uncommitted candidates (directories without CURRENT switch) are ignored on restart
  *
- * On restart, the system MUST recover generation 10.
+ * Test flow:
+ * 1. Create generation 10 with CURRENT pointing to it (authoritative)
+ * 2. Create generation 11 directory WITHOUT switching CURRENT (candidate only)
+ * 3. Restart
+ * 4. Verify generation 10 is recovered (gen-11 ignored)
  */
 class Phase1UncommittedCandidateTest {
+
+    private static final ObjectMapper objectMapper = new ObjectMapper();
 
     @TempDir
     Path tempDir;
@@ -33,10 +42,10 @@ class Phase1UncommittedCandidateTest {
      * CRITICAL: Uncommitted candidates must be ignored on restart.
      *
      * Setup:
-     * - Generation 10: committed (snapshot-10 + generation-10.committed)
-     * - Generation 11: UNCOMMITTED candidate (snapshot-11 only, NO commit marker)
+     * - Generation 10: CURRENT points to it (committed/authoritative)
+     * - Generation 11: directory exists but CURRENT does NOT point to it (candidate only)
      *
-     * Expected: Recovery returns generation 10 (the only committed generation)
+     * Expected: Recovery returns generation 10 (CURRENT's generation)
      */
     @Test
     void testUncommittedCandidateIsIgnored() throws Exception {
@@ -44,93 +53,72 @@ class Phase1UncommittedCandidateTest {
         System.out.println("TEST: Uncommitted Candidate Is Ignored");
         System.out.println("========================================\n");
 
-        Path snapDir = tempDir.resolve("snapshots");
+        Path raftDir = tempDir.resolve("raft");
         Path metaFile = tempDir.resolve("metadata.json");
-        Files.createDirectories(snapDir);
+        Files.createDirectories(raftDir);
 
-        // Create committed metadata for generation 10 (A, B, C)
-        MetadataStore store = new MetadataStore(metaFile);
+        // Create GenerationManager and initialize first generation
+        GenerationManager genMgr = new GenerationManager(raftDir);
+        genMgr.initializeFirstGeneration();
+        assertEquals(1, genMgr.getCurrentGeneration(), "First generation should be 1");
+
+        // Create generation 10 with state A, B, C
+        long gen10 = 10;
+        genMgr.createCandidateGeneration(gen10);
+        MetadataStore store10 = new MetadataStore(metaFile);
         for (String name : List.of("A", "B", "C")) {
             ObjectMetadata obj = makeObject(name, 1000L);
-            store.createObjectDirect(obj);
+            store10.createObjectDirect(obj);
         }
-        store.setGeneration(10);
-        store.save();
+        Map<String, ObjectMetadata> objects10 = getObjectsMap(store10);
+        genMgr.writeMetadata(gen10, objects10);
+        // Write snapshot and manifest for complete generation
+        byte[] snapshot10 = objectMapper.writeValueAsBytes(objects10);
+        int checksum10 = computeChecksum(snapshot10);
+        genMgr.writeSnapshot(gen10, 10, 0, snapshot10, checksum10);
+        genMgr.writeManifest(gen10, 10, 0, checksum10);
+        genMgr.switchCurrent(gen10);
+        System.out.println("Created generation 10 with CURRENT pointing to it (authoritative)");
 
-        System.out.println("Created committed metadata for generation 10: objects A B C");
-
-        // Create committed snapshot for generation 10
-        SnapshotManager sm = new SnapshotManager(snapDir, store);
-        sm.takeSnapshot(10, 1);
-        System.out.println("Created snapshot-10 with commit marker");
-
-        // Now create an UNCOMMITTED candidate for generation 11
-        // Create new metadata with object D (candidate state)
-        MetadataStore candidateStore = new MetadataStore(tempDir.resolve("candidate.json"));
+        // Now create generation 11 WITHOUT switching CURRENT (candidate only)
+        long gen11 = 11;
+        genMgr.createCandidateGeneration(gen11);
+        MetadataStore store11 = new MetadataStore(tempDir.resolve("candidate.json"));
         for (String name : List.of("A", "B", "C", "D")) {
             ObjectMetadata obj = makeObject(name, 1000L);
-            candidateStore.createObjectDirect(obj);
+            store11.createObjectDirect(obj);
         }
-        candidateStore.setGeneration(11);
-        candidateStore.save();
+        genMgr.writeMetadata(gen11, getObjectsMap(store11));
+        // NOTE: We do NOT call switchCurrent(gen11) - gen-11 remains a candidate
+        System.out.println("Created generation 11 WITHOUT switching CURRENT (candidate only)");
+        System.out.println("State: CURRENT -> gen-10, gen-11 is candidate");
 
-        // Manually create snapshot-11 file WITHOUT a commit marker
-        // We bypass SnapshotManager.takeSnapshot() because it auto-commits
-        byte[] stateData = new com.fasterxml.jackson.databind.ObjectMapper()
-            .writeValueAsBytes(candidateStore.listObjects().stream()
-                .collect(java.util.stream.Collectors.toMap(
-                    s -> s,
-                    s -> candidateStore.getObject(s).orElseThrow()
-                )));
+        // Verify state before restart
+        assertEquals(10, genMgr.getCurrentGeneration(), "CURRENT should point to gen-10");
+        assertTrue(Files.exists(genMgr.getGenerationDir(10)), "gen-10 directory should exist");
+        assertTrue(Files.exists(genMgr.getGenerationDir(11)), "gen-11 directory should exist");
 
-        int checksum = computeChecksum(stateData);
+        // Restart with fresh GenerationManager
+        System.out.println("\nRestarting with fresh GenerationManager...");
+        GenerationManager newGenMgr = new GenerationManager(raftDir);
 
-        // Write snapshot-11 file manually
-        Path snapshotFile = snapDir.resolve("snapshot-11");
-        try (FileOutputStream fos = new FileOutputStream(snapshotFile.toFile());
-             java.nio.channels.FileChannel fc = fos.getChannel()) {
+        // CRITICAL ASSERTION: Must recover generation 10 (CURRENT's generation)
+        long recoveredGen = newGenMgr.getCurrentGeneration();
+        assertEquals(10, recoveredGen, "Must recover generation 10 (CURRENT's generation), NOT uncommitted gen-11");
 
-            ByteBuffer headerBuf = ByteBuffer.allocate(12 + 16 + 4);
-            headerBuf.putLong(0x534E415053484F54L); // SNAPSHOT magic
-            headerBuf.putInt(1); // version
-            headerBuf.putLong(11); // lastIncludedIndex
-            headerBuf.putLong(1); // lastIncludedTerm
-            headerBuf.putInt(stateData.length);
-            headerBuf.flip();
-            fc.write(headerBuf);
-            fc.write(ByteBuffer.wrap(stateData));
+        // Verify the state
+        GenerationManager.GenerationState state = newGenMgr.loadAuthoritativeState();
+        assertNotNull(state, "State should be loadable");
+        assertEquals(10, state.generation(), "Recovered state should be from generation 10");
+        assertEquals(3, state.objects().size(), "Should have 3 objects (A, B, C)");
+        assertTrue(state.objects().containsKey("A"), "Object A should exist");
+        assertTrue(state.objects().containsKey("B"), "Object B should exist");
+        assertTrue(state.objects().containsKey("C"), "Object C should exist");
+        assertFalse(state.objects().containsKey("D"), "Object D should NOT exist (only in uncommitted gen-11)");
 
-            ByteBuffer checksumBuf = ByteBuffer.allocate(4);
-            checksumBuf.putInt(checksum);
-            checksumBuf.flip();
-            fc.write(checksumBuf);
-            fc.force(true);
-        }
-
-        System.out.println("Created UNCOMMITTED snapshot-11 (NO commit marker)");
-        System.out.println("State: Generation 10 is COMMITTED, Generation 11 is CANDIDATE only");
-
-        // Verify state: generation 10 has commit marker, generation 11 does NOT
-        Path commitMarker10 = snapDir.resolve("generation-10.committed");
-        Path commitMarker11 = snapDir.resolve("generation-11.committed");
-        assertTrue(Files.exists(commitMarker10), "Generation 10 must have commit marker");
-        assertFalse(Files.exists(commitMarker11), "Generation 11 must NOT have commit marker");
-
-        // Now restart with fresh stores
-        System.out.println("\nRestarting with fresh stores...");
-        MetadataStore newStore = new MetadataStore(metaFile);
-        SnapshotManager newSm = new SnapshotManager(snapDir, newStore);
-
-        // Load latest snapshot - should return generation 10 (only committed one)
-        var latestSnap = newSm.loadLatestSnapshot();
-
-        // CRITICAL ASSERTION: Must recover COMMITTED generation 10, NOT uncommitted 11
-        assertTrue(latestSnap.isPresent(), "Should find committed snapshot");
-        assertEquals(10, latestSnap.get().lastIncludedIndex(),
-            "Must recover COMMITTED generation 10, NOT uncommitted 11");
-
-        System.out.println("SUCCESS: Recovered generation 10 (committed)");
+        System.out.println("SUCCESS: Recovered generation 10 (authoritative)");
         System.out.println("        Uncommitted generation 11 was correctly ignored");
+        System.out.println("        Objects recovered: A, B, C (NOT D)");
 
         System.out.println("\n========================================");
         System.out.println("TEST: Uncommitted Candidate Is Ignored - PASSED");
@@ -148,8 +136,16 @@ class Phase1UncommittedCandidateTest {
     }
 
     private static int computeChecksum(byte[] data) {
-        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        CRC32 crc = new CRC32();
         crc.update(data);
         return (int) crc.getValue();
+    }
+
+    private static java.util.Map<String, ObjectMetadata> getObjectsMap(MetadataStore store) {
+        java.util.Map<String, ObjectMetadata> map = new java.util.HashMap<>();
+        for (String name : store.listObjects()) {
+            map.put(name, store.getObject(name).orElseThrow());
+        }
+        return map;
     }
 }

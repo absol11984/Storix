@@ -17,20 +17,20 @@ import static org.junit.jupiter.api.Assertions.*;
  * Phase 1 Metadata Generation Mismatch Test
  *
  * CRITICAL TEST: Verifies that when metadata generation doesn't match the committed
- * generation in SnapshotManager, the system handles this safely.
+ * generation in GenerationManager, the system handles this safely.
  *
  * Scenario:
- * - SnapshotManager reports committed generation = 3
+ * - GenerationManager CURRENT = 3
  * - Metadata generation = 2 (mismatch!)
  *
  * This can happen if:
- * 1. Metadata was updated but snapshot wasn't taken
- * 2. Snapshot was taken but metadata wasn't updated
- * 3. Crash during atomic update of both
+ * 1. Metadata was updated but generation wasn't committed
+ * 2. Generation was committed but metadata wasn't updated
+ * 3. Crash during atomic commit of generation
  *
  * The system must either:
  * 1. Refuse to start (explicit error)
- * 2. Rebuild metadata from snapshot
+ * 2. Rebuild metadata from generation snapshot
  * 3. Roll back to the lower generation
  *
  * The system MUST NOT silently use mismatched state.
@@ -63,7 +63,7 @@ class Phase1MetadataGenerationMismatchTest {
      * CRITICAL: Metadata generation mismatch must be detected and handled.
      *
      * Scenario:
-     * - SnapshotManager commits generation 3
+     * - GenerationManager CURRENT = 3
      * - Metadata generation is artificially set to 2 (mismatch)
      *
      * Expected: System detects mismatch and handles safely
@@ -78,11 +78,11 @@ class Phase1MetadataGenerationMismatchTest {
 
         Path leaderRaftDir = tempDir.resolve("leader-raft");
         Path followerRaftDir = tempDir.resolve("follower-raft");
-        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Path followerGenDir = followerRaftDir;
         Path followerMetaFile = tempDir.resolve("follower-meta.json");
         Files.createDirectories(leaderRaftDir);
         Files.createDirectories(followerRaftDir);
-        Files.createDirectories(followerSnapDir);
+        Files.createDirectories(followerGenDir);
 
         // Setup leader
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
@@ -92,6 +92,11 @@ class Phase1MetadataGenerationMismatchTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        // Leader needs GenerationManager for compactLog()
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
+        leader.setGenerationManager(leaderGenMgr);
+        leader.setMetadataStore(leaderStore);
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try { leaderStateMachine.apply(entry); }
@@ -101,11 +106,11 @@ class Phase1MetadataGenerationMismatchTest {
         // Setup follower
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
         MetadataStore followerStore = new MetadataStore(followerMetaFile);
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerSnapDir, followerStore);
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
@@ -189,15 +194,15 @@ class Phase1MetadataGenerationMismatchTest {
             assertEquals(4, followerStore.listObjects().size(), "Follower should have A B C D");
             System.out.println("InstallSnapshot completed successfully");
 
-            // CRITICAL: Verify commit marker EXISTS
-            Path commitMarker3 = followerSnapDir.resolve("generation-3.committed");
-            assertTrue(Files.exists(commitMarker3),
-                "COMMIT MARKER MUST EXIST - generation 3 IS committed");
-            System.out.println("VERIFIED: generation-3.committed marker exists");
+            // CRITICAL: Verify generation 3 is committed (CURRENT = 3)
+            long currentGen = followerGenMgr.getCurrentGeneration();
+            assertEquals(3, currentGen,
+                "GenerationManager CURRENT should be 3");
+            System.out.println("VERIFIED: Generation 3 is committed (CURRENT = 3)");
 
             // Step 4: Simulate mismatch - corrupt metadata generation
             System.out.println("\nStep 4: Simulating metadata generation mismatch...");
-            System.out.println("SnapshotManager committed generation: 3");
+            System.out.println("GenerationManager CURRENT: 3");
             System.out.println("Artificially setting metadata generation to 2 (MISMATCH!)");
 
             // Force metadata to generation 2 (creating mismatch)
@@ -207,8 +212,8 @@ class Phase1MetadataGenerationMismatchTest {
             // Verify mismatch exists
             assertEquals(2, followerStore.getGeneration(),
                 "Metadata generation should be artificially set to 2");
-            assertEquals(3, followerSnapshotMgr.getCurrentCommittedGeneration(),
-                "SnapshotManager committed generation should be 3");
+            assertEquals(3, followerGenMgr.getCurrentGeneration(),
+                "GenerationManager CURRENT should be 3");
 
             // Step 5: Simulate crash - stop follower
             System.out.println("\nStep 5: Simulating crash (stopping follower)...");
@@ -218,21 +223,21 @@ class Phase1MetadataGenerationMismatchTest {
             // Step 6: Restart follower - should detect mismatch
             System.out.println("Step 6: Restarting follower with mismatched state...");
             MetadataStore restartedStore = new MetadataStore(followerMetaFile);
-            SnapshotManager restartedSnapshotMgr = new SnapshotManager(followerSnapDir, restartedStore);
+            GenerationManager restartedGenMgr = new GenerationManager(followerGenDir);
 
             // Step 7: Check how system handles mismatch
             System.out.println("\nStep 7: Checking how system handles mismatch...");
 
-            long committedGen = restartedSnapshotMgr.getCurrentCommittedGeneration();
+            long committedGen = restartedGenMgr.getCurrentGeneration();
             long metaGen = restartedStore.getGeneration();
 
             System.out.println("After restart:");
-            System.out.println("  - SnapshotManager committed generation: " + committedGen);
+            System.out.println("  - GenerationManager CURRENT: " + committedGen);
             System.out.println("  - Metadata generation: " + metaGen);
 
             // The system should detect the mismatch and handle it safely.
             // Possible outcomes:
-            // 1. Metadata is updated to match snapshot (generation becomes 3)
+            // 1. Metadata is updated to match generation (generation becomes 3)
             // 2. System refuses to start with mismatched state
             // 3. System uses the lower generation (2)
             //
@@ -243,7 +248,10 @@ class Phase1MetadataGenerationMismatchTest {
                 System.out.println("System resolved mismatch by synchronizing generations");
                 assertEquals(3, committedGen,
                     "If resolved, should use the committed (higher) generation");
-                assertEquals(4, restartedStore.listObjects().size(),
+                // Verify state using GenerationManager.loadAuthoritativeState()
+                var genState = restartedGenMgr.loadAuthoritativeState();
+                assertNotNull(genState, "Authoritative state should be loadable");
+                assertEquals(4, genState.objects().size(),
                     "Should have correct state A B C D");
             } else {
                 System.out.println("System detected mismatch but generations still differ");

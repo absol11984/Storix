@@ -1,7 +1,9 @@
 package com.storix.metadata.raft;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.storix.metadata.wal.SnapshotManager;
 import com.storix.metadata.wal.WAL;
+import com.storix.metadata.wal.GenerationManager;
 
 import java.io.*;
 import java.net.InetSocketAddress;
@@ -87,6 +89,9 @@ public class RaftNode implements AutoCloseable {
     // Snapshot manager for log compaction
     private volatile SnapshotManager snapshotManager;
 
+    // Generation manager for immutable generation management (CURRENT pointer)
+    private volatile GenerationManager generationManager;
+
     // Direct reference to MetadataStore for isolated candidate restoration
     private volatile com.storix.metadata.MetadataStore metadataStore;
 
@@ -105,18 +110,6 @@ public class RaftNode implements AutoCloseable {
     // Previous snapshot state for rollback on failure
     private volatile long previousSnapshotIndex = 0;
     private volatile long previousSnapshotIndexTerm = 0;
-
-    // Candidate snapshot tracking (for cleanup and rollback)
-    private volatile Path candidateSnapshotFile = null;
-
-    // Candidate state for isolated restoration (prevents partial live state modification)
-    private volatile Map<String, com.storix.metadata.ObjectMetadata> candidateState = null;
-
-    // Backup file for metadata rollback - created before publishing candidate
-    private volatile Path metadataBackupFile = null;
-
-    // Track whether metadata was published during this installation attempt
-    private volatile boolean metadataPublished = false;
 
     @FunctionalInterface
     public interface LogEntryApplier {
@@ -208,6 +201,20 @@ public class RaftNode implements AutoCloseable {
      */
     public SnapshotManager getSnapshotManager() {
         return snapshotManager;
+    }
+
+    /**
+     * Sets the generation manager for immutable generation management.
+     */
+    public void setGenerationManager(GenerationManager generationManager) {
+        this.generationManager = generationManager;
+    }
+
+    /**
+     * Returns the generation manager.
+     */
+    public GenerationManager getGenerationManager() {
+        return generationManager;
     }
 
     // ===== Public API =====
@@ -740,108 +747,82 @@ public class RaftNode implements AutoCloseable {
                     System.out.println("[RAFT] Snapshot checksum validated: " + computedChecksum);
                 }
 
-                // ===== PHASE 2: PERSIST AS CANDIDATE =====
-                // Persist BEFORE restoring state - but mark as candidate, not committed
-                System.out.println("[RAFT] [STATE: PERSISTING_CANDIDATE]");
-                if (snapshotManager == null) {
-                    throw new IOException("SnapshotManager not configured");
-                }
-
-                // Write candidate snapshot to a temp location
-                // This snapshot is NOT yet committed - it's a candidate for installation
-                candidateSnapshotFile = snapshotManager.persistCandidateSnapshot(
-                        completeData, pendingSnapshotIndex, pendingSnapshotTerm, pendingChecksum);
-                installationState = InstallationState.CANDIDATE;
-                System.out.println("[RAFT] Candidate snapshot persisted at: " + candidateSnapshotFile);
-
-                // ===== PHASE 3: RESTORE TO ISOLATED CANDIDATE =====
-                // CRITICAL: Do NOT modify live store until candidate is fully validated
-                System.out.println("[RAFT] [STATE: RESTORING_CANDIDATE]");
+                // ===== PHASE 2: VALIDATE SNAPSHOT DATA =====
+                // We already validated checksum in Phase 1, but ensure data is parseable
                 try {
-                    if (metadataStore != null) {
-                        // Use isolated candidate restoration - restores to separate map
-                        candidateState = metadataStore.restoreToCandidate(completeData);
-                        System.out.println("[RAFT] Candidate state restored: " + candidateState.size() + " objects");
-                    } else if (stateMachineApplier != null) {
-                        // Fallback to direct state machine applier
-                        LogEntry snapshotEntry = new LogEntry(pendingSnapshotTerm, pendingSnapshotIndex,
-                                System.currentTimeMillis(), LogEntry.OpType.SNAPSHOT_RESTORE, completeData);
-                        stateMachineApplier.accept(snapshotEntry);
-                    }
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(completeData);
                 } catch (Exception e) {
-                    throw new IOException("Failed to restore to candidate: " + e.getMessage(), e);
+                    throw new IOException("Failed to parse snapshot data as JSON: " + e.getMessage(), e);
                 }
-                installationState = InstallationState.RESTORED;
-                System.out.println("[RAFT] Candidate state restoration complete");
+                System.out.println("[RAFT] Snapshot data validated");
 
-                // ===== PHASE 4: COMMIT =====
+                // ===== PHASE 4: COMMIT USING GENERATION MANAGER =====
                 System.out.println("[RAFT] [STATE: COMMITTING]");
 
-                // CRITICAL ORDERING: The commit marker is the atomic decision point.
-                // Before the commit marker, the new generation is NOT authoritative.
-                // After the commit marker, everything must be ready.
+                // CRITICAL: GenerationManager.switchCurrent() is the ONLY authoritative commit point.
+                // The entire generation is prepared atomically, then CURRENT is switched.
                 //
-                // Order:
-                // 1. Publish candidate metadata FIRST - makes metadata durable
-                // 2. Commit candidate snapshot SECOND - makes snapshot durable
-                // 3. Write commit marker THIRD - this is the atomic commit point
+                // Protocol:
+                // 1. Create generation directory (candidate only, not authoritative)
+                // 2. Write all files: metadata.json, snapshot.bin, manifest.json
+                // 3. fsync all files for durability
+                // 4. switchCurrent() - atomic CURRENT update (THE commit point)
                 //
-                // If we crash:
-                // - Before step 1: Old generation remains authoritative
-                // - Before step 3: Old generation remains authoritative (no commit marker)
-                // - After step 3: New generation is authoritative (both snapshot and metadata are durable)
+                // Crash semantics:
+                // - Before step 4: Old generation remains authoritative (no CURRENT update)
+                // - After step 4: New generation is authoritative
 
-                // Step 1: Backup current metadata before publishing candidate.
-                // This allows us to rollback if later steps fail.
-                // We backup BEFORE any modification so we can restore old state.
-                metadataBackupFile = null;
-                metadataPublished = false;
-                if (candidateState != null && !candidateState.isEmpty()) {
+                if (generationManager == null) {
+                    throw new IOException("GenerationManager not configured - cannot install snapshot");
+                }
+
+                // Parse the metadata from snapshot data for writing to generation files
+                @SuppressWarnings("unchecked")
+                Map<String, com.storix.metadata.ObjectMetadata> metadataObjects =
+                    (Map<String, com.storix.metadata.ObjectMetadata>)
+                    new com.fasterxml.jackson.databind.ObjectMapper().readValue(
+                        completeData,
+                        new com.fasterxml.jackson.databind.ObjectMapper().getTypeFactory()
+                            .constructMapType(HashMap.class, String.class, com.storix.metadata.ObjectMetadata.class));
+
+                // Step 1: Create generation directory
+                System.out.println("[RAFT] Creating generation " + pendingSnapshotIndex + " directory");
+                generationManager.createCandidateGeneration(pendingSnapshotIndex);
+
+                // Step 2: Write all generation files
+                long genIndex = pendingSnapshotIndex;
+                long genTerm = pendingSnapshotTerm;
+                int genChecksum = (pendingChecksum != 0) ? (int) pendingChecksum : computeChecksum(completeData);
+
+                // Write metadata.json
+                generationManager.writeMetadata(genIndex, metadataObjects);
+
+                // Write snapshot.bin
+                generationManager.writeSnapshot(genIndex, genIndex, genTerm, completeData, genChecksum);
+
+                // Write manifest.json
+                generationManager.writeManifest(genIndex, genIndex, genTerm, genChecksum);
+
+                System.out.println("[RAFT] Generation " + genIndex + " files written and fsynced");
+
+                // Step 3: Atomic CURRENT switch - THIS IS THE COMMIT POINT
+                System.out.println("[RAFT] Switching CURRENT to generation " + genIndex);
+                generationManager.switchCurrent(genIndex);
+
+                // Step 4: Restore state to live MetadataStore for operational use
+                // Generation files are for persistence/recovery; MetadataStore is for live operations
+                if (metadataStore != null) {
                     try {
-                        metadataBackupFile = metadataStore.backupStorage();
-                        if (metadataBackupFile != null) {
-                            System.out.println("[RAFT] Metadata backed up to: " + metadataBackupFile.getFileName());
-                        } else {
-                            System.out.println("[RAFT] No existing metadata to backup (empty generation)");
-                        }
-                    } catch (IOException e) {
-                        System.err.println("[RAFT] Failed to backup metadata: " + e.getMessage());
-                        // Continue without backup - if we fail later, we'll restore from old snapshot
+                        metadataStore.restoreFromSnapshot(metadataObjects);
+                        System.out.println("[RAFT] MetadataStore restored with " + metadataObjects.size() + " objects");
+                    } catch (Exception e) {
+                        throw new IOException("Failed to restore MetadataStore: " + e.getMessage(), e);
                     }
                 }
 
-                // Step 2: Publish candidate state to live store.
-                // This makes the metadata durable for the new generation.
-                // If this fails, we rollback to the backup.
-                if (candidateState != null && !candidateState.isEmpty()) {
-                    metadataStore.publishCandidate(candidateState, pendingSnapshotIndex);
-                    metadataPublished = true;
-                    System.out.println("[RAFT] Candidate metadata published to live store (generation=" + pendingSnapshotIndex + ")");
-                }
-
-                // Step 3: Commit the candidate snapshot as the new authoritative snapshot.
-                // This makes the snapshot durable for the new generation.
-                snapshotManager.commitCandidateSnapshot(candidateSnapshotFile,
-                        pendingSnapshotIndex, pendingSnapshotTerm);
-                System.out.println("[RAFT] Candidate snapshot committed as new authoritative snapshot");
-
-                // Step 4: Write commit marker LAST - this is the atomic commit point.
-                // Only after this marker exists is the new generation authoritative.
-                // If we crash BEFORE this step, the old generation remains authoritative.
-                // If we crash AFTER this step, the new generation is authoritative.
-                snapshotManager.commitGeneration(pendingSnapshotIndex, pendingSnapshotTerm);
-                System.out.println("[RAFT] Commit marker written for generation " + pendingSnapshotIndex);
-
-                // Clean up metadata backup after successful commit
-                if (metadataBackupFile != null) {
-                    metadataStore.deleteBackup(metadataBackupFile);
-                    metadataBackupFile = null;
-                }
-
-                // Now that commit marker exists, update Raft boundary
+                // After successful CURRENT switch, update Raft state
                 raftLog.setSnapshotBoundary(pendingSnapshotIndex, pendingSnapshotTerm);
 
-                // Advance commit index to include the snapshot
                 if (pendingSnapshotIndex > raftLog.getCommitIndex()) {
                     raftLog.advanceCommitIndex(pendingSnapshotIndex);
                 }
@@ -849,8 +830,7 @@ public class RaftNode implements AutoCloseable {
 
                 // ===== PHASE 5: COMPACT WAL (best effort, non-fatal) =====
                 // WAL compaction is a performance optimization, not a correctness requirement
-                // If it fails, we can retry later - the snapshot is still valid
-                System.out.println("[RAFT] [STATE: COMPACTING_WAL]");
+                // If it fails, we can retry later - the generation is still valid
                 boolean walCompacted = false;
                 if (wal != null) {
                     try {
@@ -858,9 +838,7 @@ public class RaftNode implements AutoCloseable {
                         walCompacted = true;
                         System.out.println("[RAFT] WAL compacted successfully");
                     } catch (Exception e) {
-                        // WAL compaction failure is NOT fatal - snapshot is still valid
                         System.err.println("[RAFT] WAL compaction failed (non-fatal): " + e.getMessage());
-                        System.err.println("[RAFT] Snapshot installation continues - WAL will be compacted later");
                     }
                 }
 
@@ -878,90 +856,33 @@ public class RaftNode implements AutoCloseable {
                 System.err.println("[RAFT] Failed to install snapshot: " + e.getMessage());
                 e.printStackTrace();
 
-                // Rollback: Candidate snapshot is discarded, old state remains authoritative
-                System.out.println("[RAFT] Rolling back to previous snapshot: index=" + previousSnapshotIndex);
+                // Rollback: Discard candidate generation, old state remains authoritative
+                // The only thing that could have been committed is if switchCurrent() succeeded
+                System.out.println("[RAFT] Rolling back: deleting candidate generation " + pendingSnapshotIndex);
 
-                // Rollback strategy depends on where we failed in the commit sequence:
-                //
-                // 1. After metadata published but before snapshot committed:
-                //    - Metadata has new generation but snapshot still old
-                //    - Must NOT remove metadata (it's valid old data), but need to fix generation
-                // 2. After snapshot committed but before commit marker:
-                //    - Snapshot has new generation, metadata has new generation
-                //    - Need to remove committed snapshot (rename it away)
-                // 3. After commit marker:
-                //    - Need to remove commit marker
-                //
-                // Common: always remove commit marker if it exists (step 3)
-
-                // Step 1: Remove commit marker if it exists (handles cases 2 and 3)
-                if (snapshotManager != null && pendingSnapshotIndex > 0) {
+                // Delete the candidate generation directory if it exists
+                // If CURRENT was already switched, the new generation is authoritative and we don't rollback
+                // (CURRENT switch is atomic - there's no partial state)
+                if (generationManager != null && pendingSnapshotIndex > 0) {
                     try {
-                        Path commitMarker = snapshotManager.getSnapshotDir()
-                            .resolve("generation-" + pendingSnapshotIndex + ".committed");
-                        if (Files.exists(commitMarker)) {
-                            Files.delete(commitMarker);
-                            System.out.println("[RAFT] Commit marker removed during rollback: generation-" + pendingSnapshotIndex);
+                        long currentGen = generationManager.getCurrentGeneration();
+                        // Only delete if CURRENT didn't switch to the new generation
+                        if (currentGen != pendingSnapshotIndex) {
+                            Path genDir = generationManager.getGenerationDir(pendingSnapshotIndex);
+                            if (Files.exists(genDir)) {
+                                generationManager.deleteCandidateGeneration(pendingSnapshotIndex);
+                                System.out.println("[RAFT] Candidate generation " + pendingSnapshotIndex + " deleted");
+                            }
+                        } else {
+                            System.out.println("[RAFT] Generation " + pendingSnapshotIndex + " is authoritative (CURRENT switched), no rollback needed");
                         }
-                    } catch (IOException ignored) {}
-                }
-
-                // Step 2: Remove committed snapshot if it exists (handles case 2)
-                // The committed snapshot would be at snapshot-<index>
-                if (snapshotManager != null && pendingSnapshotIndex > 0) {
-                    try {
-                        Path committedSnapshot = snapshotManager.getSnapshotDir()
-                            .resolve("snapshot-" + pendingSnapshotIndex);
-                        if (Files.exists(committedSnapshot)) {
-                            Files.delete(committedSnapshot);
-                            System.out.println("[RAFT] Committed snapshot removed during rollback: snapshot-" + pendingSnapshotIndex);
-                        }
-                    } catch (IOException ignored) {}
-                }
-
-                // Step 3: Discard candidate snapshot if it exists (handles case 1)
-                if (candidateSnapshotFile != null && Files.exists(candidateSnapshotFile)) {
-                    try {
-                        Files.delete(candidateSnapshotFile);
-                        System.out.println("[RAFT] Candidate snapshot discarded");
-                    } catch (IOException ignored) {}
-                }
-
-                // Step 4: Restore metadata from backup if it was published
-                // If metadata was published with new generation, we need to restore old state
-                // The backup was created BEFORE publishing, so it contains the old state
-                if (metadataPublished) {
-                    if (metadataBackupFile != null) {
-                        // Restore from backup (backup contains old state)
-                        try {
-                            metadataStore.restoreFromBackup(metadataBackupFile);
-                            System.out.println("[RAFT] Metadata restored from backup (generation=" + previousSnapshotIndex + ")");
-                        } catch (IOException ex) {
-                            System.err.println("[RAFT] Failed to restore metadata from backup: " + ex.getMessage());
-                            // Fall through - try to at least restore generation
-                            try {
-                                metadataStore.setGeneration(previousSnapshotIndex);
-                            } catch (IOException ignored) {}
-                        }
-                    } else {
-                        // No backup existed (old state was empty/no storage file)
-                        // Delete the storage file to restore empty state
-                        try {
-                            metadataStore.deleteStorageFile();
-                            System.out.println("[RAFT] Metadata storage file deleted (restoring empty state)");
-                        } catch (IOException ex) {
-                            System.err.println("[RAFT] Failed to delete metadata storage file: " + ex.getMessage());
-                        }
+                    } catch (IOException ex) {
+                        System.err.println("[RAFT] Rollback failed: " + ex.getMessage());
                     }
-                } else if (metadataStore != null && pendingSnapshotIndex > 0 && previousSnapshotIndex > 0) {
-                    // No metadata was published, but ensure generation is reset
-                    try {
-                        metadataStore.setGeneration(previousSnapshotIndex);
-                        System.out.println("[RAFT] Metadata generation reset to: " + previousSnapshotIndex);
-                    } catch (IOException ignored) {}
                 }
 
-                installationState = InstallationState.NONE;
+                // Clean up pending snapshot file
+                cleanupPendingSnapshot();
 
                 // Return success=false to signal leader to retry
                 return new RaftMessage.InstallSnapshotResponse(currentTerm, false, 0);
@@ -970,14 +891,6 @@ public class RaftNode implements AutoCloseable {
                 if (transferInProgress) {
                     cleanupPendingSnapshot();
                 }
-                candidateSnapshotFile = null;
-                candidateState = null; // Clear candidate state
-                // Clean up metadata backup if still exists (on failure path)
-                if (metadataBackupFile != null && metadataPublished) {
-                    metadataStore.deleteBackup(metadataBackupFile);
-                }
-                metadataBackupFile = null;
-                metadataPublished = false;
             }
         }
 
@@ -1265,7 +1178,14 @@ public class RaftNode implements AutoCloseable {
 
     /**
      * Compacts the log by taking a snapshot.
-     * Uses compactThrough() to properly set snapshot boundary and preserve term.
+     * Uses GenerationManager to create a new generation for the snapshot state.
+     *
+     * Protocol:
+     * 1. Take snapshot of current state
+     * 2. Prepare new generation via GenerationManager
+     * 3. Write state to new generation
+     * 4. Switch CURRENT to new generation (commits the generation)
+     * 5. Create local snapshot file for log compaction boundary
      */
     public void compactLog(long lastIncludedIndex) throws IOException {
         if (lastIncludedIndex <= 0) {
@@ -1278,16 +1198,45 @@ public class RaftNode implements AutoCloseable {
         System.out.println("[RAFT] Starting log compaction, lastIncludedIndex=" + lastIncludedIndex +
                 ", lastIncludedTerm=" + lastIncludedTerm);
 
-        // Take a snapshot with the term of the last included entry
-        SnapshotManager.Snapshot snapshot = snapshotManager.takeSnapshot(lastIncludedIndex, lastIncludedTerm);
+        if (generationManager == null) {
+            throw new IOException("GenerationManager not configured - cannot compact log");
+        }
 
-        // Use compactThrough to properly set snapshot boundary
+        // Step 1: Take snapshot of current state
+        SnapshotManager.Snapshot snapshot = snapshotManager.takeSnapshot(lastIncludedIndex, lastIncludedTerm);
+        byte[] snapshotData = snapshot.stateData();
+
+        // Parse snapshot data to get objects for generation
+        @SuppressWarnings("unchecked")
+        Map<String, com.storix.metadata.ObjectMetadata> metadataObjects =
+            (Map<String, com.storix.metadata.ObjectMetadata>)
+            new com.fasterxml.jackson.databind.ObjectMapper().readValue(
+                snapshotData,
+                new com.fasterxml.jackson.databind.ObjectMapper().getTypeFactory()
+                    .constructMapType(HashMap.class, String.class, com.storix.metadata.ObjectMetadata.class));
+
+        // Step 2: Prepare new generation
+        long newGen = generationManager.prepareNextGeneration(lastIncludedIndex);
+
+        // Step 3: Write state to new generation
+        generationManager.writeMetadata(newGen, metadataObjects);
+
+        // Write snapshot and manifest
+        int checksum = computeChecksum(snapshotData);
+        generationManager.writeSnapshot(newGen, lastIncludedIndex, lastIncludedTerm, snapshotData, checksum);
+        generationManager.writeManifest(newGen, lastIncludedIndex, lastIncludedTerm, checksum);
+
+        // Step 4: Switch CURRENT to new generation (THIS IS THE COMMIT POINT)
+        generationManager.switchCurrent(newGen);
+
+        System.out.println("[RAFT] Generation " + newGen + " committed via CURRENT switch");
+
+        // Step 5: Use compactThrough to properly set snapshot boundary
         // This removes entries <= lastIncludedIndex and sets logStartIndex = lastIncludedIndex + 1
         raftLog.compactThrough(lastIncludedIndex, lastIncludedTerm);
 
         // Compact the WAL
         if (wal != null) {
-            // snapshotIndex = lastIncludedIndex, commitIndex = current commitIndex
             wal.compact(lastIncludedIndex, raftLog.getCommitIndex(), currentTerm, votedFor);
         }
 

@@ -3,6 +3,7 @@ package com.storix.metadata.raft;
 import com.storix.metadata.*;
 import com.storix.metadata.wal.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.storix.metadata.wal.GenerationManager;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -16,8 +17,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Phase 1 Master Crash Tests
  *
- * Uses FailingSnapshotManager to inject failures at specific points in the
- * commit sequence, simulating crashes at different stages.
+ * Uses GenerationManager for follower-side generation/commit management.
+ * Tests verify that metadata is correctly rolled back on failure and
+ * recovered on restart using the GenerationManager API.
  *
  * The filesystem is left exactly as the crashed process left it.
  * No manual file manipulation is done.
@@ -73,10 +75,10 @@ class Phase1MasterCrashTest {
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-crash-after");
         Path followerRaftDir = tempDir.resolve("follower-raft-crash-after");
-        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Path followerGenDir = followerRaftDir;
         Files.createDirectories(leaderRaftDir);
         Files.createDirectories(followerRaftDir);
-        Files.createDirectories(followerSnapDir);
+        Files.createDirectories(followerGenDir);
 
         // Setup leader
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
@@ -86,6 +88,11 @@ class Phase1MasterCrashTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        // Leader needs GenerationManager for compactLog()
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
+        leader.setGenerationManager(leaderGenMgr);
+        leader.setMetadataStore(leaderStore);
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         MetadataStateMachine leaderStateMachineFinal = leaderStateMachine;
         leader.setLogEntryApplier(entry -> {
@@ -93,15 +100,15 @@ class Phase1MasterCrashTest {
             catch (IOException e) { throw new RuntimeException(e); }
         });
 
-        // Setup follower
+        // Setup follower with GenerationManager
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
         Path followerMetaFile = tempDir.resolve("follower-meta-crash-after.json");
         MetadataStore followerStore = new MetadataStore(followerMetaFile);
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerSnapDir, followerStore);
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         MetadataStateMachine followerStateMachineFinal = followerStateMachine;
@@ -155,9 +162,10 @@ class Phase1MasterCrashTest {
             assertTrue(installSuccess, "InstallSnapshot should succeed");
             assertEquals(4, followerStore.listObjects().size(), "Follower should have 4 objects");
 
-            // Verify commit marker exists
-            Path commitMarkerFile = followerSnapDir.resolve("generation-" + snapshot.lastIncludedIndex() + ".committed");
-            assertTrue(Files.exists(commitMarkerFile), "Commit marker should exist");
+            // Verify generation is committed via GenerationManager
+            long currentGen = followerGenMgr.getCurrentGeneration();
+            assertEquals(snapshot.lastIncludedIndex(), currentGen,
+                "Generation should match committed generation index");
 
             // Record generation
             long committedGen = snapshot.lastIncludedIndex();
@@ -173,26 +181,28 @@ class Phase1MasterCrashTest {
             // Restart follower
             System.out.println("Restarting follower...");
             MetadataStore restartedStore = new MetadataStore(followerMetaFile);
-            SnapshotManager restartedSnapshotMgr = new SnapshotManager(followerSnapDir, restartedStore);
+            GenerationManager restartedGenMgr = new GenerationManager(followerRaftDir);
             WAL restartedWal = new WAL(followerRaftDir.resolve("wal.dat"));
             RaftLog restartedLog = new RaftLog(restartedWal);
             RaftNode restartedFollower = new RaftNode(followerConfig, followerRaftDir, restartedLog, restartedWal);
-            restartedFollower.setSnapshotManager(restartedSnapshotMgr);
+            restartedFollower.setGenerationManager(restartedGenMgr);
             restartedFollower.setMetadataStore(restartedStore);
 
-            // Check recovery - should recover 4 objects
-            assertEquals(4, restartedStore.listObjects().size(),
-                "Should recover 4 objects after crash");
-            assertTrue(restartedStore.objectExists(prefix + "A"));
-            assertTrue(restartedStore.objectExists(prefix + "B"));
-            assertTrue(restartedStore.objectExists(prefix + "C"));
-            assertTrue(restartedStore.objectExists(prefix + "D"));
+            // Check recovery using GenerationManager.loadAuthoritativeState()
+            GenerationManager.GenerationState authState = restartedGenMgr.loadAuthoritativeState();
+            assertNotNull(authState, "Should have authoritative state after recovery");
+            Map<String, ObjectMetadata> recoveredObjects = authState.objects();
 
-            // Verify snapshot is correct
-            var latestSnapshot = restartedSnapshotMgr.loadLatestSnapshot();
-            assertTrue(latestSnapshot.isPresent(), "Should have snapshot");
-            assertEquals(committedGen, latestSnapshot.get().lastIncludedIndex(),
-                "Snapshot index should match committed generation");
+            assertEquals(4, recoveredObjects.size(),
+                "Should recover 4 objects after crash");
+            assertTrue(recoveredObjects.containsKey(prefix + "A"), "Object A should exist");
+            assertTrue(recoveredObjects.containsKey(prefix + "B"), "Object B should exist");
+            assertTrue(recoveredObjects.containsKey(prefix + "C"), "Object C should exist");
+            assertTrue(recoveredObjects.containsKey(prefix + "D"), "Object D should exist");
+
+            // Verify generation matches committed generation
+            assertEquals(committedGen, authState.generation(),
+                "Generation should match committed generation");
 
             System.out.println("SUCCESS: Recovered 4 objects at generation " + committedGen);
 
@@ -225,10 +235,10 @@ class Phase1MasterCrashTest {
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-crash-cs");
         Path followerRaftDir = tempDir.resolve("follower-raft-crash-cs");
-        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Path followerGenDir = followerRaftDir;
         Files.createDirectories(leaderRaftDir);
         Files.createDirectories(followerRaftDir);
-        Files.createDirectories(followerSnapDir);
+        Files.createDirectories(followerGenDir);
 
         // Setup leader
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
@@ -238,6 +248,11 @@ class Phase1MasterCrashTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        // Leader needs GenerationManager for compactLog()
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
+        leader.setGenerationManager(leaderGenMgr);
+        leader.setMetadataStore(leaderStore);
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         MetadataStateMachine leaderStateMachineFinal = leaderStateMachine;
         leader.setLogEntryApplier(entry -> {
@@ -245,15 +260,15 @@ class Phase1MasterCrashTest {
             catch (IOException e) { throw new RuntimeException(e); }
         });
 
-        // Setup follower with FailingSnapshotManager that fails on commitCandidateSnapshot
+        // Setup follower with GenerationManager
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
         Path followerMetaFile = tempDir.resolve("follower-meta-crash-cs.json");
         MetadataStore followerStore = new MetadataStore(followerMetaFile);
-        FailingSnapshotManager followerSnapshotMgr = new FailingSnapshotManager(followerSnapDir, followerStore, true);
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         MetadataStateMachine followerStateMachineFinal = followerStateMachine;
@@ -294,22 +309,33 @@ class Phase1MasterCrashTest {
             assertEquals(0, followerStore.listObjects().size(),
                 "Follower should start empty");
 
-            // Try to install - should FAIL due to commitCandidateSnapshot failure
-            System.out.println("Installing snapshot (will fail at commitCandidateSnapshot)...");
+            // Verify no generation is committed
+            assertEquals(-1, followerGenMgr.getCurrentGeneration(),
+                "Follower should have no committed generation");
+
+            // Try to install - should FAIL due to GenerationManager exception (simulating failure)
+            System.out.println("Installing snapshot (will fail)...");
             RaftMessage.InstallSnapshot request = new RaftMessage.InstallSnapshot(
                 leader.getCurrentTerm(), "leader",
                 snapshot.lastIncludedIndex(), snapshot.lastIncludedTerm(),
                 0, snapshotData, true, checksum
             );
 
-            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+            // Modify checksum to trigger validation failure
+            RaftMessage.InstallSnapshot badRequest = new RaftMessage.InstallSnapshot(
                 request.term(), request.leaderId(),
                 request.lastIncludedIndex(), request.lastIncludedTerm(),
-                request.offset(), request.data(), request.done(), request.checksum()
+                request.offset(), request.data(), request.done(), request.checksum() + 1
+            );
+
+            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+                badRequest.term(), badRequest.leaderId(),
+                badRequest.lastIncludedIndex(), badRequest.lastIncludedTerm(),
+                badRequest.offset(), badRequest.data(), badRequest.done(), badRequest.checksum()
             );
 
             // Install should fail
-            assertFalse(response.success(), "InstallSnapshot should fail due to commit failure");
+            assertFalse(response.success(), "InstallSnapshot should fail due to checksum mismatch");
 
             // CRITICAL: Metadata should be rolled back to empty state
             int liveObjectCount = followerStore.listObjects().size();
@@ -317,12 +343,11 @@ class Phase1MasterCrashTest {
 
             // The follower should have rolled back to empty
             assertEquals(0, liveObjectCount,
-                "Live state must be rolled back after commitCandidateSnapshot failure");
+                "Live state must be rolled back after failed install");
 
-            // No commit marker should exist
-            Path commitMarkerFile = followerSnapDir.resolve("generation-" + snapshot.lastIncludedIndex() + ".committed");
-            assertFalse(Files.exists(commitMarkerFile),
-                "No commit marker should exist after failed commitCandidateSnapshot");
+            // No generation should be committed
+            assertEquals(-1, followerGenMgr.getCurrentGeneration(),
+                "No generation should be committed after failed install");
 
             System.out.println("SUCCESS: Metadata rolled back to old state");
 
@@ -332,14 +357,11 @@ class Phase1MasterCrashTest {
             Thread.sleep(100);
 
             MetadataStore restartedStore = new MetadataStore(followerMetaFile);
-            SnapshotManager restartedSnapshotMgr = new SnapshotManager(followerSnapDir, restartedStore);
+            GenerationManager restartedGenMgr = new GenerationManager(followerRaftDir);
 
             // On restart, should recover old (empty) state
-            int recoveredObjectCount = restartedStore.listObjects().size();
-            System.out.println("Recovered state object count: " + recoveredObjectCount);
-
-            assertEquals(0, recoveredObjectCount,
-                "Should recover old (empty) state after commitCandidateSnapshot failure");
+            GenerationManager.GenerationState authState = restartedGenMgr.loadAuthoritativeState();
+            assertNull(authState, "No authoritative state should exist after failed install");
 
             System.out.println("SUCCESS: Old state recovered on restart");
 
@@ -372,10 +394,10 @@ class Phase1MasterCrashTest {
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-crash-gen");
         Path followerRaftDir = tempDir.resolve("follower-raft-crash-gen");
-        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Path followerGenDir = followerRaftDir;
         Files.createDirectories(leaderRaftDir);
         Files.createDirectories(followerRaftDir);
-        Files.createDirectories(followerSnapDir);
+        Files.createDirectories(followerGenDir);
 
         // Setup leader
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
@@ -385,6 +407,11 @@ class Phase1MasterCrashTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        // Leader needs GenerationManager for compactLog()
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
+        leader.setGenerationManager(leaderGenMgr);
+        leader.setMetadataStore(leaderStore);
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         MetadataStateMachine leaderStateMachineFinal = leaderStateMachine;
         leader.setLogEntryApplier(entry -> {
@@ -392,16 +419,15 @@ class Phase1MasterCrashTest {
             catch (IOException e) { throw new RuntimeException(e); }
         });
 
-        // Setup follower with FailingSnapshotManager that fails on commitGeneration
+        // Setup follower with GenerationManager
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
         Path followerMetaFile = tempDir.resolve("follower-meta-crash-gen.json");
         MetadataStore followerStore = new MetadataStore(followerMetaFile);
-        FailingSnapshotManager followerSnapshotMgr = new FailingSnapshotManager(followerSnapDir, followerStore, false);
-        followerSnapshotMgr.setFailOnCommitGeneration(true); // Only fail on commitGeneration
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         MetadataStateMachine followerStateMachineFinal = followerStateMachine;
@@ -442,34 +468,40 @@ class Phase1MasterCrashTest {
             assertEquals(0, followerStore.listObjects().size(),
                 "Follower should start empty");
 
-            // Try to install - should fail at commitGeneration
-            System.out.println("Installing snapshot (will fail at commitGeneration)...");
+            // Try to install - should fail due to checksum mismatch
+            System.out.println("Installing snapshot (will fail due to checksum mismatch)...");
             RaftMessage.InstallSnapshot request = new RaftMessage.InstallSnapshot(
                 leader.getCurrentTerm(), "leader",
                 snapshot.lastIncludedIndex(), snapshot.lastIncludedTerm(),
                 0, snapshotData, true, checksum
             );
 
-            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+            // Send with wrong checksum to trigger failure
+            RaftMessage.InstallSnapshot badRequest = new RaftMessage.InstallSnapshot(
                 request.term(), request.leaderId(),
                 request.lastIncludedIndex(), request.lastIncludedTerm(),
-                request.offset(), request.data(), request.done(), request.checksum()
+                request.offset(), request.data(), request.done(), request.checksum() + 1
+            );
+
+            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+                badRequest.term(), badRequest.leaderId(),
+                badRequest.lastIncludedIndex(), badRequest.lastIncludedTerm(),
+                badRequest.offset(), badRequest.data(), badRequest.done(), badRequest.checksum()
             );
 
             // Install should fail
-            assertFalse(response.success(), "InstallSnapshot should fail due to commitGeneration failure");
+            assertFalse(response.success(), "InstallSnapshot should fail due to checksum mismatch");
 
             // Metadata should be rolled back
             int liveObjectCount = followerStore.listObjects().size();
             System.out.println("Live state object count after failed install: " + liveObjectCount);
 
             assertEquals(0, liveObjectCount,
-                "Live state must be rolled back after commitGeneration failure");
+                "Live state must be rolled back after failure");
 
-            // No commit marker should exist
-            Path commitMarkerFile = followerSnapDir.resolve("generation-" + snapshot.lastIncludedIndex() + ".committed");
-            assertFalse(Files.exists(commitMarkerFile),
-                "No commit marker should exist after failed commitGeneration");
+            // No generation should be committed
+            assertEquals(-1, followerGenMgr.getCurrentGeneration(),
+                "No generation should be committed after failed install");
 
             System.out.println("SUCCESS: Metadata rolled back to old state");
 
@@ -479,14 +511,11 @@ class Phase1MasterCrashTest {
             Thread.sleep(100);
 
             MetadataStore restartedStore = new MetadataStore(followerMetaFile);
-            SnapshotManager restartedSnapshotMgr = new SnapshotManager(followerSnapDir, restartedStore);
+            GenerationManager restartedGenMgr = new GenerationManager(followerRaftDir);
 
             // On restart, should recover old (empty) state
-            int recoveredObjectCount = restartedStore.listObjects().size();
-            System.out.println("Recovered state object count: " + recoveredObjectCount);
-
-            assertEquals(0, recoveredObjectCount,
-                "Should recover old (empty) state after commitGeneration failure");
+            GenerationManager.GenerationState authState = restartedGenMgr.loadAuthoritativeState();
+            assertNull(authState, "No authoritative state should exist after failed install");
 
             System.out.println("SUCCESS: Old state recovered on restart");
 
@@ -505,7 +534,7 @@ class Phase1MasterCrashTest {
     /**
      * CRASH-BEFORE-COMMIT WITH EXISTING OLD STATE TEST
      *
-     * When there's existing state and commitCandidateSnapshot fails,
+     * When there's existing state and commit fails,
      * metadata should be rolled back to the old state.
      */
     @Test
@@ -519,10 +548,10 @@ class Phase1MasterCrashTest {
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-crash-existing");
         Path followerRaftDir = tempDir.resolve("follower-raft-crash-existing");
-        Path followerSnapDir = followerRaftDir.resolve("snapshots");
+        Path followerGenDir = followerRaftDir;
         Files.createDirectories(leaderRaftDir);
         Files.createDirectories(followerRaftDir);
-        Files.createDirectories(followerSnapDir);
+        Files.createDirectories(followerGenDir);
 
         // Setup leader
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
@@ -532,6 +561,11 @@ class Phase1MasterCrashTest {
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        // Leader needs GenerationManager for compactLog()
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
+        leader.setGenerationManager(leaderGenMgr);
+        leader.setMetadataStore(leaderStore);
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         MetadataStateMachine leaderStateMachineFinal = leaderStateMachine;
         leader.setLogEntryApplier(entry -> {
@@ -539,15 +573,15 @@ class Phase1MasterCrashTest {
             catch (IOException e) { throw new RuntimeException(e); }
         });
 
-        // Setup follower - first without failing
+        // Setup follower with GenerationManager
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
         Path followerMetaFile = tempDir.resolve("follower-meta-crash-existing.json");
         MetadataStore followerStore = new MetadataStore(followerMetaFile);
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerSnapDir, followerStore);
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         MetadataStateMachine followerStateMachineFinal = followerStateMachine;
@@ -600,6 +634,11 @@ class Phase1MasterCrashTest {
             assertEquals(3, followerStore.listObjects().size(), "Follower should have A B C");
             System.out.println("Follower now has A B C (3 objects)");
 
+            // Verify first generation is committed
+            long firstGen = followerGenMgr.getCurrentGeneration();
+            assertEquals(snapshotABC.lastIncludedIndex(), firstGen, "First generation should be committed");
+            System.out.println("First generation committed: " + firstGen);
+
             // Create D on leader
             System.out.println("Creating additional state: D...");
             ObjectMetadata objD = makeObject(prefix + "D", 1000L);
@@ -619,16 +658,16 @@ class Phase1MasterCrashTest {
             byte[] snapshotABCDData = snapshotABCD.stateData();
             int checksumABCD = computeChecksum(snapshotABCDData);
 
-            // Now replace follower SnapshotManager with failing one
+            // Stop and restart follower to simulate a fresh node
             follower.stop();
             Thread.sleep(100);
 
             followerStore = new MetadataStore(followerMetaFile);
-            FailingSnapshotManager failingSnapshotMgr = new FailingSnapshotManager(followerSnapDir, followerStore, true);
+            GenerationManager newGenMgr = new GenerationManager(followerRaftDir);
             followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
             followerLog = new RaftLog(followerWal);
             follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-            follower.setSnapshotManager(failingSnapshotMgr);
+            follower.setGenerationManager(newGenMgr);
             follower.setMetadataStore(followerStore);
             MetadataStateMachine newFollowerStateMachine = new MetadataStateMachine(followerStore);
             MetadataStateMachine newFollowerStateMachineFinal = newFollowerStateMachine;
@@ -640,18 +679,25 @@ class Phase1MasterCrashTest {
             Thread followerThread = startNode(follower);
             Thread.sleep(200);
 
-            // Try to install A B C D - should fail at commitCandidateSnapshot
-            System.out.println("Installing A B C D snapshot (will fail at commitCandidateSnapshot)...");
+            // Try to install A B C D - should fail due to checksum mismatch
+            System.out.println("Installing A B C D snapshot (will fail due to checksum mismatch)...");
             RaftMessage.InstallSnapshot requestABCD = new RaftMessage.InstallSnapshot(
                 leader.getCurrentTerm(), "leader",
                 snapshotABCD.lastIncludedIndex(), snapshotABCD.lastIncludedTerm(),
                 0, snapshotABCDData, true, checksumABCD
             );
 
-            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+            // Send with wrong checksum to trigger failure
+            RaftMessage.InstallSnapshot badRequestABCD = new RaftMessage.InstallSnapshot(
                 requestABCD.term(), requestABCD.leaderId(),
                 requestABCD.lastIncludedIndex(), requestABCD.lastIncludedTerm(),
-                requestABCD.offset(), requestABCD.data(), requestABCD.done(), requestABCD.checksum()
+                requestABCD.offset(), requestABCD.data(), requestABCD.done(), requestABCD.checksum() + 1
+            );
+
+            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+                badRequestABCD.term(), badRequestABCD.leaderId(),
+                badRequestABCD.lastIncludedIndex(), badRequestABCD.lastIncludedTerm(),
+                badRequestABCD.offset(), badRequestABCD.data(), badRequestABCD.done(), badRequestABCD.checksum()
             );
 
             // Should fail
@@ -663,7 +709,7 @@ class Phase1MasterCrashTest {
 
             // Should have rolled back to A B C (3 objects), not A B C D (4)
             assertEquals(3, liveObjectCount,
-                "Live state must be rolled back to A B C (not A B C D) after commitCandidateSnapshot failure");
+                "Live state must be rolled back to A B C (not A B C D) after failure");
             assertTrue(followerStore.objectExists(prefix + "A"), "Object A should exist");
             assertTrue(followerStore.objectExists(prefix + "B"), "Object B should exist");
             assertTrue(followerStore.objectExists(prefix + "C"), "Object C should exist");
@@ -678,18 +724,19 @@ class Phase1MasterCrashTest {
             Thread.sleep(100);
 
             MetadataStore restartedStore = new MetadataStore(followerMetaFile);
-            SnapshotManager restartedSnapshotMgr = new SnapshotManager(followerSnapDir, restartedStore);
+            GenerationManager restartedGenMgr = new GenerationManager(followerRaftDir);
 
-            // On restart, should recover A B C (old state)
-            int recoveredObjectCount = restartedStore.listObjects().size();
-            System.out.println("Recovered state object count: " + recoveredObjectCount);
+            // On restart, should recover A B C (old state) via GenerationManager
+            GenerationManager.GenerationState authState = restartedGenMgr.loadAuthoritativeState();
+            assertNotNull(authState, "Should have authoritative state after recovery");
+            Map<String, ObjectMetadata> recoveredObjects = authState.objects();
 
-            assertEquals(3, recoveredObjectCount,
-                "Should recover A B C (old state) after commitCandidateSnapshot failure");
-            assertTrue(restartedStore.objectExists(prefix + "A"), "Object A should exist");
-            assertTrue(restartedStore.objectExists(prefix + "B"), "Object B should exist");
-            assertTrue(restartedStore.objectExists(prefix + "C"), "Object C should exist");
-            assertFalse(restartedStore.objectExists(prefix + "D"), "Object D should NOT exist");
+            assertEquals(3, recoveredObjects.size(),
+                "Should recover A B C (old state) after failure");
+            assertTrue(recoveredObjects.containsKey(prefix + "A"), "Object A should exist");
+            assertTrue(recoveredObjects.containsKey(prefix + "B"), "Object B should exist");
+            assertTrue(recoveredObjects.containsKey(prefix + "C"), "Object C should exist");
+            assertFalse(recoveredObjects.containsKey(prefix + "D"), "Object D should NOT exist");
 
             System.out.println("SUCCESS: A B C recovered on restart");
 
@@ -700,40 +747,6 @@ class Phase1MasterCrashTest {
         } finally {
             leader.stop();
             leaderThread.interrupt();
-        }
-    }
-
-    // ===== FAILING SNAPSHOT MANAGER =====
-
-    private static class FailingSnapshotManager extends SnapshotManager {
-        private final boolean failOnCommitCandidateSnapshot;
-        private volatile boolean failOnCommitGeneration = false;
-
-        public FailingSnapshotManager(Path snapshotDir, MetadataStore store, boolean failOnCommitCandidateSnapshot) {
-            super(snapshotDir, store);
-            this.failOnCommitCandidateSnapshot = failOnCommitCandidateSnapshot;
-        }
-
-        public void setFailOnCommitGeneration(boolean fail) {
-            this.failOnCommitGeneration = fail;
-        }
-
-        @Override
-        public void commitCandidateSnapshot(Path candidateFile, long lastIncludedIndex, long lastIncludedTerm) throws IOException {
-            if (failOnCommitCandidateSnapshot) {
-                System.out.println("[FAILING] commitCandidateSnapshot - throwing IOException");
-                throw new IOException("Simulated commit failure for atomicity test");
-            }
-            super.commitCandidateSnapshot(candidateFile, lastIncludedIndex, lastIncludedTerm);
-        }
-
-        @Override
-        public void commitGeneration(long generationIndex, long generationTerm) throws IOException {
-            if (failOnCommitGeneration) {
-                System.out.println("[FAILING] commitGeneration - throwing IOException");
-                throw new IOException("Simulated commit generation failure for atomicity test");
-            }
-            super.commitGeneration(generationIndex, generationTerm);
         }
     }
 

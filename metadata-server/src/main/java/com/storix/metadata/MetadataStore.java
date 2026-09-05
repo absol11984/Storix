@@ -2,6 +2,7 @@ package com.storix.metadata;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.storix.metadata.wal.GenerationManager;
 
 import java.io.IOException;
 import java.io.RandomAccessFile;
@@ -17,11 +18,11 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Thread-safe metadata store with JSON persistence.
  *
- * GENERATION TRACKING:
- * This store tracks the generation it's associated with via a companion .generation file.
- * The generation file contains the snapshot index this metadata was restored from.
- * On load, if the stored generation doesn't match the committed generation in SnapshotManager,
- * the metadata is considered stale and should be rebuilt from the snapshot.
+ * GENERATION INTEGRATION:
+ * When created with a GenerationManager, this store loads from the current generation's
+ * metadata file. This ensures GenerationManager is the ONLY authoritative persistence path.
+ *
+ * The flat metadata.json is ONLY used as a migration fallback when no generation exists.
  */
 public class MetadataStore {
 
@@ -35,13 +36,40 @@ public class MetadataStore {
     private final Path generationFile;
     private final ObjectMapper objectMapper;
     private volatile long currentGeneration = -1;
+    private final GenerationManager generationManager;
+    private volatile boolean loadedFromGeneration = false;
 
+    /**
+     * Creates a MetadataStore without GenerationManager integration.
+     * For backward compatibility and non-cluster mode.
+     */
     public MetadataStore(Path storageFile) throws IOException {
+        this(storageFile, null);
+    }
+
+    /**
+     * Creates a MetadataStore with GenerationManager integration.
+     * Loads from the current generation's metadata file if in cluster mode.
+     *
+     * @param storageFile Fallback file path (used only for migration if no generation exists)
+     * @param generationManager GenerationManager for authoritative generation loading
+     * @throws IOException if generation loading fails
+     */
+    public MetadataStore(Path storageFile, GenerationManager generationManager) throws IOException {
         this.storageFile = storageFile;
         this.generationFile = storageFile.resolveSibling(storageFile.getFileName() + GENERATION_SUFFIX);
         this.objectMapper = new ObjectMapper();
         this.objectMapper.enable(SerializationFeature.INDENT_OUTPUT);
+        this.generationManager = generationManager;
         load();
+    }
+
+    /**
+     * Returns true if metadata was loaded from GenerationManager.
+     * Returns false if loaded from flat file (migration mode or non-cluster).
+     */
+    public boolean wasLoadedFromGeneration() {
+        return loadedFromGeneration;
     }
 
     /**
@@ -332,17 +360,26 @@ public class MetadataStore {
 
     /**
      * Explicitly saves the current state to disk.
-     * Used after batch operations (like snapshot restoration) to persist the final state.
+     * When in cluster mode (GenerationManager available), writes to the current generation's
+     * metadata file. This ensures GenerationManager is the ONLY authoritative persistence path.
      *
      * @throws IOException if the save fails - callers must handle this
      */
     public void save() throws IOException {
-        objectMapper.writeValue(storageFile.toFile(), objects);
+        if (generationManager != null && currentGeneration >= 0) {
+            // Cluster mode: write to current generation's metadata file
+            generationManager.writeMetadata(currentGeneration, new HashMap<>(objects));
+        } else {
+            // Non-cluster or no generation: write to flat file (migration fallback)
+            objectMapper.writeValue(storageFile.toFile(), objects);
+        }
     }
 
     /**
      * Batch restore from a snapshot - clears existing state and rebuilds from snapshot.
      * More efficient than individual creates/updates as it saves only once at the end.
+     * When in cluster mode, writes to the current generation's metadata file.
+     *
      * @param snapshotData Map of object name to ObjectMetadata
      * @throws IOException if persistence fails
      */
@@ -355,7 +392,43 @@ public class MetadataStore {
             objects.put(entry.getKey(), entry.getValue());
         }
 
-        // Save once at the end
+        // Save once at the end (writes to generation if in cluster mode)
+        save();
+    }
+
+    /**
+     * Restores state from raw snapshot bytes, clearing existing state.
+     * Parses snapshot data and saves to disk.
+     * Used during recovery when loading from snapshot is preferred over flat file.
+     *
+     * When in cluster mode, writes to the current generation's metadata file.
+     *
+     * @param snapshotData Raw snapshot bytes
+     * @throws IOException if parsing or persistence fails
+     */
+    @SuppressWarnings("unchecked")
+    public void restoreFromSnapshotBytes(byte[] snapshotData) throws IOException {
+        if (snapshotData == null || snapshotData.length == 0) {
+            return;
+        }
+
+        // Parse the snapshot JSON
+        Map<String, Object> snapshot = objectMapper.readValue(snapshotData,
+            objectMapper.getTypeFactory().constructMapType(HashMap.class, String.class, Object.class));
+
+        // Clear existing state
+        objects.clear();
+
+        // Restore all objects from snapshot
+        for (Map.Entry<String, Object> entry : snapshot.entrySet()) {
+            String key = entry.getKey();
+            Object value = entry.getValue();
+            String json = objectMapper.writeValueAsString(value);
+            ObjectMetadata metadata = objectMapper.readValue(json, ObjectMetadata.class);
+            objects.put(key, metadata);
+        }
+
+        // Save to disk (writes to generation if in cluster mode)
         save();
     }
 
@@ -437,6 +510,9 @@ public class MetadataStore {
      * If any step fails, the old storage file remains intact and recoverable.
      * The in-memory map is only updated after the atomic rename succeeds.
      *
+     * When in cluster mode (GenerationManager available), writes to the current generation's
+     * metadata file instead of the flat storage file.
+     *
      * @param candidateState The candidate state to publish (from restoreToCandidate)
      * @param generation The generation index to associate with this state
      * @throws IOException if publication fails
@@ -450,6 +526,20 @@ public class MetadataStore {
         for (Map.Entry<String, ObjectMetadata> entry : candidateState.entrySet()) {
             validateObjectMetadata(entry.getValue());
         }
+
+        // Cluster mode: use GenerationManager for persistence
+        if (generationManager != null) {
+            // Step 1: Write metadata to the generation directory
+            generationManager.writeMetadata(generation, new HashMap<>(candidateState));
+
+            // Step 2: Update in-memory state
+            this.currentGeneration = generation;
+            objects.clear();
+            objects.putAll(candidateState);
+            return;
+        }
+
+        // Non-cluster mode: use flat file with staging swap
 
         // Step 1: Serialize candidate state to a byte array
         byte[] data;
@@ -561,17 +651,51 @@ public class MetadataStore {
     }
 
     /**
-     * Loads metadata from disk.
+     * Loads metadata, preferring GenerationManager over flat file.
+     *
+     * Priority:
+     * 1. GenerationManager's current generation (authoritative in cluster mode)
+     * 2. Flat metadata.json (migration fallback only - NOT authoritative)
      */
     @SuppressWarnings("unchecked")
     private void load() throws IOException {
-        // Load generation first
-        loadGeneration();
+        // Try GenerationManager first if available
+        if (generationManager != null) {
+            try {
+                long currentGen = generationManager.getCurrentGeneration();
+                if (currentGen >= 0) {
+                    System.out.println("[METADATA] Loading from GenerationManager, generation=" + currentGen);
+                    GenerationManager.GenerationState state = generationManager.loadAuthoritativeState();
+                    if (state != null) {
+                        objects.clear();
+                        objects.putAll(state.objects());
+                        this.currentGeneration = state.generation();
+                        loadGeneration(); // Load from .generation file for compatibility
+                        loadedFromGeneration = true;
+                        return;
+                    }
+                }
+            } catch (IOException e) {
+                // GenerationManager load failed - this is FATAL in cluster mode
+                throw new IOException("Failed to load from GenerationManager: " + e.getMessage(), e);
+            }
+        }
 
+        // Fall back to flat file ONLY for migration or non-cluster mode
+        System.out.println("[METADATA] Falling back to flat file (migration or non-cluster mode)");
+        loadFromFlatFile();
+    }
+
+    /**
+     * Loads metadata from flat file.
+     * This is ONLY used for migration or non-cluster mode.
+     */
+    @SuppressWarnings("unchecked")
+    private void loadFromFlatFile() throws IOException {
+        loadGeneration();
         if (!Files.exists(storageFile)) {
             return;
         }
-
         try {
             Map<String, Object> data = objectMapper.readValue(storageFile.toFile(), Map.class);
             for (Map.Entry<String, Object> entry : data.entrySet()) {

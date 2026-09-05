@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.storix.metadata.raft.*;
 import com.storix.metadata.wal.WAL;
 import com.storix.metadata.wal.SnapshotManager;
+import com.storix.metadata.wal.GenerationManager;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -31,6 +32,7 @@ public class MetadataServer {
     private final RaftNode raftNode;
     private final MetadataStateMachine stateMachine;
     private final SnapshotManager snapshotManager;
+    private final GenerationManager generationManager;
     private volatile boolean running = true;
     private ServerSocketChannel serverChannel;
 
@@ -59,18 +61,50 @@ public class MetadataServer {
                           long nodeTimeoutMillis, long healthCheckIntervalMillis,
                           ClusterConfig clusterConfig, Path raftStateDir) throws IOException {
         this.port = port;
-        this.metadataStore = new MetadataStore(metadataFile);
         this.nodeRegistry = new NodeRegistry();
-        this.placementManager = new PlacementManager(nodeRegistry, replicationFactor);
-        this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager);
-        this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager,
-                nodeTimeoutMillis, healthCheckIntervalMillis);
 
         // Initialize Raft if cluster config provided
         if (clusterConfig != null) {
             // Use provided raftStateDir or default to "raft-state-{nodeId}"
             Path resolvedRaftStateDir = (raftStateDir != null) ? raftStateDir
                 : Path.of("raft-state-" + clusterConfig.nodeId());
+
+            // Create GenerationManager FIRST - it is the ONLY authoritative persistence path
+            // Pass resolvedRaftStateDir (parent); GenerationManager internally creates generations/ subdirectory
+            this.generationManager = new GenerationManager(resolvedRaftStateDir);
+
+            // Validate CURRENT generation on startup - if generation directory is corrupt,
+            // this is FATAL. GenerationManager is authoritative, so corrupt generation = no startup.
+            long currentGen;
+            try {
+                currentGen = generationManager.getCurrentGeneration();
+                if (currentGen >= 0) {
+                    System.out.println("[SERVER] Found current generation: " + currentGen);
+                    // Validate generation integrity - this will throw if corrupt
+                    generationManager.loadAuthoritativeState();
+                    System.out.println("[SERVER] Generation " + currentGen + " validated successfully");
+                } else {
+                    System.out.println("[SERVER] No current generation (fresh start)");
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(
+                    "FATAL: Generation validation failed. Generation data is corrupt. " +
+                    "This may indicate disk corruption or incomplete InstallSnapshot. " +
+                    "Manual intervention required. Error: " + e.getMessage(), e);
+            }
+
+            // Initialize first generation on fresh start (if no current generation exists)
+            if (currentGen < 0) {
+                generationManager.initializeFirstGeneration();
+            }
+
+            // Create MetadataStore with GenerationManager integration
+            // MetadataStore will load from GenerationManager's current generation
+            this.metadataStore = new MetadataStore(metadataFile, generationManager);
+            this.placementManager = new PlacementManager(nodeRegistry, replicationFactor);
+            this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager);
+            this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager,
+                    nodeTimeoutMillis, healthCheckIntervalMillis);
             this.stateMachine = new MetadataStateMachine(metadataStore);
 
             // Create SnapshotManager for log compaction
@@ -86,118 +120,83 @@ public class MetadataServer {
             // Use loadEntries() to restore without re-writing to WAL
             WAL.WALRecoveryResult recoveryData = wal.recover();
 
-            // Try to restore from snapshot if exists (restores full state before log replay)
-            // NOTE: We do NOT fall back to stale metadata.json if snapshot loading fails.
-            // The system must either recover from snapshot+WAL or fail explicitly.
+            // Load latest snapshot for log boundary (NOT for state recovery)
+            // State is loaded from GenerationManager which is the ONLY authoritative source.
+            // SnapshotManager snapshot is used ONLY to determine the log compaction boundary.
             Optional<SnapshotManager.Snapshot> latestSnapshot = snapshotManager.loadLatestSnapshot();
+
+            // Determine the snapshot boundary index
+            long snapshotBoundaryIndex = latestSnapshot.map(SnapshotManager.Snapshot::lastIncludedIndex).orElse(0L);
+            long snapshotBoundaryTerm = latestSnapshot.map(SnapshotManager.Snapshot::lastIncludedTerm).orElse(0L);
 
             if (latestSnapshot.isPresent()) {
                 SnapshotManager.Snapshot snap = latestSnapshot.get();
-                System.out.println("[SERVER] Found snapshot at index " + snap.lastIncludedIndex() +
-                        ", term " + snap.lastIncludedTerm());
+                System.out.println("[SERVER] Found SnapshotManager snapshot at index " + snap.lastIncludedIndex() +
+                        ", term " + snap.lastIncludedTerm() + " (used for log boundary only)");
+            }
 
-                // Clear metadataStore first - we're going to restore from snapshot
-                // which provides the authoritative state. If metadata.json has any data,
-                // it would conflict with snapshot restoration.
-                for (String name : new ArrayList<>(metadataStore.listObjects())) {
-                    metadataStore.deleteObjectDirect(name);
-                }
-                try {
-                    metadataStore.save();
-                } catch (IOException e) {
-                    throw new RuntimeException("Failed to clear metadata store before snapshot restore", e);
-                }
+            // State is already loaded from GenerationManager via MetadataStore constructor.
+            // We only need to:
+            // 1. Set snapshot boundary in RaftLog
+            // 2. Apply post-snapshot WAL entries to bring state up to date
 
-                // Restore state from snapshot
-                snapshotManager.restoreFromSnapshot(snap, metadataStore);
+            // Set snapshot boundary in RaftLog for log management
+            raftLog.setSnapshotBoundary(snapshotBoundaryIndex, snapshotBoundaryTerm);
 
-                // Set snapshot boundary in RaftLog BEFORE loading entries
-                // This ensures entries <= snapshotIndex are treated as covered by snapshot
-                raftLog.setSnapshotBoundary(snap.lastIncludedIndex(), snap.lastIncludedTerm());
+            // Filter WAL entries to only include post-snapshot entries
+            List<LogEntry> postSnapshotEntries = recoveryData.entries.stream()
+                    .filter(e -> e.index() > snapshotBoundaryIndex)
+                    .toList();
 
-                // Filter WAL entries to only include post-snapshot entries
-                // Entries <= lastIncludedIndex are already in the snapshot
-                List<LogEntry> postSnapshotEntries = recoveryData.entries.stream()
-                        .filter(e -> e.index() > snap.lastIncludedIndex())
-                        .toList();
+            raftLog.loadEntries(
+                postSnapshotEntries,
+                recoveryData.commitIndex,
+                Math.min(recoveryData.lastApplied, recoveryData.commitIndex)
+            );
 
-                System.out.println("[SERVER] Loading " + postSnapshotEntries.size() + " post-snapshot entries");
+            System.out.println("[SERVER] Loaded from generation, applying " + postSnapshotEntries.size() + " post-snapshot WAL entries");
 
-                raftLog.loadEntries(
-                    postSnapshotEntries,
-                    recoveryData.commitIndex,
-                    Math.min(recoveryData.lastApplied, recoveryData.commitIndex)
-                );
+            // Collect names of objects loaded from GenerationManager
+            java.util.Set<String> loadedObjects = new java.util.HashSet<>();
+            for (String name : metadataStore.listObjects()) {
+                loadedObjects.add(name);
+            }
 
-                // Collect names of objects in the snapshot (already restored)
-                java.util.Set<String> snapshotObjects = new java.util.HashSet<>();
-                for (String name : metadataStore.listObjects()) {
-                    snapshotObjects.add(name);
-                }
-
-                // Apply post-snapshot entries to state machine to reconstruct complete state
-                int appliedCount = 0;
-                int skippedCount = 0;
-                for (LogEntry entry : postSnapshotEntries) {
-                    if (entry.index() <= recoveryData.commitIndex) {
-                        // Skip CREATE_OBJECT for objects already in snapshot
-                        // This can happen when snapshot is taken mid-operation
-                        if (entry.opType() == LogEntry.OpType.CREATE_OBJECT && snapshotObjects.contains(extractObjectName(entry))) {
-                            skippedCount++;
-                            continue;
-                        }
-                        stateMachine.apply(entry);
-                        // Track created objects to detect duplicates
-                        if (entry.opType() == LogEntry.OpType.CREATE_OBJECT) {
-                            snapshotObjects.add(extractObjectName(entry));
-                        }
-                        appliedCount++;
+            // Apply post-snapshot entries to state machine to reconstruct complete state
+            int appliedCount = 0;
+            int skippedCount = 0;
+            for (LogEntry entry : postSnapshotEntries) {
+                if (entry.index() <= recoveryData.commitIndex) {
+                    // Skip CREATE_OBJECT for objects already in generation state
+                    if (entry.opType() == LogEntry.OpType.CREATE_OBJECT && loadedObjects.contains(extractObjectName(entry))) {
+                        skippedCount++;
+                        continue;
                     }
-                }
-                System.out.println("[SERVER] Applied " + appliedCount + " entries, skipped " + skippedCount + " duplicates");
-            } else {
-                // No snapshot exists - this is allowed for fresh clusters or when snapshots
-                // haven't been taken yet. Use WAL-only recovery.
-                System.out.println("[SERVER] No snapshot found, using WAL-only recovery");
-
-                if (recoveryData.commitIndex > 0 || !recoveryData.entries.isEmpty()) {
-                    // WAL has entries - clear stale metadata and rebuild from WAL
-                    for (String name : new ArrayList<>(metadataStore.listObjects())) {
-                        metadataStore.deleteObjectDirect(name);
+                    stateMachine.apply(entry);
+                    if (entry.opType() == LogEntry.OpType.CREATE_OBJECT) {
+                        loadedObjects.add(extractObjectName(entry));
                     }
-                    try {
-                        metadataStore.save();
-                    } catch (IOException e) {
-                        throw new RuntimeException("Failed to clear metadata store before WAL rebuild", e);
-                    }
-
-                    raftLog.loadEntries(
-                        recoveryData.entries,
-                        recoveryData.commitIndex,
-                        recoveryData.lastApplied
-                    );
-                    // Apply all entries to state machine
-                    for (LogEntry entry : recoveryData.entries) {
-                        if (entry.index() <= recoveryData.commitIndex) {
-                            stateMachine.apply(entry);
-                        }
-                    }
-                    System.out.println("[SERVER] Applied " + recoveryData.entries.size() + " entries to state machine (no snapshot)");
-                } else {
-                    // Fresh cluster - no snapshot, no WAL entries
-                    // metadataStore was loaded from metadata.json which is fine for fresh start
-                    System.out.println("[SERVER] Fresh start: no snapshot, no WAL entries");
+                    appliedCount++;
                 }
             }
+            System.out.println("[SERVER] Applied " + appliedCount + " entries, skipped " + skippedCount + " duplicates");
 
             this.raftNode = new RaftNode(clusterConfig, resolvedRaftStateDir, raftLog, wal,
                     recoveryData.term, recoveryData.votedFor);
             // Wire SnapshotManager into RaftNode for log compaction
             this.raftNode.setSnapshotManager(snapshotManager);
+            // Wire GenerationManager into RaftNode for immutable generation management
+            this.raftNode.setGenerationManager(generationManager);
         } else {
-            this.raftNode = null;
-            this.stateMachine = null;
+            // Non-cluster mode: create MetadataStore without GenerationManager
+            this.metadataStore = new MetadataStore(metadataFile);
+            this.placementManager = new PlacementManager(nodeRegistry, 2);
+            this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager);
+            this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager, 6000, 2000);
             this.snapshotManager = null;
+            this.generationManager = null;
+            this.stateMachine = null;
+            this.raftNode = null;
         }
     }
 
@@ -254,6 +253,14 @@ public class MetadataServer {
      */
     public MetadataStateMachine getStateMachine() {
         return stateMachine;
+    }
+
+    /**
+     * Returns the generation manager for immutable generation management.
+     * May be null if not in cluster mode.
+     */
+    public GenerationManager getGenerationManager() {
+        return generationManager;
     }
 
     /**

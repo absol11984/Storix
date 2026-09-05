@@ -3,6 +3,7 @@ package com.storix.metadata.raft;
 import com.storix.metadata.*;
 import com.storix.metadata.wal.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.storix.metadata.wal.GenerationManager;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -64,11 +65,15 @@ class InstallSnapshotIntegrationTest {
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
 
         MetadataStore leaderStore = new MetadataStore(tempDir.resolve("leader-meta.json"));
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
         SnapshotManager leaderSnapshotMgr = new SnapshotManager(leaderRaftDir.resolve("snapshots"), leaderStore);
         WAL leaderWal = new WAL(leaderRaftDir.resolve("wal.dat"));
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setGenerationManager(leaderGenMgr); // Needed for compactLog()
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -82,11 +87,12 @@ class InstallSnapshotIntegrationTest {
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
 
         MetadataStore followerStore = new MetadataStore(tempDir.resolve("follower-meta.json"));
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerRaftDir.resolve("snapshots"), followerStore);
+        // GenerationManager internally creates "generations/" subdirectory
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
@@ -228,11 +234,15 @@ class InstallSnapshotIntegrationTest {
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
 
         MetadataStore leaderStore = new MetadataStore(tempDir.resolve("leader-meta-cksum.json"));
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
         SnapshotManager leaderSnapshotMgr = new SnapshotManager(leaderRaftDir.resolve("snapshots"), leaderStore);
         WAL leaderWal = new WAL(leaderRaftDir.resolve("wal.dat"));
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setGenerationManager(leaderGenMgr); // Needed for compactLog()
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -246,11 +256,12 @@ class InstallSnapshotIntegrationTest {
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
 
         MetadataStore followerStore = new MetadataStore(tempDir.resolve("follower-meta-cksum.json"));
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerRaftDir.resolve("snapshots"), followerStore);
+        Path followerGenDir = followerRaftDir;
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
@@ -378,11 +389,15 @@ class InstallSnapshotIntegrationTest {
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
 
         MetadataStore leaderStore = new MetadataStore(tempDir.resolve("leader-meta-restore.json"));
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
         SnapshotManager leaderSnapshotMgr = new SnapshotManager(leaderRaftDir.resolve("snapshots"), leaderStore);
         WAL leaderWal = new WAL(leaderRaftDir.resolve("wal.dat"));
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setGenerationManager(leaderGenMgr); // Needed for compactLog()
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -396,12 +411,13 @@ class InstallSnapshotIntegrationTest {
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
 
         MetadataStore followerStore = new MetadataStore(tempDir.resolve("follower-meta-restore.json"));
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerRaftDir.resolve("snapshots"), followerStore);
+        Path followerGenDir = followerRaftDir;
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
 
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         // Note: setLogEntryApplier not used because with Option A, restoreToCandidate
         // is called directly on MetadataStore, bypassing the log entry applier.
@@ -496,11 +512,15 @@ class InstallSnapshotIntegrationTest {
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
 
         MetadataStore leaderStore = new MetadataStore(tempDir.resolve("leader-meta-atomic.json"));
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
         SnapshotManager leaderSnapshotMgr = new SnapshotManager(leaderRaftDir.resolve("snapshots"), leaderStore);
         WAL leaderWal = new WAL(leaderRaftDir.resolve("wal.dat"));
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setGenerationManager(leaderGenMgr); // Needed for compactLog()
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -514,11 +534,12 @@ class InstallSnapshotIntegrationTest {
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
 
         MetadataStore followerStore = new MetadataStore(tempDir.resolve("follower-meta-atomic.json"));
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerRaftDir.resolve("snapshots"), followerStore);
+        Path followerGenDir = followerRaftDir;
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {
@@ -617,11 +638,15 @@ class InstallSnapshotIntegrationTest {
         ClusterConfig leaderConfig = new ClusterConfig("test", "leader", "127.0.0.1", leaderPort, null);
 
         MetadataStore leaderStore = new MetadataStore(tempDir.resolve("leader-meta-post.json"));
+        GenerationManager leaderGenMgr = new GenerationManager(leaderRaftDir);
+        leaderGenMgr.initializeFirstGeneration();
         SnapshotManager leaderSnapshotMgr = new SnapshotManager(leaderRaftDir.resolve("snapshots"), leaderStore);
         WAL leaderWal = new WAL(leaderRaftDir.resolve("wal.dat"));
         RaftLog leaderLog = new RaftLog(leaderWal);
         RaftNode leader = new RaftNode(leaderConfig, leaderRaftDir, leaderLog, leaderWal);
         leader.setSnapshotManager(leaderSnapshotMgr);
+        leader.setGenerationManager(leaderGenMgr); // Needed for compactLog()
+        leader.setMetadataStore(leaderStore); // Enable isolated candidate restoration
         MetadataStateMachine leaderStateMachine = new MetadataStateMachine(leaderStore);
         leader.setLogEntryApplier(entry -> {
             try {
@@ -635,11 +660,12 @@ class InstallSnapshotIntegrationTest {
         ClusterConfig followerConfig = new ClusterConfig("test", "follower", "127.0.0.1", leaderPort + 1, null);
 
         MetadataStore followerStore = new MetadataStore(tempDir.resolve("follower-meta-post.json"));
-        SnapshotManager followerSnapshotMgr = new SnapshotManager(followerRaftDir.resolve("snapshots"), followerStore);
+        Path followerGenDir = followerRaftDir;
+        GenerationManager followerGenMgr = new GenerationManager(followerRaftDir);
         WAL followerWal = new WAL(followerRaftDir.resolve("wal.dat"));
         RaftLog followerLog = new RaftLog(followerWal);
         RaftNode follower = new RaftNode(followerConfig, followerRaftDir, followerLog, followerWal);
-        follower.setSnapshotManager(followerSnapshotMgr);
+        follower.setGenerationManager(followerGenMgr);
         follower.setMetadataStore(followerStore);
         MetadataStateMachine followerStateMachine = new MetadataStateMachine(followerStore);
         follower.setLogEntryApplier(entry -> {

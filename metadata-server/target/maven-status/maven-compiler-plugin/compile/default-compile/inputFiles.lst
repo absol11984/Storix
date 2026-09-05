@@ -19,5 +19,6 @@
 /home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/raft/RaftPeer.java
 /home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/raft/RaftState.java
 /home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/wal/DeduplicationCache.java
+/home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/wal/GenerationManager.java
 /home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/wal/SnapshotManager.java
 /home/arceus/Storix/metadata-server/src/main/java/com/storix/metadata/wal/WAL.java
