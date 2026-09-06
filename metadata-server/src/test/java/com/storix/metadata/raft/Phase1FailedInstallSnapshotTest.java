@@ -361,7 +361,7 @@ class Phase1FailedInstallSnapshotTest {
 
             // After restart, the old state (A B C D) should be recovered
             long currentGen = restartedGenMgr.getCurrentGeneration();
-            assertEquals(2, currentGen, "CURRENT should be 2");
+            assertEquals(1, currentGen, "CURRENT should be 1 (first generation on follower)");
 
             var loadedState = restartedGenMgr.loadAuthoritativeState();
             assertEquals(4, loadedState.objects().size(),
@@ -511,7 +511,9 @@ class Phase1FailedInstallSnapshotTest {
 
             // Verify old generation still exists and is valid via GenerationManager
             long currentGen = followerGenMgr.getCurrentGeneration();
-            assertEquals(oldSnapIndex, currentGen, "CURRENT should still be old generation");
+            // First InstallSnapshot created generation 1; the corrupted second snapshot
+            // should NOT have changed CURRENT (generation IDs are sequential, independent of snapshot index)
+            assertEquals(1, currentGen, "CURRENT should still be generation 1 (old snapshot)");
 
             var loadedState = followerGenMgr.loadAuthoritativeState();
             assertEquals(3, loadedState.objects().size(),

@@ -142,10 +142,12 @@ class InstallSnapshotPersistenceTest {
 
             assertTrue(response.success(), "InstallSnapshot should succeed");
 
-            // VERIFY: GenerationManager has the correct committed generation
+            // VERIFY: GenerationManager has committed a new generation
+            // Generation IDs are sequential (1, 2, 3...) separate from snapshot index
             long committedGen = followerGenMgr.getCurrentGeneration();
-            assertTrue(committedGen >= snapshot.lastIncludedIndex(),
-                "GenerationManager should have committed generation >= " + snapshot.lastIncludedIndex());
+            assertTrue(committedGen >= 1,
+                "GenerationManager should have committed generation >= 1");
+            System.out.println("  GenerationManager committed generation: " + committedGen + " (snapshot index=" + snapshot.lastIncludedIndex() + ")");
 
             System.out.println("  GenerationManager committed generation: " + committedGen);
 
@@ -451,10 +453,11 @@ class InstallSnapshotPersistenceTest {
             assertTrue(finalResponse.success(), "Final InstallSnapshot should succeed");
             assertTrue(chunkCount > 1, "Should use multiple chunks");
 
-            // VERIFY: GenerationManager has the correct committed generation
+            // VERIFY: GenerationManager has committed a new generation
             long committedGen = followerGenMgr.getCurrentGeneration();
-            assertTrue(committedGen >= snapshot.lastIncludedIndex(),
-                "GenerationManager should have committed generation >= " + snapshot.lastIncludedIndex());
+            assertTrue(committedGen >= 1,
+                "GenerationManager should have committed generation >= 1");
+            System.out.println("  GenerationManager committed generation: " + committedGen + " (snapshot index=" + snapshot.lastIncludedIndex() + ")");
 
             // VERIFY: All 50 objects restored
             int objectCount = followerStore.listObjects().size();
@@ -748,8 +751,14 @@ class InstallSnapshotPersistenceTest {
 
             // After install - verify GenerationManager has correct generation
             long committedGen = followerGenMgr.getCurrentGeneration();
-            assertTrue(committedGen >= snapshot.lastIncludedIndex(),
-                "GenerationManager should have committed generation >= " + snapshot.lastIncludedIndex());
+            // First InstallSnapshot creates generation 1 (sequential IDs, not snapshot index)
+            assertTrue(committedGen >= 1,
+                "GenerationManager should have committed generation >= 1 (first generation)");
+
+            // Verify generation 1 has the correct state
+            var authState = followerGenMgr.loadAuthoritativeState();
+            assertNotNull(authState, "Should have authoritative state after install");
+            assertEquals(20, authState.objects().size(), "Should have 20 objects");
 
             // Verify generation files exist (if any were created)
             if (Files.exists(genDir)) {

@@ -194,26 +194,26 @@ class Phase1MetadataGenerationMismatchTest {
             assertEquals(4, followerStore.listObjects().size(), "Follower should have A B C D");
             System.out.println("InstallSnapshot completed successfully");
 
-            // CRITICAL: Verify generation 3 is committed (CURRENT = 3)
+            // CRITICAL: Verify generation 2 is committed (CURRENT = 2, sequential IDs)
             long currentGen = followerGenMgr.getCurrentGeneration();
-            assertEquals(3, currentGen,
-                "GenerationManager CURRENT should be 3");
-            System.out.println("VERIFIED: Generation 3 is committed (CURRENT = 3)");
+            assertEquals(2, currentGen,
+                "GenerationManager CURRENT should be 2");
+            System.out.println("VERIFIED: Generation 2 is committed (CURRENT = 2)");
 
             // Step 4: Simulate mismatch - corrupt metadata generation
             System.out.println("\nStep 4: Simulating metadata generation mismatch...");
-            System.out.println("GenerationManager CURRENT: 3");
-            System.out.println("Artificially setting metadata generation to 2 (MISMATCH!)");
+            System.out.println("GenerationManager CURRENT: 2");
+            System.out.println("Artificially setting metadata generation to 1 (MISMATCH!)");
 
-            // Force metadata to generation 2 (creating mismatch)
-            followerStore.setGeneration(2);
+            // Force metadata to generation 1 (creating mismatch)
+            followerStore.setGeneration(1);
             followerStore.save();
 
             // Verify mismatch exists
-            assertEquals(2, followerStore.getGeneration(),
-                "Metadata generation should be artificially set to 2");
-            assertEquals(3, followerGenMgr.getCurrentGeneration(),
-                "GenerationManager CURRENT should be 3");
+            assertEquals(1, followerStore.getGeneration(),
+                "Metadata generation should be artificially set to 1");
+            assertEquals(2, followerGenMgr.getCurrentGeneration(),
+                "GenerationManager CURRENT should be 2");
 
             // Step 5: Simulate crash - stop follower
             System.out.println("\nStep 5: Simulating crash (stopping follower)...");
@@ -237,16 +237,16 @@ class Phase1MetadataGenerationMismatchTest {
 
             // The system should detect the mismatch and handle it safely.
             // Possible outcomes:
-            // 1. Metadata is updated to match generation (generation becomes 3)
+            // 1. Metadata is updated to match generation (generation becomes 2)
             // 2. System refuses to start with mismatched state
-            // 3. System uses the lower generation (2)
+            // 3. System uses the lower generation (1)
             //
             // What's important: the system doesn't crash and doesn't silently
             // use inconsistent data.
 
             if (committedGen == metaGen) {
                 System.out.println("System resolved mismatch by synchronizing generations");
-                assertEquals(3, committedGen,
+                assertEquals(2, committedGen,
                     "If resolved, should use the committed (higher) generation");
                 // Verify state using GenerationManager.loadAuthoritativeState()
                 var genState = restartedGenMgr.loadAuthoritativeState();

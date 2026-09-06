@@ -360,19 +360,22 @@ public class MetadataStore {
 
     /**
      * Explicitly saves the current state to disk.
-     * When in cluster mode (GenerationManager available), writes to the current generation's
-     * metadata file. This ensures GenerationManager is the ONLY authoritative persistence path.
+     *
+     * In cluster mode, writes to flat file. The WAL is the mutable source.
+     * Generation directories are IMMUTABLE after CURRENT switch - they are created
+     * only during log compaction (compactLog) or InstallSnapshot.
+     *
+     * Recovery path:
+     * 1. Load last committed generation from CURRENT -> generation's metadata.json
+     * 2. Replay WAL entries from that point to rebuild mutable state
      *
      * @throws IOException if the save fails - callers must handle this
      */
     public void save() throws IOException {
-        if (generationManager != null && currentGeneration >= 0) {
-            // Cluster mode: write to current generation's metadata file
-            generationManager.writeMetadata(currentGeneration, new HashMap<>(objects));
-        } else {
-            // Non-cluster or no generation: write to flat file (migration fallback)
-            objectMapper.writeValue(storageFile.toFile(), objects);
-        }
+        // Always write to flat file in cluster mode.
+        // Generation directories are immutable snapshots created during compactLog/InstallSnapshot.
+        // WAL entries are the mutable source that gets replayed on recovery.
+        objectMapper.writeValue(storageFile.toFile(), objects);
     }
 
     /**
@@ -659,31 +662,42 @@ public class MetadataStore {
      */
     @SuppressWarnings("unchecked")
     private void load() throws IOException {
-        // Try GenerationManager first if available
+        // Model: Flat file is mutable (holds current state), generation directories are immutable (snapshots).
+        // Recovery: Load from flat file first, then replay WAL if needed.
+        // GenerationManager is used for snapshots created during compactLog/InstallSnapshot only.
+
+        // Try flat file first - it has the current mutable state
+        if (Files.exists(storageFile)) {
+            System.out.println("[METADATA] Loading from flat file (mutable state)");
+            loadFromFlatFile();
+            loadedFromGeneration = false;
+            return;
+        }
+
+        // Fall back to GenerationManager for snapshot recovery (compactLog/InstallSnapshot)
         if (generationManager != null) {
             try {
                 long currentGen = generationManager.getCurrentGeneration();
                 if (currentGen >= 0) {
-                    System.out.println("[METADATA] Loading from GenerationManager, generation=" + currentGen);
+                    System.out.println("[METADATA] Loading from GenerationManager snapshot, generation=" + currentGen);
                     GenerationManager.GenerationState state = generationManager.loadAuthoritativeState();
                     if (state != null) {
                         objects.clear();
                         objects.putAll(state.objects());
                         this.currentGeneration = state.generation();
-                        loadGeneration(); // Load from .generation file for compatibility
+                        loadGeneration();
                         loadedFromGeneration = true;
                         return;
                     }
                 }
             } catch (IOException e) {
-                // GenerationManager load failed - this is FATAL in cluster mode
                 throw new IOException("Failed to load from GenerationManager: " + e.getMessage(), e);
             }
         }
 
-        // Fall back to flat file ONLY for migration or non-cluster mode
-        System.out.println("[METADATA] Falling back to flat file (migration or non-cluster mode)");
-        loadFromFlatFile();
+        // No state found - fresh start
+        System.out.println("[METADATA] No existing state found, starting fresh");
+        loadGeneration();
     }
 
     /**

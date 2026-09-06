@@ -123,8 +123,17 @@ public class GenerationManager {
 
     /**
      * Writes metadata to a generation directory.
+     *
+     * @throws IOException if the generation is already authoritative (immutable)
      */
     public void writeMetadata(long generation, Map<String, ObjectMetadata> objects) throws IOException {
+        // Immutability check: cannot modify an authoritative generation
+        if (isAuthoritative(generation)) {
+            throw new IOException("FATAL: Attempted to modify authoritative generation " +
+                generation + ". Generations are IMMUTABLE after becoming authoritative. " +
+                "Use prepareNextGeneration() to create a new generation for mutations.");
+        }
+
         Path genDir = getGenerationDir(generation);
         Path metadataFile = genDir.resolve(METADATA_FILE);
 
@@ -138,9 +147,17 @@ public class GenerationManager {
 
     /**
      * Writes snapshot to a generation directory.
+     *
+     * @throws IOException if the generation is already authoritative (immutable)
      */
     public void writeSnapshot(long generation, long lastIncludedIndex, long lastIncludedTerm,
                             byte[] stateData, int checksum) throws IOException {
+        // Immutability check: cannot modify an authoritative generation
+        if (isAuthoritative(generation)) {
+            throw new IOException("FATAL: Attempted to modify authoritative generation " +
+                generation + ". Generations are IMMUTABLE after becoming authoritative.");
+        }
+
         Path genDir = getGenerationDir(generation);
         Path snapshotFile = genDir.resolve(SNAPSHOT_FILE);
 
@@ -173,9 +190,17 @@ public class GenerationManager {
 
     /**
      * Writes manifest to a generation directory.
+     *
+     * @throws IOException if the generation is already authoritative (immutable)
      */
     public void writeManifest(long generation, long lastIncludedIndex, long lastIncludedTerm,
                             int snapshotChecksum) throws IOException {
+        // Immutability check: cannot modify an authoritative generation
+        if (isAuthoritative(generation)) {
+            throw new IOException("FATAL: Attempted to modify authoritative generation " +
+                generation + ". Generations are IMMUTABLE after becoming authoritative.");
+        }
+
         Path genDir = getGenerationDir(generation);
         Path manifestFile = genDir.resolve(MANIFEST_FILE);
 
@@ -529,7 +554,8 @@ public class GenerationManager {
      */
     public long prepareNextGeneration(long snapshotIndex) throws IOException {
         long currentGen = getCurrentGeneration();
-        long nextGen = currentGen + 1;
+        // If no current generation (fresh start), start from generation 1
+        long nextGen = (currentGen >= 0) ? currentGen + 1 : 1;
         createCandidateGeneration(nextGen);
         System.out.println("[GEN] Prepared generation " + nextGen + " for snapshot at index " + snapshotIndex);
         return nextGen;

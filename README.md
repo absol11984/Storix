@@ -26,6 +26,54 @@ A distributed object storage system built with Java 21, featuring multi-node rep
     └──────────┘   └──────────┘   └──────────┘
 ```
 
+### Metadata Persistence Architecture
+
+The Metadata Server uses a crash-safe persistence model:
+
+```
+                    CURRENT
+                       |
+                       v
+              AUTHORITATIVE SNAPSHOT
+                       |
+                       v
+                 GENERATION N
+                       |
+              +--------+--------+
+              |                 |
+        metadata state       snapshot
+              |
+              v
+             WAL
+              |
+              v
+     mutations after snapshot
+```
+
+**Key Components:**
+- **CURRENT**: Single authoritative generation pointer (atomic file)
+- **GenerationManager**: Manages generation directories and CURRENT pointer
+- **WAL**: Durable Write-Ahead Log for post-snapshot mutations
+- **MetadataStateMachine**: Applies WAL/Raft mutations
+- **MetadataStore**: Live/materialized metadata state
+
+**Generation Format:**
+```
+generations/
+    gen-1/
+        metadata.json    # State snapshot
+        snapshot.bin     # Binary snapshot with header
+        manifest.json    # Generation metadata
+
+    gen-2/
+        metadata.json
+        snapshot.bin
+        manifest.json
+
+CURRENT              # Atomic generation pointer
+wal.dat             # Write-Ahead Log
+```
+
 ## Features
 
 ### Distributed Storage
@@ -287,33 +335,43 @@ mvn test
 
 ## What Was Implemented
 
-### Prompt 1: Core Object Storage
-- Storage Node TCP server (ChunkServer)
-- Chunk storage on filesystem (ChunkStorage)
-- Binary protocol for PUT_CHUNK, GET_CHUNK, DELETE_CHUNK (Protocol)
-- Request/Response handling (ChunkRequest, ChunkResponse, ChunkHandler)
-- Virtual threads for concurrent connections
-- Graceful shutdown
-- Metadata Server (MetadataServer, MetadataHandler)
-- Metadata persistence with JSON (MetadataStore)
-- Object and chunk metadata models (ObjectMetadata, ChunkInfo)
-- Chunker for file splitting and reconstruction
-- Client library (StorixClient, StorageNodeClient, MetadataClient)
-- CLI with put/get/delete/info/list commands
-- Comprehensive tests for chunking, storage, and metadata
+### Phase 1: Distributed Storage with Crash Safety
 
-### Prompt 2: Distributed Multi-Node Storage
-- **Node Registry**: Tracks registered nodes with health status (NodeRegistry, NodeInfo, NodeStatus)
+#### Core Storage
+- Storage Node TCP server with virtual threads
+- Chunk storage on filesystem
+- Binary protocol for PUT_CHUNK, GET_CHUNK, DELETE_CHUNK
+- Object and chunk metadata models
+
+#### Distributed Cluster
+- **Node Registry**: Tracks registered nodes with health status
 - **Node Registration**: Storage nodes register with metadata server on startup
-- **Heartbeat System**: Nodes send heartbeats every 2 seconds; missed heartbeats mark nodes unhealthy
-- **Health Monitor**: Scheduled background task checks node health and triggers repairs
-- **Placement Manager**: Deterministic round-robin chunk placement across healthy nodes
-- **Replica-Aware PUT**: Uploads chunks to multiple nodes based on replication factor
-- **Replica-Aware GET**: Downloads from healthy replicas, skips unhealthy nodes
-- **Automatic Repair**: Detects under-replicated chunks and copies from source to destination
-- **Cluster Status**: Shows all nodes, health, and replication statistics
-- **Manual Repair CLI**: `repair` command triggers manual repair cycle
-- **Integration Tests**: Full end-to-end tests with in-process server startup
+- **Heartbeat System**: Nodes send heartbeats every 2 seconds
+- **Health Monitor**: Scheduled background task checks node health
+- **Placement Manager**: Deterministic round-robin chunk placement
+- **Automatic Repair**: Detects under-replicated chunks and repairs them
+
+#### Raft Consensus
+- RaftNode for leader election and log replication
+- AppendEntries RPC for log consistency
+- InstallSnapshot RPC for state transfer
+- Term-based leader election
+
+#### Crash-Safe Persistence (Phase 1)
+- **GenerationManager**: Manages immutable generation directories
+- **CURRENT Pointer**: Atomic generation pointer (single source of truth)
+- **WAL**: Write-Ahead Log for durability
+- **SnapshotManager**: Log compaction with snapshots
+- **Crash Recovery**: Atomic generation commits with rollback safety
+- **Generation Immutability**: Committed generations cannot be modified
+
+**Test Coverage (166 tests):**
+- WAL tests (recovery, compaction, truncation)
+- RaftLog tests (append, truncate, boundary)
+- Generation tests (creation, immutability, recovery)
+- InstallSnapshot tests (multi-chunk, checksum, failure)
+- Crash recovery tests (before/after CURRENT switch)
+- Cluster integration tests (registration, heartbeat, failover)
 
 ## Files Created/Modified
 
@@ -345,11 +403,21 @@ mvn test
 - `EndToEndIntegrationTest.java` - Full integration tests
 - `pom.xml` - Added test dependencies on metadata-server and storage-node
 
-## Limitations (Not Implemented)
+## Phase 1 Status: COMPLETE
+
+Phase 1 of the Storix distributed storage system is complete with:
+- ✓ Raft consensus for leader election and log replication
+- ✓ Crash-safe persistence with atomic generation commits
+- ✓ Generation immutability after commit
+- ✓ WAL + snapshot recovery
+- ✓ Multi-chunk InstallSnapshot with checksum validation
+- ✓ Crash before/after CURRENT switch recovery
+- ✓ Full test suite (166 tests)
+
+## Future Enhancements (Not Yet Implemented)
 
 - No authentication
 - No encryption
-- No distributed consensus (Raft, etc.)
 - No load balancing
 - No tiered storage
 - No quota management

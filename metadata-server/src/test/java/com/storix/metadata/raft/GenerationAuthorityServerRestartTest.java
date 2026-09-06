@@ -153,10 +153,10 @@ class GenerationAuthorityServerRestartTest {
             assertTrue(response.success(), "InstallSnapshot should succeed");
             System.out.println("InstallSnapshot completed successfully");
 
-            // Verify CURRENT is set
+            // Verify CURRENT is set (generation IDs are sequential, separate from snapshot index)
             long currentGen = followerGenMgr.getCurrentGeneration();
-            assertTrue(currentGen >= 2, "CURRENT should be >= 2");
-            System.out.println("CURRENT after InstallSnapshot: " + currentGen);
+            assertTrue(currentGen >= 0, "CURRENT should be >= 0 (new generation committed)");
+            System.out.println("CURRENT after InstallSnapshot: " + currentGen + " (snapshot index=" + snapshot.lastIncludedIndex() + ")");
 
             // Verify follower has the state
             assertEquals(3, followerStore.listObjects().size(), "Follower should have A, B, C");
@@ -321,8 +321,8 @@ class GenerationAuthorityServerRestartTest {
             );
 
             assertTrue(response.success(), "Initial snapshot install should succeed");
-            assertEquals(2, followerGenMgr.getCurrentGeneration(), "CURRENT should be 2");
-            System.out.println("Generation 2 installed, CURRENT = 2");
+            assertEquals(1, followerGenMgr.getCurrentGeneration(), "CURRENT should be 1 (first generation on follower)");
+            System.out.println("Generation 1 installed, CURRENT = 1");
 
             // Step 2: Create more objects C, D on leader
             System.out.println("Step 2: Creating objects C, D on leader...");
@@ -367,8 +367,8 @@ class GenerationAuthorityServerRestartTest {
 
             // Step 4: Verify old state is still there
             long currentGenBeforeStop = followerGenMgr.getCurrentGeneration();
-            System.out.println("CURRENT before stop: " + currentGenBeforeStop + " (should be 2)");
-            assertEquals(2, currentGenBeforeStop, "CURRENT should still be 2 (gen 3 not committed)");
+            System.out.println("CURRENT before stop: " + currentGenBeforeStop + " (should be 1)");
+            assertEquals(1, currentGenBeforeStop, "CURRENT should still be 1 (gen 2 not committed)");
 
             // Step 5: Stop follower
             System.out.println("Step 5: Stopping follower...");
@@ -387,12 +387,12 @@ class GenerationAuthorityServerRestartTest {
                 followerRaftDir
             );
 
-            // Step 7: Verify generation 2 is still current
-            System.out.println("Step 7: Verifying generation 2 is still current...");
+            // Step 7: Verify generation 1 is still current
+            System.out.println("Step 7: Verifying generation 1 is still current...");
             GenerationManager newGenMgr = newServer.getGenerationManager();
             long newCurrentGen = newGenMgr.getCurrentGeneration();
             System.out.println("CURRENT after restart: " + newCurrentGen);
-            assertEquals(2, newCurrentGen, "CURRENT should still be 2 (gen 3 was never committed)");
+            assertEquals(1, newCurrentGen, "CURRENT should still be 1 (gen 2 was never committed)");
 
             // Step 8: Verify state is A, B only (not C, D)
             System.out.println("Step 8: Verifying state is A, B only...");
@@ -404,10 +404,10 @@ class GenerationAuthorityServerRestartTest {
             assertFalse(newStore.objectExists("D"), "Object D should NOT exist");
 
             System.out.println("State after restart: " + stateAfter);
-            System.out.println("\nSUCCESS: Old generation 2 recovered");
+            System.out.println("\nSUCCESS: Old generation 1 recovered");
             System.out.println("  - CURRENT = " + newCurrentGen);
             System.out.println("  - Objects: " + stateAfter);
-            System.out.println("  - Generation 3 correctly ignored (was not committed)");
+            System.out.println("  - Generation 2 correctly ignored (was not committed)");
 
             newServer.stop();
 

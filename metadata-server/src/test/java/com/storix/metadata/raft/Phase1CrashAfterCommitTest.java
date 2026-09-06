@@ -200,11 +200,11 @@ class Phase1CrashAfterCommitTest {
             assertEquals(4, followerStore.listObjects().size(), "Follower should have A B C D");
             System.out.println("InstallSnapshot completed successfully");
 
-            // CRITICAL: Verify CURRENT is now gen 3
+            // CRITICAL: Verify a new generation was committed (generation IDs are sequential)
             long currentGen = followerGenMgr.getCurrentGeneration();
-            System.out.println("CURRENT after InstallSnapshot: " + currentGen);
-            assertEquals(3, currentGen, "CURRENT must be 3 (NEW generation)");
-            System.out.println("VERIFIED: CURRENT = 3");
+            System.out.println("CURRENT after InstallSnapshot: " + currentGen + " (snapshot index=" + snapshot.lastIncludedIndex() + ")");
+            assertEquals(2, currentGen, "CURRENT must be generation 2 (second generation committed)");
+            System.out.println("VERIFIED: New generation committed");
 
             // Step 4: Simulate crash - stop follower
             System.out.println("\nStep 4: Simulating crash (stopping follower)...");
@@ -216,14 +216,14 @@ class Phase1CrashAfterCommitTest {
             MetadataStore restartedStore = new MetadataStore(followerMetaFile);
             GenerationManager restartedGenMgr = new GenerationManager(followerGenDir);
 
-            // Step 6: Verify NEW generation (3) is recovered
+            // Step 6: Verify NEW generation (2) is recovered
             System.out.println("\nStep 6: Verifying NEW generation is recovered...");
 
             long recoveredGen = restartedGenMgr.getCurrentGeneration();
             System.out.println("CURRENT after restart: " + recoveredGen);
 
-            assertEquals(3, recoveredGen,
-                "CRITICAL: CURRENT must be 3 (NEW generation)");
+            assertEquals(2, recoveredGen,
+                "CRITICAL: CURRENT must be 2 (NEW generation)");
 
             // Verify state via GenerationManager
             var loadedState = restartedGenMgr.loadAuthoritativeState();
@@ -233,10 +233,10 @@ class Phase1CrashAfterCommitTest {
             assertTrue(loadedState.objects().containsKey("B"), "Object B must exist");
             assertTrue(loadedState.objects().containsKey("C"), "Object C must exist");
             assertTrue(loadedState.objects().containsKey("D"),
-                "CRITICAL: Object D MUST exist - generation 3 was committed");
+                "CRITICAL: Object D MUST exist - generation 2 was committed");
 
-            System.out.println("SUCCESS: New generation 3 with state A B C D recovered");
-            System.out.println("  - CURRENT = 3");
+            System.out.println("SUCCESS: New generation 2 with state A B C D recovered");
+            System.out.println("  - CURRENT = 2");
             System.out.println("  - state has 4 objects");
 
         } finally {
@@ -361,9 +361,10 @@ class Phase1CrashAfterCommitTest {
 
             assertTrue(success, "Multi-chunk InstallSnapshot should succeed");
 
-            // Verify CURRENT
+            // Verify CURRENT (generation IDs are sequential, separate from snapshot index)
             long currentGen = followerGenMgr.getCurrentGeneration();
-            assertEquals(2, currentGen, "CURRENT must be 2");
+            // First InstallSnapshot on follower creates generation 1
+            assertEquals(1, currentGen, "CURRENT must be generation 1 (first generation committed)");
 
             // Simulate crash and restart
             System.out.println("\nSimulating crash...");
@@ -372,7 +373,7 @@ class Phase1CrashAfterCommitTest {
 
             GenerationManager restartedGenMgr = new GenerationManager(followerGenDir);
             long recoveredGen = restartedGenMgr.getCurrentGeneration();
-            assertEquals(2, recoveredGen, "After restart, CURRENT should still be 2");
+            assertEquals(1, recoveredGen, "After restart, CURRENT should still be 1");
 
             var recoveredState = restartedGenMgr.loadAuthoritativeState();
             assertEquals(50, recoveredState.objects().size(), "Should recover all 50 objects");

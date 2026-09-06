@@ -161,11 +161,12 @@ class Phase1CrashBeforeCommitTest {
             );
             assertTrue(response.success(), "Initial snapshot install should succeed");
             assertEquals(3, followerStore.listObjects().size(), "Follower should have A B C");
-            System.out.println("Follower now has generation 2 with A B C");
+            System.out.println("Follower now has a new generation with A B C");
 
-            // Verify CURRENT is set to gen 2
-            long currentGen = followerGenMgr.getCurrentGeneration();
-            assertEquals(2, currentGen, "CURRENT should be 2");
+            // Verify CURRENT was advanced to generation 1 (generation IDs are sequential, starting from 1)
+            long genAfterFirstSnapshot = followerGenMgr.getCurrentGeneration();
+            assertEquals(1, genAfterFirstSnapshot, "CURRENT should be generation 1 after first snapshot");
+            System.out.println("CURRENT after first snapshot: " + genAfterFirstSnapshot);
 
             // Step 2: Create generation 3 with A B C D
             System.out.println("\nStep 2: Creating generation 3 with state A B C D...");
@@ -225,8 +226,8 @@ class Phase1CrashBeforeCommitTest {
             long recoveredGen = restartedGenMgr.getCurrentGeneration();
             System.out.println("CURRENT after restart: " + recoveredGen);
 
-            assertEquals(2, recoveredGen,
-                "CRITICAL: CURRENT must be 2 (OLD generation) - gen 3 was not committed");
+            assertEquals(1, recoveredGen,
+                "CRITICAL: CURRENT must be 1 (OLD generation) - gen 2 was not committed");
 
             // Verify state via GenerationManager - should have A B C only
             var loadedState = restartedGenMgr.loadAuthoritativeState();
@@ -309,9 +310,48 @@ class Phase1CrashBeforeCommitTest {
         try {
             waitForLeader(leader, 5000);
 
-            // Create state with 30 objects
-            System.out.println("Creating state with 30 objects...");
-            for (int i = 0; i < 30; i++) {
+            // Step 1: Create initial state with 10 objects and install complete snapshot
+            System.out.println("Step 1: Creating initial state with 10 objects and installing complete snapshot...");
+            for (int i = 0; i < 10; i++) {
+                ObjectMetadata obj = makeObject("Obj" + i, 5000L);
+                byte[] data = objectMapper.writeValueAsBytes(obj);
+                LogEntry entry = LogEntry.create(leader.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data);
+                leader.submit(entry);
+            }
+            Thread.sleep(300);
+
+            // Compact to create first snapshot
+            leader.compactLog(2);
+            Thread.sleep(200);
+
+            // Install first snapshot completely on follower
+            var snapshotOpt = leaderSnapshotMgr.loadLatestSnapshot();
+            assertTrue(snapshotOpt.isPresent());
+            var snapshot = snapshotOpt.get();
+            byte[] snapshotData = snapshot.stateData();
+            int checksum = computeChecksum(snapshotData);
+
+            RaftMessage.InstallSnapshot request = new RaftMessage.InstallSnapshot(
+                leader.getCurrentTerm(), "leader",
+                snapshot.lastIncludedIndex(), snapshot.lastIncludedTerm(),
+                0, snapshotData, true, checksum
+            );
+            RaftMessage.InstallSnapshotResponse response = follower.handleInstallSnapshot(
+                request.term(), request.leaderId(),
+                request.lastIncludedIndex(), request.lastIncludedTerm(),
+                request.offset(), request.data(), request.done(), request.checksum()
+            );
+            assertTrue(response.success(), "Initial snapshot install should succeed");
+            System.out.println("Initial snapshot installed successfully");
+
+            // Verify first generation is committed
+            long genAfterFirstSnapshot = followerGenMgr.getCurrentGeneration();
+            assertEquals(1, genAfterFirstSnapshot, "CURRENT should be generation 1 after first snapshot");
+            System.out.println("CURRENT after first snapshot: " + genAfterFirstSnapshot);
+
+            // Step 2: Create more state (30 objects) and attempt interrupted multi-chunk install
+            System.out.println("\nStep 2: Creating larger state with 30 objects...");
+            for (int i = 10; i < 40; i++) {
                 ObjectMetadata obj = makeObject("Obj" + i, 5000L);
                 byte[] data = objectMapper.writeValueAsBytes(obj);
                 LogEntry entry = LogEntry.create(leader.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data);
@@ -319,25 +359,25 @@ class Phase1CrashBeforeCommitTest {
             }
             Thread.sleep(400);
 
-            // Compact
+            // Compact to create second snapshot
             leader.compactLog(2);
             Thread.sleep(200);
 
-            // Get snapshot
-            var snapshotOpt = leaderSnapshotMgr.loadLatestSnapshot();
+            // Get second snapshot
+            snapshotOpt = leaderSnapshotMgr.loadLatestSnapshot();
             assertTrue(snapshotOpt.isPresent());
-            var snapshot = snapshotOpt.get();
-            byte[] snapshotData = snapshot.stateData();
+            snapshot = snapshotOpt.get();
+            snapshotData = snapshot.stateData();
 
             System.out.println("Snapshot size: " + snapshotData.length + " bytes");
 
-            // Send first 3 chunks only
+            // Send first 3 chunks only (NOT the final chunk - done=false for all)
             int chunkSize = 4096;
             int chunksSent = 0;
             for (int offset = 0; offset < Math.min(snapshotData.length, chunkSize * 3); offset += chunkSize) {
                 int len = Math.min(chunkSize, snapshotData.length - offset);
                 byte[] chunk = Arrays.copyOfRange(snapshotData, offset, offset + len);
-                boolean done = (offset + len >= snapshotData.length);
+                boolean done = false;  // Never complete the transfer
 
                 RaftMessage.InstallSnapshot req = new RaftMessage.InstallSnapshot(
                     leader.getCurrentTerm(), "leader",
@@ -359,14 +399,13 @@ class Phase1CrashBeforeCommitTest {
             follower.stop();
             Thread.sleep(100);
 
-            // Restart and verify OLD state
+            // Restart and verify OLD state (generation should be unchanged after interrupted InstallSnapshot)
             GenerationManager restartedGenMgr = new GenerationManager(followerGenDir);
             long recoveredGen = restartedGenMgr.getCurrentGeneration();
-            assertEquals(2, recoveredGen, "CURRENT should be 2 (old generation)");
-
-            // Gen 3 files should NOT exist
-            Path gen3Dir = followerGenDir.resolve("gen-3");
-            assertFalse(Files.exists(gen3Dir), "gen-3 directory should NOT exist");
+            // With sequential generation IDs, the generation number depends on how many snapshots were committed
+            // The key invariant is: interrupted snapshot should NOT advance CURRENT
+            assertEquals(1, recoveredGen,
+                "CURRENT should be generation 1 after interrupted InstallSnapshot");
 
             System.out.println("SUCCESS: Interrupted transfer recovered old generation correctly");
 

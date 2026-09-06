@@ -164,11 +164,12 @@ class Phase1MasterCrashTest {
 
             // Verify generation is committed via GenerationManager
             long currentGen = followerGenMgr.getCurrentGeneration();
-            assertEquals(snapshot.lastIncludedIndex(), currentGen,
-                "Generation should match committed generation index");
+            // First InstallSnapshot creates generation 1 (sequential)
+            assertEquals(1, currentGen,
+                "First InstallSnapshot should create generation 1");
 
-            // Record generation
-            long committedGen = snapshot.lastIncludedIndex();
+            // Record generation - use currentGen (sequential ID), not snapshot index
+            long committedGen = currentGen;
 
             System.out.println("State committed at generation " + committedGen);
 
@@ -636,7 +637,8 @@ class Phase1MasterCrashTest {
 
             // Verify first generation is committed
             long firstGen = followerGenMgr.getCurrentGeneration();
-            assertEquals(snapshotABC.lastIncludedIndex(), firstGen, "First generation should be committed");
+            // First InstallSnapshot creates generation 1 (sequential)
+            assertEquals(1, firstGen, "First generation should be 1");
             System.out.println("First generation committed: " + firstGen);
 
             // Create D on leader

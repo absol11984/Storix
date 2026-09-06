@@ -722,6 +722,17 @@ public class RaftNode implements AutoCloseable {
 
         // All chunks received - install the snapshot with crash-safe protocol
         if (done) {
+            // Capture current generation BEFORE any changes (for rollback)
+            long oldCurrentGen = -1;
+            if (generationManager != null) {
+                try {
+                    oldCurrentGen = generationManager.getCurrentGeneration();
+                } catch (IOException e) {
+                    // If we can't read the current generation, default to -1
+                    System.err.println("[RAFT] Warning: could not read current generation: " + e.getMessage());
+                }
+            }
+
             try {
                 System.out.println("[RAFT] All chunks received, beginning crash-safe installation: index=" +
                         pendingSnapshotIndex + ", term=" + pendingSnapshotTerm);
@@ -785,25 +796,24 @@ public class RaftNode implements AutoCloseable {
                         new com.fasterxml.jackson.databind.ObjectMapper().getTypeFactory()
                             .constructMapType(HashMap.class, String.class, com.storix.metadata.ObjectMetadata.class));
 
-                // Step 1: Create generation directory
-                System.out.println("[RAFT] Creating generation " + pendingSnapshotIndex + " directory");
-                generationManager.createCandidateGeneration(pendingSnapshotIndex);
+                // Step 1: Prepare new generation (gets sequential generation ID, separate from snapshot index)
+                long genIndex = generationManager.prepareNextGeneration(pendingSnapshotIndex);
+                System.out.println("[RAFT] Created generation " + genIndex + " for snapshot at index " + pendingSnapshotIndex);
 
                 // Step 2: Write all generation files
-                long genIndex = pendingSnapshotIndex;
                 long genTerm = pendingSnapshotTerm;
                 int genChecksum = (pendingChecksum != 0) ? (int) pendingChecksum : computeChecksum(completeData);
 
                 // Write metadata.json
                 generationManager.writeMetadata(genIndex, metadataObjects);
 
-                // Write snapshot.bin
-                generationManager.writeSnapshot(genIndex, genIndex, genTerm, completeData, genChecksum);
+                // Write snapshot.bin (stores snapshot index/term in binary format)
+                generationManager.writeSnapshot(genIndex, pendingSnapshotIndex, genTerm, completeData, genChecksum);
 
-                // Write manifest.json
-                generationManager.writeManifest(genIndex, genIndex, genTerm, genChecksum);
+                // Write manifest.json (stores both generation ID and snapshot index/term)
+                generationManager.writeManifest(genIndex, pendingSnapshotIndex, genTerm, genChecksum);
 
-                System.out.println("[RAFT] Generation " + genIndex + " files written and fsynced");
+                System.out.println("[RAFT] Generation " + genIndex + " files written and fsynced (snapshot index=" + pendingSnapshotIndex + ")");
 
                 // Step 3: Atomic CURRENT switch - THIS IS THE COMMIT POINT
                 System.out.println("[RAFT] Switching CURRENT to generation " + genIndex);
@@ -844,7 +854,8 @@ public class RaftNode implements AutoCloseable {
 
                 installationState = InstallationState.COMMITTED;
                 System.out.println("[RAFT] [STATE: COMMITTED] - Snapshot installed successfully");
-                System.out.println("[RAFT]   generation=" + pendingSnapshotIndex +
+                System.out.println("[RAFT]   generation=" + genIndex +
+                        ", snapshotIndex=" + pendingSnapshotIndex +
                         ", logStartIndex=" + raftLog.getLogStartIndex() +
                         ", commitIndex=" + raftLog.getCommitIndex() +
                         ", walCompacted=" + walCompacted);
@@ -856,25 +867,30 @@ public class RaftNode implements AutoCloseable {
                 System.err.println("[RAFT] Failed to install snapshot: " + e.getMessage());
                 e.printStackTrace();
 
-                // Rollback: Discard candidate generation, old state remains authoritative
-                // The only thing that could have been committed is if switchCurrent() succeeded
-                System.out.println("[RAFT] Rolling back: deleting candidate generation " + pendingSnapshotIndex);
-
-                // Delete the candidate generation directory if it exists
-                // If CURRENT was already switched, the new generation is authoritative and we don't rollback
-                // (CURRENT switch is atomic - there's no partial state)
-                if (generationManager != null && pendingSnapshotIndex > 0) {
+                // Rollback: Discard candidate generations created during this failed attempt.
+                // The only thing that could have been committed is if switchCurrent() succeeded.
+                // Since we use sequential generation IDs, any generation > oldCurrentGen that wasn't
+                // switched to is a failed candidate.
+                if (generationManager != null) {
                     try {
-                        long currentGen = generationManager.getCurrentGeneration();
-                        // Only delete if CURRENT didn't switch to the new generation
-                        if (currentGen != pendingSnapshotIndex) {
-                            Path genDir = generationManager.getGenerationDir(pendingSnapshotIndex);
-                            if (Files.exists(genDir)) {
-                                generationManager.deleteCandidateGeneration(pendingSnapshotIndex);
-                                System.out.println("[RAFT] Candidate generation " + pendingSnapshotIndex + " deleted");
+                        // Get current generation AFTER the failure
+                        long currentGenAfter = generationManager.getCurrentGeneration();
+                        // List all generations and delete any that are > oldCurrentGen but != currentGenAfter
+                        // (those are uncommitted candidates from this failed attempt)
+                        for (Long gen : generationManager.listGenerations()) {
+                            if (gen > oldCurrentGen && gen != currentGenAfter) {
+                                try {
+                                    generationManager.deleteCandidateGeneration(gen);
+                                    System.out.println("[RAFT] Deleted uncommitted candidate generation " + gen);
+                                } catch (IOException ex) {
+                                    System.err.println("[RAFT] Failed to delete candidate generation " + gen + ": " + ex.getMessage());
+                                }
                             }
+                        }
+                        if (currentGenAfter > oldCurrentGen) {
+                            System.out.println("[RAFT] Generation " + currentGenAfter + " is now authoritative (CURRENT switched during failure)");
                         } else {
-                            System.out.println("[RAFT] Generation " + pendingSnapshotIndex + " is authoritative (CURRENT switched), no rollback needed");
+                            System.out.println("[RAFT] No generation was committed - old generation remains authoritative");
                         }
                     } catch (IOException ex) {
                         System.err.println("[RAFT] Rollback failed: " + ex.getMessage());
