@@ -120,19 +120,18 @@ public class MetadataServer {
             // Use loadEntries() to restore without re-writing to WAL
             WAL.WALRecoveryResult recoveryData = wal.recover();
 
-            // Load latest snapshot for log boundary (NOT for state recovery)
-            // State is loaded from GenerationManager which is the ONLY authoritative source.
-            // SnapshotManager snapshot is used ONLY to determine the log compaction boundary.
-            Optional<SnapshotManager.Snapshot> latestSnapshot = snapshotManager.loadLatestSnapshot();
+            // Get snapshot boundary from GenerationManager (ONLY authoritative source)
+            // GenerationManager is the SOLE authority for snapshot state and boundaries.
+            // SnapshotManager is a LOCAL optimization only and must NOT determine authoritative index/term.
+            GenerationManager.SnapshotBoundary boundary = generationManager.getSnapshotBoundary();
+            long snapshotBoundaryIndex = (boundary != null) ? boundary.lastIncludedIndex() : 0L;
+            long snapshotBoundaryTerm = (boundary != null) ? boundary.lastIncludedTerm() : 0L;
 
-            // Determine the snapshot boundary index
-            long snapshotBoundaryIndex = latestSnapshot.map(SnapshotManager.Snapshot::lastIncludedIndex).orElse(0L);
-            long snapshotBoundaryTerm = latestSnapshot.map(SnapshotManager.Snapshot::lastIncludedTerm).orElse(0L);
-
-            if (latestSnapshot.isPresent()) {
-                SnapshotManager.Snapshot snap = latestSnapshot.get();
-                System.out.println("[SERVER] Found SnapshotManager snapshot at index " + snap.lastIncludedIndex() +
-                        ", term " + snap.lastIncludedTerm() + " (used for log boundary only)");
+            if (boundary != null) {
+                System.out.println("[SERVER] GenerationManager snapshot boundary: index=" + snapshotBoundaryIndex +
+                        ", term=" + snapshotBoundaryTerm);
+            } else {
+                System.out.println("[SERVER] No generation snapshot boundary (fresh start or empty)");
             }
 
             // State is already loaded from GenerationManager via MetadataStore constructor.
