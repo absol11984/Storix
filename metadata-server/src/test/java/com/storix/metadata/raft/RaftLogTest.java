@@ -134,9 +134,16 @@ class RaftLogTest {
         assertEquals(1, toApply.get(0).index());
         assertEquals(3, toApply.get(2).index());
 
-        // Advance last applied
+        // Advance last applied - each call advances by one position
         log.advanceLastApplied();
+        assertEquals(1, log.getLastApplied());
+        assertEquals(2, log.getEntriesToApply().size()); // entries 2,3
 
+        log.advanceLastApplied();
+        assertEquals(2, log.getLastApplied());
+        assertEquals(1, log.getEntriesToApply().size()); // entry 3
+
+        log.advanceLastApplied();
         assertEquals(3, log.getLastApplied());
         assertTrue(log.getEntriesToApply().isEmpty());
     }

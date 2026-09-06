@@ -794,6 +794,108 @@ public class WAL implements AutoCloseable {
     }
 
     /**
+     * Truncates the WAL to remove all entries with index >= truncateFromIndex.
+     * This is used during log compaction and conflict resolution.
+     *
+     * Uses the same approach as compact(): reads current entries, filters, rewrites.
+     */
+    public synchronized void truncateFrom(long truncateFromIndex) throws IOException {
+        lock.lock();
+        try {
+            if (closed) {
+                throw new IOException("WAL is closed");
+            }
+
+            // Recover current entries
+            WALRecoveryResult recoveryResult;
+            try {
+                recoveryResult = recover();
+            } catch (WALRecoveryException e) {
+                if (e.getStatus() == WALRecoveryException.RecoveryStatus.TRUNCATED_TAIL) {
+                    // WAL was already truncated - use empty entries
+                    recoveryResult = WALRecoveryResult.truncated(
+                        new ArrayList<>(), pendingTerm, pendingVotedFor,
+                        0, 0, e.getMessage());
+                } else {
+                    throw e;
+                }
+            }
+
+            // Filter out entries >= truncateFromIndex
+            List<LogEntry> keptEntries = recoveryResult.entries.stream()
+                    .filter(e -> e.index() < truncateFromIndex)
+                    .toList();
+
+            // If nothing to remove, we're done
+            if (keptEntries.size() == recoveryResult.entries.size()) {
+                return;
+            }
+
+            // Rewrite WAL with kept entries
+            FileChannel oldChannel = this.channel;
+            this.channel = null;
+
+            Path tempFile = walFile.resolveSibling(walFile.getFileName() + ".tmp");
+            boolean tempFileCreated = false;
+            Path walFileRef = walFile; // For use in finally block
+            try (FileChannel newChannel = FileChannel.open(tempFile,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.SYNC)) {
+
+                // Write header
+                writeHeaderTo(newChannel);
+
+                // Write state record
+                byte[] votedForBytes = pendingVotedFor != null ? pendingVotedFor.getBytes() : new byte[0];
+                ByteBuffer stateBuf = ByteBuffer.allocate(1 + 8 + 4 + votedForBytes.length + 8 + 8);
+                stateBuf.put(STATE_RECORD_TYPE);
+                stateBuf.putLong(pendingTerm);
+                stateBuf.putInt(votedForBytes.length);
+                if (votedForBytes.length > 0) {
+                    stateBuf.put(votedForBytes);
+                }
+                stateBuf.putLong(recoveryResult.commitIndex);
+                stateBuf.putLong(recoveryResult.lastApplied);
+                stateBuf.flip();
+                newChannel.write(stateBuf);
+
+                // Write kept entries
+                for (LogEntry entry : keptEntries) {
+                    ByteBuffer entryBuf = serialize(entry);
+                    newChannel.write(entryBuf);
+                }
+                newChannel.force(true);
+                tempFileCreated = true;
+            }
+
+            // Close old channel
+            try {
+                if (oldChannel != null && oldChannel.isOpen()) {
+                    oldChannel.close();
+                }
+            } catch (IOException e) {
+                // Ignore close errors
+            }
+
+            // Atomically replace WAL with truncated version
+            if (tempFileCreated) {
+                Files.move(tempFile, walFileRef, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            // Reopen channel
+            this.channel = FileChannel.open(walFileRef,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.SYNC);
+            channel.position(channel.size());
+
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Returns the WAL file path for testing/debugging.
      */
     public Path getWalFile() {

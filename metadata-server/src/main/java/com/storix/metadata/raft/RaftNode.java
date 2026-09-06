@@ -415,7 +415,9 @@ public class RaftNode implements AutoCloseable {
             replicateToFollowers(indexedEntry);
 
             // Wait for majority commit with timeout
-            boolean committed = commitFuture.get(5, TimeUnit.SECONDS);
+            // Use 10 seconds to allow for network latency and slow followers in test environments.
+            // The commit index advances when majority acknowledges, which may take multiple heartbeats.
+            boolean committed = commitFuture.get(10, TimeUnit.SECONDS);
             return committed;
         } catch (TimeoutException e) {
             // Timeout - entry may still be pending
@@ -1357,17 +1359,22 @@ public class RaftNode implements AutoCloseable {
 
         List<LogEntry> toApply = raftLog.getEntriesToApply();
         for (LogEntry entry : toApply) {
+            boolean appliedSuccessfully = false;
             try {
                 stateMachineApplier.accept(entry);
+                appliedSuccessfully = true;
             } catch (Exception e) {
                 System.err.println("[RAFT] Failed to apply entry " + entry.index() + ": " + e.getMessage());
+                // Do NOT advance lastApplied when application fails.
+                // The entry will be retried on the next apply loop cycle.
+                // This prevents skipping uncommitted/failed entries and ensures
+                // exactly-once state machine semantics are preserved.
             }
-            // Always advance lastApplied regardless of apply success/failure.
-            // If an entry fails to apply (e.g., duplicate CREATE from WAL + generation
-            // snapshot overlap), we must still advance to prevent infinite retry loops.
-            // The WAL may have entries that were part of a snapshot that are now
-            // redundant with the generation state - these should be skipped, not retried.
-            raftLog.advanceLastApplied();
+            // Only advance lastApplied if application succeeded.
+            // Failed applications will be retried.
+            if (appliedSuccessfully) {
+                raftLog.advanceLastApplied();
+            }
         }
 
         // Persist commit index periodically after applying entries
