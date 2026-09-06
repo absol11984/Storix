@@ -10,13 +10,21 @@ public record ClusterConfig(
     String nodeId,
     String host,
     int port,
+    int raftPort,
     List<RaftPeer> initialPeers
 ) {
+    /**
+     * Convenience constructor that uses the same port for both client and Raft RPC.
+     */
+    public ClusterConfig(String clusterId, String nodeId, String host, int port, List<RaftPeer> initialPeers) {
+        this(clusterId, nodeId, host, port, port, initialPeers);
+    }
+
     /**
      * Returns all peers including self.
      */
     public List<RaftPeer> getAllPeers() {
-        RaftPeer self = new RaftPeer(nodeId, host, port);
+        RaftPeer self = new RaftPeer(nodeId, host, raftPort);
         if (initialPeers == null || initialPeers.isEmpty()) {
             return List.of(self);
         }

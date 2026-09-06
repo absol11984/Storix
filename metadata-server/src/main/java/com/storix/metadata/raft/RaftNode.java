@@ -43,10 +43,13 @@ public class RaftNode implements AutoCloseable {
     private final List<RaftPeer> peers;
     private final boolean singleNode;
 
-    // Persistent state
+    // Persistent state tracking
     private volatile long currentTerm = 0;
     private volatile String votedFor = null;
-    private volatile long persistedTerm = -1; // Track what term has been persisted to WAL
+    // Track both term and votedFor independently so that changes to votedFor
+    // within the same term are still persisted (fix for same-term vote updates).
+    private volatile long persistedTerm = -1;
+    private volatile String persistedVotedFor = "__NONE__"; // sentinel distinct from null
     private final RaftLog raftLog;
     private final Path stateDir;
     private WAL wal; // For persisting term/votedFor changes
@@ -60,8 +63,8 @@ public class RaftNode implements AutoCloseable {
     private final Map<String, Long> matchIndex = new ConcurrentHashMap<>();
 
     // Threading
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-    private final ExecutorService rpcExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    private ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private ExecutorService rpcExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private volatile boolean running = false;
 
     // Election
@@ -69,6 +72,9 @@ public class RaftNode implements AutoCloseable {
     private volatile long lastHeartbeat = 0;
     private volatile long electionDeadline = 0; // When current election timeout expires
     private final ReentrantLock electionLock = new ReentrantLock();
+    // Backoff after persistence failure: prevents immediate retry that could succeed
+    // and leave the node stuck as CANDIDATE without a majority.
+    private volatile long electionBackoffUntil = 0;
 
     // Vote tracking - thread-safe set of voters who granted us their vote this term
     private final Set<String> votesReceived = ConcurrentHashMap.newKeySet();
@@ -78,6 +84,9 @@ public class RaftNode implements AutoCloseable {
 
     // RPC port for peer communication
     private ServerSocketChannel rpcServer;
+    // Flag to indicate RPC server is fully bound and accepting connections.
+    // Used to prevent premature elections before the node can receive RPCs.
+    private volatile boolean rpcServerReady = false;
 
     // Callbacks
     private final List<Runnable> leadershipListeners = new CopyOnWriteArrayList<>();
@@ -94,6 +103,13 @@ public class RaftNode implements AutoCloseable {
 
     // Direct reference to MetadataStore for isolated candidate restoration
     private volatile com.storix.metadata.MetadataStore metadataStore;
+
+    // Injected failure hook for deterministic persistence failure testing.
+    // If set, called BEFORE every persistTermToWal() write.
+    // If the hook throws IOException, persistence fails.
+    private volatile java.util.function.Consumer<String> persistenceFailureHook;
+    private volatile boolean persistenceFailureInjected = false;
+    private volatile String persistenceFailureTag = null;
 
     // Snapshot installation state machine for crash-safe protocol
     private enum InstallationState {
@@ -124,7 +140,7 @@ public class RaftNode implements AutoCloseable {
     public RaftNode(ClusterConfig config, Path stateDir, RaftLog raftLog, WAL wal) {
         this.nodeId = config.nodeId();
         this.host = config.host();
-        this.port = config.port();
+        this.port = config.raftPort();
         this.stateDir = stateDir;
         this.singleNode = config.isSingleNode();
         this.peers = new ArrayList<>(config.getOtherPeers());
@@ -152,7 +168,7 @@ public class RaftNode implements AutoCloseable {
                      long recoveredTerm, String recoveredVotedFor) {
         this.nodeId = config.nodeId();
         this.host = config.host();
-        this.port = config.port();
+        this.port = config.raftPort();
         this.stateDir = stateDir;
         this.singleNode = config.isSingleNode();
         this.peers = new ArrayList<>(config.getOtherPeers());
@@ -243,6 +259,10 @@ public class RaftNode implements AutoCloseable {
         return state == RaftState.LEADER;
     }
 
+    public boolean isRunning() {
+        return running;
+    }
+
     public Optional<RaftPeer> getLeader() {
         if (leaderId == null) {
             return Optional.empty();
@@ -256,10 +276,32 @@ public class RaftNode implements AutoCloseable {
     }
 
     public void start() throws IOException {
+        if (running) {
+            return; // Already started
+        }
         running = true;
 
-        // Start RPC server for peer communication
-        startRpcServer();
+        // Re-create executors if they were shut down (from previous stop())
+        if (rpcExecutor.isShutdown()) {
+            rpcExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        }
+        if (scheduler.isShutdown()) {
+            scheduler = Executors.newSingleThreadScheduledExecutor();
+        }
+
+        // If this is a restart (state was LEADER), reset to FOLLOWER.
+        // The node must re-join the cluster as a follower; it cannot assume
+        // it is still the leader without going through election again.
+        if (state == RaftState.LEADER) {
+            state = RaftState.FOLLOWER;
+            leaderId = null;
+            System.out.println("[RAFT] Node " + nodeId + " reset to FOLLOWER on restart");
+        }
+
+        // Start RPC server for peer communication (skip if already bound)
+        if (rpcServer == null || !rpcServer.isOpen()) {
+            startRpcServer();
+        }
 
         // Start election timeout checker
         startElectionTimeoutLoop();
@@ -273,8 +315,35 @@ public class RaftNode implements AutoCloseable {
         }
     }
 
+    /**
+     * Blocks until the RPC server is bound and accepting connections.
+     * Used by integration tests to ensure proper startup ordering.
+     */
+    public void waitForRpcServerReady() {
+        // The RPC server is bound synchronously in startRpcServer() before start() returns.
+        // After start() returns, we verify by attempting a connection.
+        // Wait up to 10 seconds for the port to be reachable.
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            try (var s = new java.net.Socket()) {
+                s.connect(new java.net.InetSocketAddress("127.0.0.1", port), 100);
+                // Connected - server is ready. Close immediately.
+                return;
+            } catch (IOException e) {
+                // Not ready yet, retry
+                try { Thread.sleep(20); } catch (InterruptedException ie) { return; }
+            }
+        }
+    }
+
     public void stop() {
         running = false;
+        rpcServerReady = false;
+        // When a node stops, it must not appear to be a leader.
+        // Reset to FOLLOWER so that any observer checking isLeader()
+        // (which checks only state in the base implementation) sees a non-leader.
+        state = RaftState.FOLLOWER;
+        leaderId = null;
         scheduler.shutdownNow();
         try {
             scheduler.awaitTermination(500, TimeUnit.MILLISECONDS);
@@ -382,11 +451,39 @@ public class RaftNode implements AutoCloseable {
         this.metadataStore = store;
     }
 
+    /**
+     * Injects a deterministic persistence failure for testing.
+     * After this call, the NEXT persistence attempt will fail with the given tag.
+     * The hook will be called once, then reset.
+     * @param tag Description of the failure, logged in the error message
+     */
+    public void injectPersistenceFailure(String tag) {
+        this.persistenceFailureInjected = true;
+        this.persistenceFailureTag = tag;
+    }
+
+    /**
+     * Clears any injected persistence failure.
+     */
+    public void clearPersistenceFailure() {
+        this.persistenceFailureInjected = false;
+        this.persistenceFailureTag = null;
+    }
+
+    /**
+     * Returns true if a persistence failure is currently armed.
+     */
+    public boolean hasPersistenceFailure() {
+        return persistenceFailureInjected;
+    }
+
     // ===== Election and State Transitions =====
 
     private void startElectionTimeoutLoop() {
         // Initialize election deadline when starting
         resetElectionDeadline();
+
+        System.out.println("[RAFT] Node " + nodeId + " starting election timeout loop, deadline=" + electionDeadline);
 
         scheduler.scheduleWithFixedDelay(() -> {
             try {
@@ -400,7 +497,7 @@ public class RaftNode implements AutoCloseable {
                 // Check if election timeout has expired
                 long now = System.currentTimeMillis();
                 if (now > electionDeadline) {
-                    System.out.println("[RAFT] Node " + nodeId + " election timeout expired, starting election");
+                    System.out.println("[RAFT] Node " + nodeId + " election timeout expired (now=" + now + " > deadline=" + electionDeadline + "), starting election");
                     startElection();
                     resetElectionDeadline(); // Set next deadline after election starts
                 }
@@ -419,7 +516,15 @@ public class RaftNode implements AutoCloseable {
     private void startElection() {
         electionLock.lock();
         try {
-            if (!running || state == RaftState.LEADER) {
+            // Don't start election if RPC server is not ready yet.
+            // This prevents premature elections during startup before the server can accept connections.
+            if (!running || !rpcServerReady || state == RaftState.LEADER) {
+                return;
+            }
+
+            // Backoff after persistence failure — wait for election timeout to reset naturally
+            long now = System.currentTimeMillis();
+            if (now < electionBackoffUntil) {
                 return;
             }
 
@@ -429,7 +534,27 @@ public class RaftNode implements AutoCloseable {
             votedFor = nodeId; // Vote for self
             votesReceived.clear();
             votesReceived.add(nodeId); // Count self-vote
-            saveState();
+
+            // PERSIST CRITICALLY: term must be durable before we call ourselves candidate.
+            // If persistence fails, we must NOT be a candidate — rollback to FOLLOWER.
+            // This prevents invalid leadership claims from nodes that couldn't persist their term.
+            try {
+                saveStateOrThrow();
+            } catch (IOException e) {
+                System.err.println("[RAFT] Node " + nodeId + " failed to persist term " + currentTerm +
+                    " during election start: " + e.getMessage() + " — rolling back to FOLLOWER");
+                // Rollback: revert to follower state without the term/votedFor change
+                currentTerm--;
+                votedFor = null;
+                state = RaftState.FOLLOWER;
+                votesReceived.clear();
+                // Backoff: extend the election deadline so the loop doesn't immediately retry.
+                // Set it far enough in the future that the election timeout will naturally
+                // prevent another attempt until after the backoff expires.
+                electionBackoffUntil = now + ELECTION_TIMEOUT_MAX_MS;
+                electionDeadline = electionBackoffUntil; // Don't reset deadline — keep the backoff
+                return; // Election aborted — will retry after backoff
+            }
 
             System.out.println("[RAFT] Node " + nodeId + " starting election for term " + currentTerm);
 
@@ -463,6 +588,11 @@ public class RaftNode implements AutoCloseable {
 
         System.out.println("[RAFT] Node " + nodeId + " became leader for term " + currentTerm);
 
+        // Reset election deadline so it doesn't fire while we're leader.
+        // (The election timeout loop will skip election since state==LEADER,
+        // but resetting prevents unnecessary CPU wakeups and log noise.)
+        resetElectionDeadline();
+
         // Notify listeners
         notifyLeadershipChange();
 
@@ -477,8 +607,18 @@ public class RaftNode implements AutoCloseable {
         this.lastHeartbeat = System.currentTimeMillis();
         resetElectionDeadline(); // Reset timeout when becoming follower
 
-        // Don't persist votedFor here - it's set by the vote request handler
-        saveState();
+        // votedFor is set by the vote request handler before calling becomeFollower.
+        // Persist term + votedFor so crash recovery is consistent.
+        // votedFor here may be null (from term transition) or set by RequestVote.
+        try {
+            saveStateOrThrow();
+        } catch (IOException e) {
+            System.err.println("[RAFT] Node " + nodeId + " failed to persist becomeFollower(" +
+                term + "): " + e.getMessage());
+            // Don't throw — becoming follower without persistence is recoverable.
+            // On crash, we'll be at the previous term and re-receive the AppendEntries.
+            // votedFor was set by the vote request handler with its own saveStateOrThrow().
+        }
     }
 
     private void notifyLeadershipChange() {
@@ -506,7 +646,22 @@ public class RaftNode implements AutoCloseable {
             // Transition to follower
             currentTerm = candidateTerm;
             votedFor = null;
-            saveState();
+            // CRITICAL: new term must be durable before we act as follower.
+            // If persistence fails, don't silently continue — the node cannot safely
+            // participate in the new term without durable state.
+            try {
+                saveStateOrThrow();
+            } catch (IOException e) {
+                System.err.println("[RAFT] Node " + nodeId + " failed to persist higher term " +
+                    candidateTerm + " in RequestVote: " + e.getMessage());
+                // votedFor is already null (set before failing save), which is consistent.
+                // Revert in-memory currentTerm to old value so we're in a consistent state.
+                // Return oldTerm in the response so the caller also stays at oldTerm.
+                // Both sides reject the stale candidate, the candidate retries in next term.
+                long oldTerm = currentTerm;
+                currentTerm = candidateTerm - 1; // revert to pre-transition term
+                return new RaftMessage.RequestVoteResponse(oldTerm, false);
+            }
         }
 
         lastHeartbeat = System.currentTimeMillis();
@@ -519,7 +674,16 @@ public class RaftNode implements AutoCloseable {
             if (raftLog.isAtLeastAsUpToDate(lastLogIndex, lastLogTerm)) {
                 votedFor = candidateId;
                 voteGranted = true;
-                saveState();
+                // PERSIST BEFORE GRANTING: vote must be durable before we respond with voteGranted=true
+                // If persistence fails, we must NOT grant the vote - the candidate would proceed
+                // assuming we voted but we might have voted differently after a crash
+                try {
+                    saveStateOrThrow();
+                } catch (IOException e) {
+                    System.err.println("[RAFT] Node " + nodeId + " failed to persist vote for " + candidateId + ": " + e.getMessage());
+                    votedFor = null; // Rollback: don't claim to have voted
+                    return new RaftMessage.RequestVoteResponse(currentTerm, false);
+                }
             }
         }
 
@@ -542,7 +706,16 @@ public class RaftNode implements AutoCloseable {
 
         if (term > currentTerm) {
             currentTerm = term;
-            saveState();
+            // CRITICAL: new term must be durable before we act as follower in the new term.
+            // If persistence fails, reject the AppendEntries — the leader should retry.
+            try {
+                saveStateOrThrow();
+            } catch (IOException e) {
+                System.err.println("[RAFT] Node " + nodeId + " failed to persist higher term " +
+                    term + " in AppendEntries: " + e.getMessage());
+                currentTerm = term - 1; // revert to consistent state
+                return new RaftMessage.AppendEntriesResponse(currentTerm, false, 0);
+            }
         }
 
         // Update heartbeat
@@ -637,7 +810,16 @@ public class RaftNode implements AutoCloseable {
 
         if (term > currentTerm) {
             currentTerm = term;
-            saveState();
+            // CRITICAL: new term must be durable before we act as follower in the new term.
+            // If persistence fails, reject the InstallSnapshot — the leader should retry.
+            try {
+                saveStateOrThrow();
+            } catch (IOException e) {
+                System.err.println("[RAFT] Node " + nodeId + " failed to persist higher term " +
+                    term + " in InstallSnapshot: " + e.getMessage());
+                currentTerm = term - 1; // revert to consistent state
+                return new RaftMessage.InstallSnapshotResponse(currentTerm, false, 0);
+            }
         }
 
         lastHeartbeat = System.currentTimeMillis();
@@ -981,7 +1163,18 @@ public class RaftNode implements AutoCloseable {
                     state = RaftState.FOLLOWER;
                     votedFor = null;
                     votesReceived.clear();
-                    saveState();
+                    // CRITICAL: new term must be durable before we act as follower.
+                    try {
+                        saveStateOrThrow();
+                    } catch (IOException e) {
+                        System.err.println("[RAFT] Node " + nodeId + " failed to persist higher term " +
+                            response.term() + " from vote response: " + e.getMessage());
+                        // Rollback to candidate state — can't safely be follower without persistence.
+                        // The election loop will retry in the next term.
+                        state = RaftState.CANDIDATE;
+                        currentTerm = response.term() - 1; // revert to old term
+                        votesReceived.clear();
+                    }
                     return;
                 }
 
@@ -996,11 +1189,15 @@ public class RaftNode implements AutoCloseable {
                             " (votes=" + votes + "/" + majority + ")");
 
                     if (votes >= majority) {
+                        System.out.println("[RAFT] Node " + nodeId + " has majority! Becoming leader.");
                         becomeLeader();
+                    } else {
+                        System.out.println("[RAFT] Node " + nodeId + " still waiting for more votes.");
                     }
                 }
             } catch (Exception e) {
                 System.err.println("[RAFT] RequestVote to " + peer + " failed: " + e.getMessage());
+                e.printStackTrace();
             }
         });
     }
@@ -1162,10 +1359,15 @@ public class RaftNode implements AutoCloseable {
         for (LogEntry entry : toApply) {
             try {
                 stateMachineApplier.accept(entry);
-                raftLog.advanceLastApplied();
             } catch (Exception e) {
                 System.err.println("[RAFT] Failed to apply entry " + entry.index() + ": " + e.getMessage());
             }
+            // Always advance lastApplied regardless of apply success/failure.
+            // If an entry fails to apply (e.g., duplicate CREATE from WAL + generation
+            // snapshot overlap), we must still advance to prevent infinite retry loops.
+            // The WAL may have entries that were part of a snapshot that are now
+            // redundant with the generation state - these should be skipped, not retried.
+            raftLog.advanceLastApplied();
         }
 
         // Persist commit index periodically after applying entries
@@ -1316,8 +1518,15 @@ public class RaftNode implements AutoCloseable {
 
     private void startRpcServer() throws IOException {
         rpcServer = ServerSocketChannel.open();
+        rpcServer.setOption(java.net.StandardSocketOptions.SO_REUSEADDR, true);
         rpcServer.bind(new InetSocketAddress(port));
         rpcServer.configureBlocking(false);
+
+        // Mark RPC server as ready BEFORE submitting the accept loop.
+        // This ensures startRpcServer() doesn't return until the port is bound,
+        // preventing race conditions where the election timeout fires before the
+        // server can accept connections.
+        rpcServerReady = true;
 
         rpcExecutor.submit(() -> {
             while (running) {
@@ -1690,42 +1899,62 @@ public class RaftNode implements AutoCloseable {
         }
     }
 
+    /**
+     * Saves state to disk and WAL. Logs errors but does not throw.
+     * Use this for non-critical paths (stop, becomeFollower, AppendEntries).
+     */
     private void saveState() {
         try {
-            Files.createDirectories(stateDir);
-            File stateFile = stateDir.resolve(STATE_FILE).toFile();
-
-            try (DataOutputStream dos = new DataOutputStream(new FileOutputStream(stateFile))) {
-                dos.writeLong(currentTerm);
-                dos.writeUTF(votedFor != null ? votedFor : "");
-                dos.flush();
-            }
-
-            // Also persist to WAL for crash recovery
-            persistTermToWal();
+            saveStateOrThrow();
         } catch (IOException e) {
-            System.err.println("[RAFT] Failed to save state: " + e.getMessage());
+            System.err.println("[RAFT] Node " + nodeId + " failed to persist state: " + e.getMessage());
         }
+    }
+
+    /**
+     * Saves state to disk and WAL. Propagates IOException on failure.
+     * Use this for critical paths where persistence failure must prevent the operation.
+     */
+    private void saveStateOrThrow() throws IOException {
+        Files.createDirectories(stateDir);
+        File stateFile = stateDir.resolve(STATE_FILE).toFile();
+
+        try (DataOutputStream dos = new DataOutputStream(new FileOutputStream(stateFile))) {
+            dos.writeLong(currentTerm);
+            dos.writeUTF(votedFor != null ? votedFor : "");
+            dos.flush();
+        }
+
+        // Also persist to WAL for crash recovery
+        persistTermToWal();
     }
 
     /**
      * Persists term and votedFor to WAL.
      * WAL is the authoritative source for crash recovery.
-     * Only writes if the term has actually changed from what's already persisted.
+     * Persists when EITHER term OR votedFor changes independently.
      */
-    private void persistTermToWal() {
+    private void persistTermToWal() throws IOException {
         if (wal != null) {
-            try {
-                // Only persist if term has actually changed from what's in the WAL
-                // This prevents duplicate state records on startup when term is just
-                // being incremented as part of the election protocol
-                // We track persistedTerm to know what we've already written
-                if (currentTerm != persistedTerm) {
-                    wal.persistTerm(currentTerm, votedFor);
-                    persistedTerm = currentTerm;
+            // Check both term AND votedFor independently.
+            // This ensures that if votedFor changes within the same term (e.g., due to
+            // a RequestVote granting), we persist the new votedFor to WAL.
+            // Using sentinel "__NONE__" for null votedFor so we can detect null→set transitions.
+            String effectiveVotedFor = votedFor != null ? votedFor : "__NONE__";
+            String effectivePersistedVotedFor = persistedVotedFor;
+            boolean votedForChanged = !effectiveVotedFor.equals(effectivePersistedVotedFor);
+
+            if (currentTerm != persistedTerm || votedForChanged) {
+                // Inject failure if armed (for deterministic testing)
+                if (persistenceFailureInjected) {
+                    persistenceFailureInjected = false;
+                    String tag = persistenceFailureTag;
+                    persistenceFailureTag = null;
+                    throw new IOException("Injected persistence failure: " + tag);
                 }
-            } catch (IOException e) {
-                System.err.println("[RAFT] Failed to persist term to WAL: " + e.getMessage());
+                wal.persistTerm(currentTerm, votedFor);
+                persistedTerm = currentTerm;
+                persistedVotedFor = effectiveVotedFor;
             }
         }
     }

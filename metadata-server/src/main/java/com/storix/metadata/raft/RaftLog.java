@@ -380,8 +380,14 @@ public class RaftLog {
      * Advances the commit index to the given value.
      */
     public void advanceCommitIndex(long newCommitIndex) {
-        if (newCommitIndex > commitIndex && newCommitIndex <= getLastLogIndex()) {
-            this.commitIndex = newCommitIndex;
+        // Allow advancing to snapshot boundary (logStartIndex - 1) even if log is empty
+        // This is needed during InstallSnapshot where entries are cleared but commitIndex
+        // must advance past the snapshot to reflect committed state.
+        if (newCommitIndex > commitIndex) {
+            long effectiveLastIndex = Math.max(getLastLogIndex(), logStartIndex - 1);
+            if (newCommitIndex <= effectiveLastIndex) {
+                this.commitIndex = newCommitIndex;
+            }
         }
     }
 

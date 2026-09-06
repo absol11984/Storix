@@ -33,7 +33,9 @@ public class MetadataServer {
     private final MetadataStateMachine stateMachine;
     private final SnapshotManager snapshotManager;
     private final GenerationManager generationManager;
+    private final ClusterConfig clusterConfig;
     private volatile boolean running = true;
+    private volatile long runningThreadId = -1;
     private ServerSocketChannel serverChannel;
 
     /**
@@ -62,6 +64,7 @@ public class MetadataServer {
                           ClusterConfig clusterConfig, Path raftStateDir) throws IOException {
         this.port = port;
         this.nodeRegistry = new NodeRegistry();
+        this.clusterConfig = clusterConfig;
 
         // Initialize Raft if cluster config provided
         if (clusterConfig != null) {
@@ -186,6 +189,8 @@ public class MetadataServer {
             this.raftNode.setSnapshotManager(snapshotManager);
             // Wire GenerationManager into RaftNode for immutable generation management
             this.raftNode.setGenerationManager(generationManager);
+            // Wire MetadataStore for InstallSnapshot state restoration
+            this.raftNode.setMetadataStore(metadataStore);
         } else {
             // Non-cluster mode: create MetadataStore without GenerationManager
             this.metadataStore = new MetadataStore(metadataFile);
@@ -289,28 +294,43 @@ public class MetadataServer {
 
         healthMonitor.start();
 
-        try (ServerSocketChannel sc = ServerSocketChannel.open();
-             var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+        // In single-node mode, skip client-facing server (RaftNode RPC handles all communication).
+        // In multi-node mode, start the client-facing server on a separate port.
+        if (clusterConfig != null && !clusterConfig.isSingleNode()) {
+            try (ServerSocketChannel sc = ServerSocketChannel.open();
+                 var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                this.serverChannel = sc;
+                serverChannel.setOption(java.net.StandardSocketOptions.SO_REUSEADDR, true);
+                serverChannel.bind(new InetSocketAddress(port));
+                System.out.println("Metadata server listening on port " + port);
+                runningThreadId = Thread.currentThread().getId();
 
-            this.serverChannel = sc;
-            serverChannel.bind(new InetSocketAddress(port));
-            System.out.println("Metadata server listening on port " + port);
-
-            while (running) {
-                try {
-                    SocketChannel clientChannel = serverChannel.accept();
-                    executor.submit(() -> handleClient(clientChannel));
-                } catch (IOException e) {
-                    if (running) {
-                        System.err.println("Accept failed: " + e.getMessage());
+                while (running) {
+                    try {
+                        SocketChannel clientChannel = serverChannel.accept();
+                        executor.submit(() -> handleClient(clientChannel));
+                    } catch (IOException e) {
+                        if (running) {
+                            System.err.println("Accept failed: " + e.getMessage());
+                        }
                     }
                 }
             }
-        } finally {
-            healthMonitor.stop();
-            if (raftNode != null) {
-                raftNode.stop();
+        } else {
+            System.out.println("Metadata server running in single-node mode (client server skipped)");
+            // Keep running - just block on a simple wait so start() doesn't return immediately
+            while (running) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    break;
+                }
             }
+        }
+
+        healthMonitor.stop();
+        if (raftNode != null) {
+            raftNode.stop();
         }
     }
 
@@ -350,6 +370,7 @@ public class MetadataServer {
         long timeout = 6000;
         long interval = 2000;
         ClusterConfig clusterConfig = null;
+        Path raftStateDir = null;
 
         // Parse arguments supporting both flags and positional
         for (int i = 0; i < args.length; i++) {
@@ -366,13 +387,15 @@ public class MetadataServer {
             } else if ("--cluster".equals(args[i]) && i + 1 < args.length) {
                 // Parse cluster config: nodeId:host:port,peer1:host:port,peer2:host:port
                 clusterConfig = parseClusterConfig(args[++i]);
+            } else if ("--raft-state-dir".equals(args[i]) && i + 1 < args.length) {
+                raftStateDir = Path.of(args[++i]);
             } else if (!args[i].startsWith("--")) {
                 if (i == 0) port = Integer.parseInt(args[0]);
                 else if (i == 1) metadataFile = Path.of(args[1]);
             }
         }
 
-        MetadataServer server = new MetadataServer(port, metadataFile, replicationFactor, timeout, interval, clusterConfig);
+        MetadataServer server = new MetadataServer(port, metadataFile, replicationFactor, timeout, interval, clusterConfig, raftStateDir);
 
         // Graceful shutdown on SIGINT/SIGTERM
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
