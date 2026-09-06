@@ -42,6 +42,7 @@ com/storix/metadata/raft/RaftMessage$ClusterConfiguration.class
 com/storix/metadata/RepairManager$RepairOutcome.class
 com/storix/metadata/RepairManager$RepairTask.class
 com/storix/metadata/raft/LogEntry.class
+com/storix/metadata/wal/GenerationManager$SnapshotBoundary.class
 com/storix/metadata/PlacementManager.class
 com/storix/metadata/wal/DeduplicationCache$CacheEntry.class
 com/storix/metadata/wal/GenerationManager$GenerationState.class

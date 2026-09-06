@@ -600,28 +600,29 @@ public class RaftNode implements AutoCloseable {
     /**
      * Handles InstallSnapshot RPC with a crash-safe installation protocol.
      *
-     * GENERATION/COMMIT-MARKER MODEL:
-     * The commit marker (generation-<index>.committed) is the point of truth.
-     * Only snapshots with a commit marker are authoritative on recovery.
+     * GENERATION MODEL (GenerationManager is sole authority):
+     * CURRENT file is the ONLY authoritative generation pointer.
+     * GenerationManager manages generations/gen-N/ directories.
      *
      * CRASH-SAFE PROTOCOL:
      * 1. RECEIVING: Assemble chunks into temp file
      * 2. VALIDATED: Validate checksum and data integrity
-     * 3. PERSISTED: Write candidate snapshot (NOT yet committed)
-     * 4. RESTORED: Restore state machine from candidate
-     * 5. COMMITTED: Commit snapshot, publish state, write commit marker
+     * 3. PREPARED: Create new generation directory (candidate only, NOT authoritative)
+     * 4. PERSISTED: Write all generation files: metadata.json, snapshot.bin, manifest.json
+     * 5. SWITCHED: Atomic CURRENT update via switchCurrent() (THE commit point)
+     * 6. RESTORED: Restore state machine from snapshot
      *
-     * CRITICAL ORDER (commit marker is last):
-     * - commitCandidateSnapshot() makes snapshot file authoritative
-     * - publishCandidate() updates live metadata atomically
-     * - commitGeneration() WRITES THE COMMIT MARKER (final step)
+     * CRITICAL ORDER (CURRENT switch is the commit point):
+     * - prepareNextGeneration() creates candidate generation directory
+     * - writeMetadata/writeSnapshot/writeManifest() persist all files
+     * - switchCurrent() atomically updates CURRENT (final step)
      *
      * On failure at any step:
-     * - Before commit marker: old generation remains authoritative
-     * - Old state is recoverable from old committed generation
-     * - New candidate is discarded on restart (no commit marker = not authoritative)
+     * - Before switchCurrent(): old generation remains authoritative (no CURRENT update)
+     * - Old state is recoverable from old generation
+     * - New candidate is discarded on restart (CURRENT unchanged)
      *
-     * On crash after commit marker:
+     * On crash after switchCurrent():
      * - New generation is authoritative and recovered
      *
      * @return response with success=false if any step fails
@@ -658,9 +659,28 @@ public class RaftNode implements AutoCloseable {
                 // Ensure state directory exists
                 Files.createDirectories(stateDir);
 
-                // Save current snapshot state for potential rollback
-                previousSnapshotIndex = raftLog.getLogStartIndex() - 1;
-                previousSnapshotIndexTerm = raftLog.getSnapshotTerm();
+                // Derive previous snapshot state from GenerationManager (authoritative source)
+                // Falls back to RaftLog if GenerationManager not available
+                if (generationManager != null) {
+                    try {
+                        var boundary = generationManager.getSnapshotBoundary();
+                        if (boundary != null) {
+                            previousSnapshotIndex = boundary.lastIncludedIndex();
+                            previousSnapshotIndexTerm = boundary.lastIncludedTerm();
+                        } else {
+                            // No generation yet - use RaftLog defaults
+                            previousSnapshotIndex = 0;
+                            previousSnapshotIndexTerm = 0;
+                        }
+                    } catch (IOException e) {
+                        // Fall back to RaftLog
+                        previousSnapshotIndex = raftLog.getLogStartIndex() - 1;
+                        previousSnapshotIndexTerm = raftLog.getSnapshotTerm();
+                    }
+                } else {
+                    previousSnapshotIndex = raftLog.getLogStartIndex() - 1;
+                    previousSnapshotIndexTerm = raftLog.getSnapshotTerm();
+                }
 
                 // Create temporary file for assembling snapshot
                 String filename = "snapshot-transfer-" + System.nanoTime();
@@ -1047,25 +1067,26 @@ public class RaftNode implements AutoCloseable {
 
     /**
      * Sends InstallSnapshot RPC to a follower when their log is too stale.
+     * Uses GenerationManager as the authoritative source for snapshot data.
      */
     private void sendInstallSnapshot(RaftPeer peer) {
-        if (snapshotManager == null) {
+        if (generationManager == null) {
             return;
         }
 
         rpcExecutor.submit(() -> {
             try {
-                // Get current snapshot
-                var snapshotOpt = snapshotManager.loadLatestSnapshot();
-                if (snapshotOpt.isEmpty()) {
+                // Get snapshot from GenerationManager (authoritative source)
+                GenerationManager.GenerationState genState = generationManager.loadAuthoritativeState();
+                if (genState == null) {
                     return;
                 }
 
-                var snapshot = snapshotOpt.get();
-                // Use the extracted state data, not the raw file bytes (which include binary header)
-                byte[] data = snapshot.stateData();
+                byte[] data = genState.snapshotData();
+                long lastIncludedIndex = genState.lastIncludedIndex();
+                long lastIncludedTerm = genState.lastIncludedTerm();
 
-                // Compute checksum of state data (NOT file bytes)
+                // Compute checksum of state data
                 int checksum = computeChecksum(data);
 
                 // Send snapshot in chunks
@@ -1078,14 +1099,12 @@ public class RaftNode implements AutoCloseable {
                     boolean done = offset + len >= data.length;
 
                     // Send checksum with FIRST chunk so follower knows expected checksum for complete snapshot
-                    // For multi-chunk transfers, the follower needs the checksum upfront
                     int chunkChecksum = (offset == 0) ? checksum : 0;
 
-                    // Use the snapshot's actual lastIncludedTerm, not current term approximation
                     RaftMessage.InstallSnapshot request = new RaftMessage.InstallSnapshot(
                             currentTerm, nodeId,
-                            snapshot.lastIncludedIndex(),
-                            snapshot.lastIncludedTerm(),
+                            lastIncludedIndex,
+                            lastIncludedTerm,
                             offset, chunk, done, chunkChecksum);
 
                     RaftMessage.InstallSnapshotResponse response = sendRpc(peer, request);
@@ -1098,8 +1117,8 @@ public class RaftNode implements AutoCloseable {
                 }
 
                 // Update nextIndex after successful snapshot install
-                nextIndex.put(peer.nodeId(), snapshot.lastIncludedIndex() + 1);
-                matchIndex.put(peer.nodeId(), snapshot.lastIncludedIndex());
+                nextIndex.put(peer.nodeId(), lastIncludedIndex + 1);
+                matchIndex.put(peer.nodeId(), lastIncludedIndex);
 
             } catch (Exception e) {
                 System.err.println("[RAFT] InstallSnapshot to " + peer + " failed: " + e.getMessage());
@@ -1193,15 +1212,20 @@ public class RaftNode implements AutoCloseable {
     }
 
     /**
-     * Compacts the log by taking a snapshot.
-     * Uses GenerationManager to create a new generation for the snapshot state.
+     * Compacts the log by creating a new generation snapshot.
      *
-     * Protocol:
-     * 1. Take snapshot of current state
-     * 2. Prepare new generation via GenerationManager
-     * 3. Write state to new generation
-     * 4. Switch CURRENT to new generation (commits the generation)
-     * 5. Create local snapshot file for log compaction boundary
+     * AUTHORITY PATH:
+     * 1. GenerationManager.prepareNextGeneration() - creates candidate generation directory
+     * 2. GenerationManager.writeMetadata/Snapshot/Manifest() - persists state to gen-N/
+     * 3. GenerationManager.switchCurrent() - ATOMIC COMMIT (makes generation authoritative)
+     *
+     * NOTE: SnapshotManager.takeSnapshot() is called to extract state from MetadataStore
+     * for writing to GenerationManager. The resulting snapshot file is a LOCAL copy
+     * for log compaction optimization only - NOT an authority.
+     *
+     * On recovery:
+     * 1. Load from CURRENT → GenerationManager → generation's metadata.json
+     * 2. Replay WAL entries from lastIncludedIndex+1 to rebuild exact state
      */
     public void compactLog(long lastIncludedIndex) throws IOException {
         if (lastIncludedIndex <= 0) {

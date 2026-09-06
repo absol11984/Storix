@@ -16,11 +16,24 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Thread-safe metadata store with JSON persistence.
+ * Materialized live state cache for object metadata.
  *
- * GENERATION INTEGRATION:
- * When created with a GenerationManager, this store loads from the current generation's
- * metadata file. This ensures GenerationManager is the ONLY authoritative persistence path.
+ * ROLE:
+ * MetadataStore is a live, in-memory cache of the current metadata state.
+ * It is NOT an authority - it materializes state from authoritative sources
+ * and accumulates mutations that haven't been persisted yet.
+ *
+ * AUTHORITY HIERARCHY:
+ * 1. CURRENT + GenerationManager - Authoritative baseline snapshot
+ * 2. WAL - Mutable mutation log after the generation baseline
+ * 3. MetadataStore - Live materialized state (materialized from #1 + #2)
+ * 4. Flat metadata.json - Migration fallback only (NOT authoritative)
+ *
+ * PERSISTENCE MODEL:
+ * - On load: Read from CURRENT → GenerationManager → generation's metadata.json
+ * - On mutation: WAL records the mutation; MetadataStore caches the result
+ * - On recovery: Load generation baseline + replay WAL = exact state
+ * - Periodic snapshot: GenerationManager creates new generation from current state
  *
  * The flat metadata.json is ONLY used as a migration fallback when no generation exists.
  */
@@ -359,22 +372,26 @@ public class MetadataStore {
     }
 
     /**
-     * Explicitly saves the current state to disk.
+     * Persists current live state to flat file.
      *
-     * In cluster mode, writes to flat file. The WAL is the mutable source.
-     * Generation directories are IMMUTABLE after CURRENT switch - they are created
-     * only during log compaction (compactLog) or InstallSnapshot.
+     * NOTE: This is NOT authoritative persistence. The authoritative persistence is:
+     * - GenerationManager + CURRENT: baseline snapshot
+     * - WAL: mutations after baseline
      *
-     * Recovery path:
-     * 1. Load last committed generation from CURRENT -> generation's metadata.json
-     * 2. Replay WAL entries from that point to rebuild mutable state
+     * This save() is for the live MetadataStore flat file cache, which is useful for:
+     * - Non-cluster mode
+     * - Migration from legacy systems
+     * - Quick restart without WAL replay
      *
-     * @throws IOException if the save fails - callers must handle this
+     * On recovery with GenerationManager:
+     * 1. Load baseline from CURRENT + generation's metadata.json
+     * 2. Replay WAL entries from lastIncludedIndex+1 to rebuild exact state
+     *
+     * @throws IOException if the save fails
      */
     public void save() throws IOException {
-        // Always write to flat file in cluster mode.
-        // Generation directories are immutable snapshots created during compactLog/InstallSnapshot.
-        // WAL entries are the mutable source that gets replayed on recovery.
+        // Write live state to flat file cache
+        // The authoritative path is via GenerationManager + WAL
         objectMapper.writeValue(storageFile.toFile(), objects);
     }
 
@@ -654,29 +671,22 @@ public class MetadataStore {
     }
 
     /**
-     * Loads metadata, preferring GenerationManager over flat file.
+     * Loads metadata from authoritative sources.
      *
-     * Priority:
-     * 1. GenerationManager's current generation (authoritative in cluster mode)
-     * 2. Flat metadata.json (migration fallback only - NOT authoritative)
+     * AUTHORITY HIERARCHY:
+     * 1. GenerationManager + CURRENT (authoritative baseline)
+     * 2. Flat metadata.json (migration fallback ONLY)
+     *
+     * After loading baseline, caller should replay WAL to get current state.
      */
     @SuppressWarnings("unchecked")
     private void load() throws IOException {
-        // RECOVERY MODEL: GenerationManager is the ONLY authoritative persistence path.
-        // CURRENT determines which generation is authoritative.
-        // The flat file is a mutable cache that must NOT override CURRENT.
-        //
-        // Order of precedence:
-        // 1. GenerationManager (if CURRENT exists) - ALWAYS authoritative
-        // 2. Flat file (only for migration when no generation exists)
-
-        // Check GenerationManager FIRST - CURRENT is the only authoritative generation pointer
+        // Authority 1: GenerationManager + CURRENT
         if (generationManager != null) {
             try {
                 long currentGen = generationManager.getCurrentGeneration();
                 if (currentGen >= 0) {
-                    // CURRENT exists - use GenerationManager as authoritative source
-                    System.out.println("[METADATA] Loading from GenerationManager, generation=" + currentGen);
+                    System.out.println("[METADATA] Loading baseline from GenerationManager, generation=" + currentGen);
                     GenerationManager.GenerationState state = generationManager.loadAuthoritativeState();
                     if (state != null) {
                         objects.clear();
@@ -684,6 +694,9 @@ public class MetadataStore {
                         this.currentGeneration = state.generation();
                         loadGeneration();
                         loadedFromGeneration = true;
+                        System.out.println("[METADATA] Baseline loaded: " + objects.size() + " objects");
+                        System.out.println("[METADATA]   lastIncludedIndex=" + state.lastIncludedIndex());
+                        System.out.println("[METADATA]   WAL replay needed from index " + (state.lastIncludedIndex() + 1));
                         return;
                     }
                 }
@@ -692,7 +705,7 @@ public class MetadataStore {
             }
         }
 
-        // No generation exists - fall back to flat file for migration/non-cluster mode
+        // Authority 2: Flat file (MIGRATION ONLY - not authoritative)
         if (Files.exists(storageFile)) {
             System.out.println("[METADATA] Loading from flat file (migration/non-cluster mode)");
             loadFromFlatFile();

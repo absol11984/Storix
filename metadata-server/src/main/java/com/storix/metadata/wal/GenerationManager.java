@@ -97,6 +97,26 @@ public class GenerationManager {
     }
 
     /**
+     * Gets the snapshot boundary (lastIncludedIndex/term) from the current generation's manifest.
+     * This is the authoritative source for the snapshot boundary.
+     *
+     * @return SnapshotBoundary with index/term, or null if no current generation
+     */
+    public SnapshotBoundary getSnapshotBoundary() throws IOException {
+        long currentGen = getCurrentGeneration();
+        if (currentGen < 0) {
+            return null;
+        }
+        GenerationManifest manifest = readManifest(currentGen);
+        return new SnapshotBoundary(manifest.lastIncludedIndex, manifest.lastIncludedTerm);
+    }
+
+    /**
+     * Snapshot boundary record containing lastIncludedIndex and lastIncludedTerm.
+     */
+    public record SnapshotBoundary(long lastIncludedIndex, long lastIncludedTerm) {}
+
+    /**
      * Checks if a generation directory exists.
      */
     public boolean generationExists(long generation) {

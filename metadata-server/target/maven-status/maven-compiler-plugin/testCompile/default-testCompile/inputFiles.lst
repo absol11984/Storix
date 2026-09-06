@@ -8,8 +8,6 @@
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/Phase1CrashAfterCommitTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/Phase1CrashBeforeCommitTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/Phase1FailedInstallSnapshotTest.java
-/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/Phase1InconsistencyTest.java
-/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/Phase1InconsistentGenerationTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/Phase1InstallSnapshotAtomicityIntegrationTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/Phase1MasterCrashTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/Phase1MetadataGenerationMismatchTest.java
@@ -30,6 +28,7 @@
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationMissingMetadataTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationMultipleRestartTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationUncommittedCandidateTest.java
+/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationWALRecoveryE2EIntegrationTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/Phase11AcceptanceTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/Phase12CompactionTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/Phase12PersistenceIntegrationTest.java

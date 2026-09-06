@@ -4,16 +4,15 @@ com/storix/metadata/wal/WALPersistenceTest.class
 com/storix/metadata/raft/Phase1CrashAfterCommitTest.class
 com/storix/metadata/wal/GenerationCrashAfterCurrentSwitchTest.class
 com/storix/metadata/wal/GenerationCrashBeforeCurrentSwitchTest.class
-com/storix/metadata/raft/Phase1InconsistentGenerationTest.class
 com/storix/metadata/raft/Phase1UncommittedCandidateTest.class
 com/storix/metadata/raft/Phase1MasterCrashTest.class
 com/storix/metadata/raft/InstallSnapshotIntegrationTest.class
 com/storix/metadata/wal/Phase11AcceptanceTest.class
 com/storix/metadata/wal/DeduplicationCacheTest.class
+com/storix/metadata/wal/GenerationWALRecoveryE2EIntegrationTest$1.class
 com/storix/metadata/raft/RaftStateTest.class
 com/storix/metadata/PlacementManagerTest.class
 com/storix/metadata/raft/RecoveredRaftLogValidationTest.class
-com/storix/metadata/raft/Phase1InconsistencyTest.class
 com/storix/metadata/wal/GenerationMissingManifestTest.class
 com/storix/metadata/wal/GenerationUncommittedCandidateTest.class
 com/storix/metadata/raft/RaftLogCompactionTest.class
@@ -33,6 +32,7 @@ com/storix/metadata/raft/RaftLogTest.class
 com/storix/metadata/NodeRegistryTest.class
 com/storix/metadata/raft/Phase1MetadataGenerationMismatchTest.class
 com/storix/metadata/raft/RaftLogRepeatedCompactionTest.class
+com/storix/metadata/wal/GenerationWALRecoveryE2EIntegrationTest.class
 com/storix/metadata/wal/Phase1MasterEndToEndTest$CapturedChunk.class
 com/storix/metadata/MetadataStoreTest.class
 com/storix/metadata/wal/GenerationManagerTest.class

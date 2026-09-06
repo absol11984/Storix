@@ -8,28 +8,33 @@ import com.storix.metadata.ObjectMetadata;
 import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.nio.file.attribute.BasicFileAttributes;
-import java.nio.file.attribute.FileTime;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
-import java.util.HashSet;
 import java.util.zip.CRC32;
 
 /**
- * Manages snapshots for log compaction.
- * Snapshots contain complete metadata state and are used to reconstruct
- * the system state after a restart.
+ * Manages local snapshot files for log compaction optimization.
  *
- * GENERATION MODEL (SOLE AUTHORITY):
- * - GenerationManager/CURRENT is the ONLY authoritative source for state recovery
- * - Snapshots in SnapshotManager are for log compaction optimization ONLY
- * - State is loaded from GenerationManager's generations/gen-N/ directory
+ * ROLE:
+ * SnapshotManager is a LOCAL utility for extracting state snapshots from MetadataStore
+ * and managing snapshot files for Raft log compaction. It is NOT authoritative.
+ *
+ * AUTHORITY HIERARCHY:
+ * 1. GenerationManager + CURRENT - Authoritative baseline snapshot
+ * 2. WAL - Mutable mutation log after baseline
+ * 3. SnapshotManager - Local snapshot files for log compaction optimization ONLY
+ *
+ * RECOVERY PATH (authoritative):
+ * - GenerationManager.loadAuthoritativeState() reads CURRENT → gen-N/ → metadata.json
+ * - WAL replay from lastIncludedIndex+1 rebuilds exact state
+ *
+ * This class provides:
+ * - takeSnapshot(): Extracts state from MetadataStore for compactLog
+ * - loadLatestSnapshot(): Reads local snapshot files for sendInstallSnapshot
+ * - Snapshot binary format for efficient storage
  *
  * Snapshot format:
  * - MAGIC(8) + VERSION(4) = 12 bytes header
@@ -41,10 +46,10 @@ public class SnapshotManager {
     private static final long SNAPSHOT_MAGIC = 0x534E4150L; // "SNAP"
     private static final int SNAPSHOT_VERSION = 1;
     private static final String SNAPSHOT_PREFIX = "snapshot-";
-    private static final String GENERATION_COMMIT_PREFIX = "generation-";
-    private static final String COMMIT_SUFFIX = ".committed";
     private static final int MAX_SNAPSHOTS_TO_KEEP = 2;
     private static final long MAX_SNAPSHOT_SIZE = 100 * 1024 * 1024; // 100MB max
+
+    private static final String CANDIDATE_PREFIX = "snapshot-candidate-";
 
     private final Path snapshotDir;
     private final MetadataStore store;
@@ -63,9 +68,6 @@ public class SnapshotManager {
     /**
      * Cleans up any stale candidate snapshot files from previous failed installations.
      * Called on startup to ensure we don't have orphaned candidate files.
-     *
-     * CRITICAL: Only removes candidates that are NOT committed.
-     * Snapshots are stored in SnapshotManager, state is authoritative in GenerationManager.
      */
     private void cleanupStaleCandidates() {
         if (!Files.exists(snapshotDir)) {
@@ -86,7 +88,7 @@ public class SnapshotManager {
                     }
                 });
 
-            // Clean up install- files (temporary files from installSnapshot method)
+            // Clean up install- files (temporary files from older installation methods)
             Files.list(snapshotDir)
                 .filter(p -> p.getFileName().toString().startsWith("install-"))
                 .filter(Files::isRegularFile)
@@ -101,143 +103,6 @@ public class SnapshotManager {
                 });
         } catch (IOException e) {
             System.err.println("[SNAPSHOT] Failed to list directory for candidate cleanup: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Returns the set of all committed generation indices.
-     */
-    private Set<Long> getCommittedGenerations() {
-        Set<Long> committed = new java.util.HashSet<>();
-        if (!Files.exists(snapshotDir)) {
-            return committed;
-        }
-        try {
-            Files.list(snapshotDir)
-                .filter(p -> p.getFileName().toString().startsWith(GENERATION_COMMIT_PREFIX))
-                .filter(p -> p.getFileName().toString().endsWith(COMMIT_SUFFIX))
-                .filter(Files::isRegularFile)
-                .forEach(p -> {
-                    String filename = p.getFileName().toString();
-                    // Format: generation-<index>.committed
-                    try {
-                        String indexStr = filename
-                            .substring(GENERATION_COMMIT_PREFIX.length())
-                            .replace(COMMIT_SUFFIX, "");
-                        committed.add(Long.parseLong(indexStr));
-                    } catch (NumberFormatException ignored) {}
-                });
-        } catch (IOException e) {
-            System.err.println("[SNAPSHOT] Failed to list committed generations: " + e.getMessage());
-        }
-        return committed;
-    }
-
-    /**
-     * Checks if a specific generation index is committed.
-     * A generation is committed if its commit marker file exists.
-     *
-     * @param generationIndex The generation index to check
-     * @return true if this generation is committed (authoritative)
-     */
-    public boolean isGenerationCommitted(long generationIndex) {
-        Path commitMarker = snapshotDir.resolve(GENERATION_COMMIT_PREFIX + generationIndex + COMMIT_SUFFIX);
-        return Files.exists(commitMarker);
-    }
-
-    /**
-     * Gets the current committed generation index.
-     * Returns -1 if no generation is committed.
-     *
-     * @return The committed generation index, or -1 if none
-     */
-    public long getCurrentCommittedGeneration() {
-        Set<Long> committed = getCommittedGenerations();
-        if (committed.isEmpty()) {
-            return -1;
-        }
-        return Collections.max(committed);
-    }
-
-    /**
-     * Marks a generation as committed by creating its commit marker atomically.
-     * This is the final step in the crash-safe InstallSnapshot protocol.
-     *
-     * The commit marker creation sequence:
-     * 1. Write to temp marker file with full fsync
-     * 2. Atomic rename to final marker filename
-     * 3. fsync directory
-     *
-     * This ensures:
-     * - Before commit marker: generation is candidate only, NOT authoritative
-     * - After commit marker: generation is authoritative and recoverable
-     * - Crash before this step: generation is discarded on recovery
-     * - Crash after this step: generation is recovered as authoritative
-     *
-     * @param generationIndex The generation index to commit
-     * @param generationTerm The term of the generation
-     * @throws IOException if commit marker creation fails
-     */
-    public void commitGeneration(long generationIndex, long generationTerm) throws IOException {
-        String markerFilename = GENERATION_COMMIT_PREFIX + generationIndex + COMMIT_SUFFIX;
-        Path commitMarker = snapshotDir.resolve(markerFilename);
-        Path tempMarker = snapshotDir.resolve(markerFilename + ".tmp");
-
-        // Content: just the term for validation
-        String content = String.valueOf(generationTerm);
-        byte[] data = content.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-
-        try (RandomAccessFile raf = new RandomAccessFile(tempMarker.toFile(), "rw")) {
-            raf.write(data);
-            raf.getFD().sync(); // Sync data to disk
-        }
-
-        // Verify file was written correctly
-        long actualSize = Files.size(tempMarker);
-        if (actualSize != data.length) {
-            Files.deleteIfExists(tempMarker);
-            throw new IOException("Commit marker size mismatch: expected " + data.length + ", got " + actualSize);
-        }
-
-        // Atomic rename to final location
-        Files.move(tempMarker, commitMarker,
-            StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-
-        // fsync directory for durability
-        fsyncDirectory(snapshotDir);
-
-        System.out.println("[SNAPSHOT] Committed generation " + generationIndex + " (term=" + generationTerm + ")");
-    }
-
-    /**
-     * Force fsync a directory to ensure directory entry changes are durable.
-     * This is needed on some filesystems to make renames truly durable.
-     */
-    private void fsyncDirectory(Path dir) throws IOException {
-        if (dir == null || !Files.exists(dir)) {
-            return;
-        }
-        // On Linux, we can use FileChannel on a dummy file handle to sync the directory.
-        // The approach is to open the directory itself using FileChannel and sync it.
-        // However, the standard Java API doesn't directly support fsyncing a directory.
-        // A common approach is to create and sync a temporary file in the directory,
-        // or use native code. For simplicity, we'll skip this on systems where it's not needed.
-        // The atomic rename provides sufficient durability guarantees on most filesystems.
-        // The real durability concern is addressed by the atomic rename itself.
-        try {
-            // Try to sync a dummy file in the directory as a proxy for directory sync
-            Path dummyFile = dir.resolve(".fsync_dummy");
-            try {
-                Files.write(dummyFile, new byte[0]);
-                try (FileChannel fc = FileChannel.open(dummyFile, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
-                    fc.force(true);
-                }
-            } finally {
-                Files.deleteIfExists(dummyFile);
-            }
-        } catch (IOException e) {
-            // Best effort - atomic rename is the primary durability mechanism
-            System.err.println("[SNAPSHOT] Directory sync failed (best effort): " + e.getMessage());
         }
     }
 
@@ -295,12 +160,9 @@ public class SnapshotManager {
         // Atomic rename
         Files.move(tempFile, snapshotFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 
-        // NOTE: Commit marker is now handled by GenerationManager via switchCurrent().
-        // SnapshotManager snapshot is just for log compaction optimization.
-
         System.out.println("[SNAPSHOT] Created snapshot at index " + lastIncludedIndex + ", term " + lastIncludedTerm);
 
-        // Cleanup old snapshots (but preserve committed ones)
+        // Cleanup old snapshots
         cleanupOldSnapshots();
 
         return new Snapshot(lastIncludedIndex, lastIncludedTerm, snapshotFile, stateData);
@@ -476,9 +338,6 @@ public class SnapshotManager {
     /**
      * Cleans up old snapshots, keeping only the most recent ones.
      * Uses logical index (lastIncludedIndex from filename) for ordering.
-     *
-     * CRITICAL: Never deletes committed snapshots (those with commit markers).
-     * Committed generations are authoritative and must be preserved.
      */
     private void cleanupOldSnapshots() throws IOException {
         // Keep the latest N snapshots for log compaction
@@ -618,217 +477,6 @@ public class SnapshotManager {
      */
     public Path getSnapshotDir() {
         return snapshotDir;
-    }
-
-    private static final String CANDIDATE_PREFIX = "snapshot-candidate-";
-
-    /**
-     * Persists a snapshot as a candidate (not yet committed).
-     * The snapshot is written to a candidate file that will not replace
-     * the current authoritative snapshot until commitCandidateSnapshot is called.
-     *
-     * @param stateData The complete state data (JSON) to store in the snapshot
-     * @param lastIncludedIndex The last log index included in this snapshot
-     * @param lastIncludedTerm The term of the entry at lastIncludedIndex
-     * @param expectedChecksum The expected CRC32 checksum (0 to skip validation)
-     * @return Path to the candidate snapshot file
-     * @throws IOException if persistence fails
-     */
-    public Path persistCandidateSnapshot(byte[] stateData, long lastIncludedIndex,
-                                        long lastIncludedTerm, int expectedChecksum) throws IOException {
-        // Validate checksum if provided
-        if (expectedChecksum != 0) {
-            int computedChecksum = computeChecksum(stateData);
-            if (computedChecksum != expectedChecksum) {
-                throw new IOException("Snapshot checksum mismatch: expected " +
-                        expectedChecksum + ", computed " + computedChecksum);
-            }
-        }
-
-        // Validate state data
-        if (stateData == null || stateData.length == 0) {
-            throw new IOException("Snapshot state data is empty");
-        }
-
-        Files.createDirectories(snapshotDir);
-
-        // Write to candidate file with unique ID
-        long candidateId = System.nanoTime();
-        String candidateFilename = CANDIDATE_PREFIX + lastIncludedIndex + "-" + candidateId + ".tmp";
-        Path candidateFile = snapshotDir.resolve(candidateFilename);
-
-        // Compute checksum for the snapshot file
-        int checksum = computeChecksum(stateData);
-
-        try (FileOutputStream fos = new FileOutputStream(candidateFile.toFile());
-             FileChannel fc = fos.getChannel()) {
-
-            // Format same as regular snapshots
-            ByteBuffer headerBuf = ByteBuffer.allocate(12 + 16 + 4);
-            headerBuf.putLong(SNAPSHOT_MAGIC);
-            headerBuf.putInt(SNAPSHOT_VERSION);
-            headerBuf.putLong(lastIncludedIndex);
-            headerBuf.putLong(lastIncludedTerm);
-            headerBuf.putInt(stateData.length);
-            headerBuf.flip();
-            fc.write(headerBuf);
-
-            fc.write(ByteBuffer.wrap(stateData));
-
-            ByteBuffer checksumBuf = ByteBuffer.allocate(4);
-            checksumBuf.putInt(checksum);
-            checksumBuf.flip();
-            fc.write(checksumBuf);
-
-            fc.force(true);
-        }
-
-        System.out.println("[SNAPSHOT] Persisted candidate snapshot at: " + candidateFile);
-
-        return candidateFile;
-    }
-
-    /**
-     * Commits a candidate snapshot as the new authoritative snapshot.
-     * This atomically replaces any existing snapshot at the same index.
-     *
-     * @param candidateFile The candidate snapshot file to commit
-     * @param lastIncludedIndex The last log index included in this snapshot
-     * @param lastIncludedTerm The term of the entry at lastIncludedIndex
-     * @throws IOException if commit fails
-     */
-    public void commitCandidateSnapshot(Path candidateFile, long lastIncludedIndex, long lastIncludedTerm) throws IOException {
-        // The authoritative snapshot filename
-        String filename = SNAPSHOT_PREFIX + lastIncludedIndex;
-        Path snapshotFile = snapshotDir.resolve(filename);
-
-        // Check if snapshot is already at the authoritative location
-        // This happens when installSnapshot was called first (writes directly to snapshot-<index>)
-        if (Files.exists(snapshotFile)) {
-            // Snapshot already committed - validate it
-            Optional<Snapshot> existing = loadSnapshot(snapshotFile);
-            if (existing.isPresent()) {
-                Snapshot snap = existing.get();
-                if (snap.lastIncludedIndex() == lastIncludedIndex && snap.lastIncludedTerm() == lastIncludedTerm) {
-                    System.out.println("[SNAPSHOT] Candidate snapshot already committed: index=" + lastIncludedIndex);
-                    return; // Already committed
-                }
-            }
-            // Snapshot exists but doesn't match - this is an error
-            throw new IOException("Snapshot at authoritative location doesn't match expected: index=" +
-                    lastIncludedIndex + ", term=" + lastIncludedTerm);
-        }
-
-        // Candidate file must exist if snapshot not already at authoritative location
-        if (candidateFile == null || !Files.exists(candidateFile)) {
-            throw new IOException("Candidate snapshot file does not exist: " + candidateFile);
-        }
-
-        // Validate the candidate snapshot can be loaded before committing
-        Optional<Snapshot> candidateSnapshot = loadSnapshot(candidateFile);
-        if (candidateSnapshot.isEmpty()) {
-            throw new IOException("Candidate snapshot is corrupted and cannot be loaded");
-        }
-
-        // Verify metadata matches
-        Snapshot snap = candidateSnapshot.get();
-        if (snap.lastIncludedIndex() != lastIncludedIndex || snap.lastIncludedTerm() != lastIncludedTerm) {
-            throw new IOException("Candidate snapshot metadata mismatch: expected index=" +
-                    lastIncludedIndex + ", term=" + lastIncludedTerm +
-                    ", got index=" + snap.lastIncludedIndex() + ", term=" + snap.lastIncludedTerm());
-        }
-
-        // Atomic rename - candidate becomes the new authoritative snapshot
-        Files.move(candidateFile, snapshotFile,
-                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-
-        System.out.println("[SNAPSHOT] Committed candidate snapshot as authoritative: index=" +
-                lastIncludedIndex + ", term=" + lastIncludedTerm);
-
-        // Cleanup old snapshots
-        cleanupOldSnapshots();
-    }
-
-    /**
-     * Installs a received snapshot from remote leader.
-     * Writes the snapshot atomically to ensure durability.
-     * This is used during InstallSnapshot RPC to persist the received snapshot.
-     *
-     * @param stateData The complete state data (JSON) to store in the snapshot
-     * @param lastIncludedIndex The last log index included in this snapshot
-     * @param lastIncludedTerm The term of the entry at lastIncludedIndex
-     * @param expectedChecksum The expected CRC32 checksum (0 to skip validation)
-     * @return The installed snapshot
-     * @throws IOException if installation fails
-     */
-    public Snapshot installSnapshot(byte[] stateData, long lastIncludedIndex,
-                                   long lastIncludedTerm, int expectedChecksum) throws IOException {
-        // Validate checksum if provided
-        if (expectedChecksum != 0) {
-            int computedChecksum = computeChecksum(stateData);
-            if (computedChecksum != expectedChecksum) {
-                throw new IOException("Snapshot checksum mismatch: expected " +
-                        expectedChecksum + ", computed " + computedChecksum);
-            }
-        }
-
-        // Validate state data
-        if (stateData == null || stateData.length == 0) {
-            throw new IOException("Snapshot state data is empty");
-        }
-
-        Files.createDirectories(snapshotDir);
-
-        // Write to temp file with "install-" prefix (different from candidate prefix)
-        // This avoids conflicts when commitCandidateSnapshot runs in parallel
-        String filename = SNAPSHOT_PREFIX + lastIncludedIndex;
-        Path snapshotFile = snapshotDir.resolve(filename);
-        Path tempFile = snapshotDir.resolve("install-" + lastIncludedIndex + "-" + System.nanoTime() + ".tmp");
-
-        // Compute checksum for the snapshot file
-        int checksum = computeChecksum(stateData);
-
-        try (FileOutputStream fos = new FileOutputStream(tempFile.toFile());
-             FileChannel fc = fos.getChannel()) {
-
-            // Format:
-            // MAGIC(8) + VERSION(4) = 12 bytes header
-            // LAST_INCLUDED_INDEX(8) + LAST_INCLUDED_TERM(8) = 16 bytes
-            // STATE_LENGTH(4) + STATE(N) + CHECKSUM(4)
-            ByteBuffer headerBuf = ByteBuffer.allocate(12 + 16 + 4);
-            headerBuf.putLong(SNAPSHOT_MAGIC);
-            headerBuf.putInt(SNAPSHOT_VERSION);
-            headerBuf.putLong(lastIncludedIndex);
-            headerBuf.putLong(lastIncludedTerm);
-            headerBuf.putInt(stateData.length);
-            headerBuf.flip();
-            fc.write(headerBuf);
-
-            // Write state data
-            fc.write(ByteBuffer.wrap(stateData));
-
-            // Write checksum
-            ByteBuffer checksumBuf = ByteBuffer.allocate(4);
-            checksumBuf.putInt(checksum);
-            checksumBuf.flip();
-            fc.write(checksumBuf);
-
-            fc.force(true);
-        }
-
-        // Atomic rename - this is the durable commit point
-        Files.move(tempFile, snapshotFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-
-        // Create commit marker to make snapshot authoritative
-        commitGeneration(lastIncludedIndex, lastIncludedTerm);
-
-        System.out.println("[SNAPSHOT] Installed snapshot at index " + lastIncludedIndex +
-                ", term " + lastIncludedTerm + ", checksum " + checksum);
-
-        // Cleanup old snapshots (but preserve committed ones)
-        cleanupOldSnapshots();
-
-        return new Snapshot(lastIncludedIndex, lastIncludedTerm, snapshotFile, stateData);
     }
 
     /**
