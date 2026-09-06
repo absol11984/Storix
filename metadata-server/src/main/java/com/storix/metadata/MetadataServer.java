@@ -189,9 +189,9 @@ public class MetadataServer {
         } else {
             // Non-cluster mode: create MetadataStore without GenerationManager
             this.metadataStore = new MetadataStore(metadataFile);
-            this.placementManager = new PlacementManager(nodeRegistry, 2);
+            this.placementManager = new PlacementManager(nodeRegistry, replicationFactor);
             this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager);
-            this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager, 6000, 2000);
+            this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager, nodeTimeoutMillis, healthCheckIntervalMillis);
             this.snapshotManager = null;
             this.generationManager = null;
             this.stateMachine = null;

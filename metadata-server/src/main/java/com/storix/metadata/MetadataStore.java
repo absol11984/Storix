@@ -681,7 +681,10 @@ public class MetadataStore {
      */
     @SuppressWarnings("unchecked")
     private void load() throws IOException {
-        // Authority 1: GenerationManager + CURRENT
+        // Authority 1: GenerationManager + CURRENT (authoritative)
+        // CRITICAL: Do NOT call loadGeneration() here - it would overwrite the authoritative
+        // generation with the legacy flat .generation file value.
+        // The authoritative generation comes from CURRENT via GenerationManager only.
         if (generationManager != null) {
             try {
                 long currentGen = generationManager.getCurrentGeneration();
@@ -691,8 +694,9 @@ public class MetadataStore {
                     if (state != null) {
                         objects.clear();
                         objects.putAll(state.objects());
+                        // Use ONLY the authoritative generation from GenerationManager
+                        // Do NOT call loadGeneration() - it would read legacy .generation file
                         this.currentGeneration = state.generation();
-                        loadGeneration();
                         loadedFromGeneration = true;
                         System.out.println("[METADATA] Baseline loaded: " + objects.size() + " objects");
                         System.out.println("[METADATA]   lastIncludedIndex=" + state.lastIncludedIndex());
@@ -706,6 +710,7 @@ public class MetadataStore {
         }
 
         // Authority 2: Flat file (MIGRATION ONLY - not authoritative)
+        // Legacy path for backward compatibility when no GenerationManager exists
         if (Files.exists(storageFile)) {
             System.out.println("[METADATA] Loading from flat file (migration/non-cluster mode)");
             loadFromFlatFile();
