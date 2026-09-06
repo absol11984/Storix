@@ -662,24 +662,21 @@ public class MetadataStore {
      */
     @SuppressWarnings("unchecked")
     private void load() throws IOException {
-        // Model: Flat file is mutable (holds current state), generation directories are immutable (snapshots).
-        // Recovery: Load from flat file first, then replay WAL if needed.
-        // GenerationManager is used for snapshots created during compactLog/InstallSnapshot only.
+        // RECOVERY MODEL: GenerationManager is the ONLY authoritative persistence path.
+        // CURRENT determines which generation is authoritative.
+        // The flat file is a mutable cache that must NOT override CURRENT.
+        //
+        // Order of precedence:
+        // 1. GenerationManager (if CURRENT exists) - ALWAYS authoritative
+        // 2. Flat file (only for migration when no generation exists)
 
-        // Try flat file first - it has the current mutable state
-        if (Files.exists(storageFile)) {
-            System.out.println("[METADATA] Loading from flat file (mutable state)");
-            loadFromFlatFile();
-            loadedFromGeneration = false;
-            return;
-        }
-
-        // Fall back to GenerationManager for snapshot recovery (compactLog/InstallSnapshot)
+        // Check GenerationManager FIRST - CURRENT is the only authoritative generation pointer
         if (generationManager != null) {
             try {
                 long currentGen = generationManager.getCurrentGeneration();
                 if (currentGen >= 0) {
-                    System.out.println("[METADATA] Loading from GenerationManager snapshot, generation=" + currentGen);
+                    // CURRENT exists - use GenerationManager as authoritative source
+                    System.out.println("[METADATA] Loading from GenerationManager, generation=" + currentGen);
                     GenerationManager.GenerationState state = generationManager.loadAuthoritativeState();
                     if (state != null) {
                         objects.clear();
@@ -693,6 +690,14 @@ public class MetadataStore {
             } catch (IOException e) {
                 throw new IOException("Failed to load from GenerationManager: " + e.getMessage(), e);
             }
+        }
+
+        // No generation exists - fall back to flat file for migration/non-cluster mode
+        if (Files.exists(storageFile)) {
+            System.out.println("[METADATA] Loading from flat file (migration/non-cluster mode)");
+            loadFromFlatFile();
+            loadedFromGeneration = false;
+            return;
         }
 
         // No state found - fresh start

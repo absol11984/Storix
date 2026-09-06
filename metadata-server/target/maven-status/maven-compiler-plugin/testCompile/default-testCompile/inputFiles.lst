@@ -20,16 +20,11 @@
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RaftLogTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RaftStateTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/raft/RecoveredRaftLogValidationTest.java
-/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/DebugCompactTest.java
-/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/DebugCompactTest2.java
-/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/DebugHeaderTest.java
-/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/DebugTest.java
-/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/DebugTest2.java
-/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/DebugTest3.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/DeduplicationCacheTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationCorruptedSnapshotTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationCrashAfterCurrentSwitchTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationCrashBeforeCurrentSwitchTest.java
+/home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationImmutabilityRegressionTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationManagerTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationMissingManifestTest.java
 /home/arceus/Storix/metadata-server/src/test/java/com/storix/metadata/wal/GenerationMissingMetadataTest.java
