@@ -294,36 +294,25 @@ public class MetadataServer {
 
         healthMonitor.start();
 
-        // In single-node mode, skip client-facing server (RaftNode RPC handles all communication).
-        // In multi-node mode, start the client-facing server on a separate port.
-        if (clusterConfig != null && !clusterConfig.isSingleNode()) {
-            try (ServerSocketChannel sc = ServerSocketChannel.open();
-                 var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-                this.serverChannel = sc;
-                serverChannel.setOption(java.net.StandardSocketOptions.SO_REUSEADDR, true);
-                serverChannel.bind(new InetSocketAddress(port));
-                System.out.println("Metadata server listening on port " + port);
-                runningThreadId = Thread.currentThread().getId();
+        // Always start the client-facing server to handle metadata requests.
+        // In single-node mode, this is the only server needed.
+        // In multi-node mode, both RaftNode RPC and this server run on the same port.
+        try (ServerSocketChannel sc = ServerSocketChannel.open();
+             var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            this.serverChannel = sc;
+            serverChannel.setOption(java.net.StandardSocketOptions.SO_REUSEADDR, true);
+            serverChannel.bind(new InetSocketAddress(port));
+            System.out.println("Metadata server listening on port " + port);
+            runningThreadId = Thread.currentThread().getId();
 
-                while (running) {
-                    try {
-                        SocketChannel clientChannel = serverChannel.accept();
-                        executor.submit(() -> handleClient(clientChannel));
-                    } catch (IOException e) {
-                        if (running) {
-                            System.err.println("Accept failed: " + e.getMessage());
-                        }
-                    }
-                }
-            }
-        } else {
-            System.out.println("Metadata server running in single-node mode (client server skipped)");
-            // Keep running - just block on a simple wait so start() doesn't return immediately
             while (running) {
                 try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {
-                    break;
+                    SocketChannel clientChannel = serverChannel.accept();
+                    executor.submit(() -> handleClient(clientChannel));
+                } catch (IOException e) {
+                    if (running) {
+                        System.err.println("Accept failed: " + e.getMessage());
+                    }
                 }
             }
         }
