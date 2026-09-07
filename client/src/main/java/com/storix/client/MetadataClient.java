@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.nio.channels.UnresolvedAddressException;
 import java.util.List;
 import java.util.Map;
 
@@ -18,38 +19,73 @@ public class MetadataClient implements AutoCloseable {
     private final int port;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private SocketChannel channel;
+    private long connectionTimeoutMs = 5000;
+    private long requestTimeoutMs = 30000;
+    private String clientId;
+    private String currentRequestId;
 
     public MetadataClient(String host, int port) {
         this.host = host;
         this.port = port;
     }
 
+    public void setConnectionTimeout(long timeoutMs) {
+        this.connectionTimeoutMs = timeoutMs;
+    }
+
+    public void setRequestTimeout(long timeoutMs) {
+        this.requestTimeoutMs = timeoutMs;
+    }
+
+    public void setClientId(String clientId) {
+        this.clientId = clientId;
+    }
+
+    public void setCurrentRequestId(String requestId) {
+        this.currentRequestId = requestId;
+    }
+
+    public String getCurrentRequestId() {
+        return currentRequestId;
+    }
+
     public void connect() throws IOException {
         if (channel == null || !channel.isOpen()) {
-            channel = SocketChannel.open(new InetSocketAddress(host, port));
+            try {
+                channel = SocketChannel.open();
+                channel.configureBlocking(true);
+                channel.socket().setSoTimeout((int) connectionTimeoutMs);
+                channel.connect(new InetSocketAddress(host, port));
+            } catch (UnresolvedAddressException e) {
+                throw new IOException("Cannot resolve address: " + host + ":" + port, e);
+            }
         }
+    }
+
+    public boolean isConnected() {
+        return channel != null && channel.isOpen() && channel.isConnected();
     }
 
     public void createObject(ObjectMetadataDTO metadata) throws IOException {
         ensureConnected();
         byte[] payload = objectMapper.writeValueAsBytes(metadata);
-        sendRequest(MetadataProtocol.CREATE_OBJECT, payload);
+        sendRequest(MetadataProtocol.CREATE_OBJECT, payload, "CREATE_OBJECT");
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
-            throw new IOException("CREATE_OBJECT failed: " + new String(response.data()));
+            throw createIOException("CREATE_OBJECT", response);
         }
     }
 
     public ObjectMetadataDTO getObject(String objectName) throws IOException {
         ensureConnected();
         byte[] payload = objectMapper.writeValueAsBytes(Map.of("objectName", objectName));
-        sendRequest(MetadataProtocol.GET_OBJECT, payload);
+        sendRequest(MetadataProtocol.GET_OBJECT, payload, "GET_OBJECT");
         Response response = readResponse();
         if (response.status() == MetadataProtocol.NOT_FOUND) {
             return null;
         }
         if (response.status() != MetadataProtocol.OK) {
-            throw new IOException("GET_OBJECT failed: " + new String(response.data()));
+            throw createIOException("GET_OBJECT", response);
         }
         return objectMapper.readValue(response.data(), ObjectMetadataDTO.class);
     }
@@ -57,27 +93,30 @@ public class MetadataClient implements AutoCloseable {
     public void updateObject(ObjectMetadataDTO metadata) throws IOException {
         ensureConnected();
         byte[] payload = objectMapper.writeValueAsBytes(metadata);
-        sendRequest(MetadataProtocol.UPDATE_OBJECT, payload);
+        sendRequest(MetadataProtocol.UPDATE_OBJECT, payload, "UPDATE_OBJECT");
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
-            throw new IOException("UPDATE_OBJECT failed: " + new String(response.data()));
+            throw createIOException("UPDATE_OBJECT", response);
         }
     }
 
     public boolean deleteObject(String objectName) throws IOException {
         ensureConnected();
         byte[] payload = objectMapper.writeValueAsBytes(Map.of("objectName", objectName));
-        sendRequest(MetadataProtocol.DELETE_OBJECT, payload);
+        sendRequest(MetadataProtocol.DELETE_OBJECT, payload, "DELETE_OBJECT");
         Response response = readResponse();
+        if (response.status() == MetadataProtocol.NOT_LEADER) {
+            throw createIOException("DELETE_OBJECT", response);
+        }
         return response.status() == MetadataProtocol.OK;
     }
 
     public String[] listObjects() throws IOException {
         ensureConnected();
-        sendRequest(MetadataProtocol.LIST_OBJECTS, new byte[0]);
+        sendRequest(MetadataProtocol.LIST_OBJECTS, new byte[0], "LIST_OBJECTS");
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
-            throw new IOException("LIST_OBJECTS failed: " + new String(response.data()));
+            throw createIOException("LIST_OBJECTS", response);
         }
         return objectMapper.readValue(response.data(), String[].class);
     }
@@ -87,29 +126,29 @@ public class MetadataClient implements AutoCloseable {
     public void registerNode(NodeInfoDTO nodeInfo) throws IOException {
         ensureConnected();
         byte[] payload = objectMapper.writeValueAsBytes(nodeInfo);
-        sendRequest(MetadataProtocol.REGISTER_NODE, payload);
+        sendRequest(MetadataProtocol.REGISTER_NODE, payload, "REGISTER_NODE");
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
-            throw new IOException("REGISTER_NODE failed: " + new String(response.data()));
+            throw createIOException("REGISTER_NODE", response);
         }
     }
 
     public void heartbeat(String nodeId) throws IOException {
         ensureConnected();
         byte[] payload = objectMapper.writeValueAsBytes(Map.of("nodeId", nodeId));
-        sendRequest(MetadataProtocol.HEARTBEAT, payload);
+        sendRequest(MetadataProtocol.HEARTBEAT, payload, "HEARTBEAT");
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
-            throw new IOException("HEARTBEAT failed: " + new String(response.data()));
+            throw createIOException("HEARTBEAT", response);
         }
     }
 
     public NodeInfoDTO[] getNodes() throws IOException {
         ensureConnected();
-        sendRequest(MetadataProtocol.GET_NODES, new byte[0]);
+        sendRequest(MetadataProtocol.GET_NODES, new byte[0], "GET_NODES");
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
-            throw new IOException("GET_NODES failed: " + new String(response.data()));
+            throw createIOException("GET_NODES", response);
         }
         return objectMapper.readValue(response.data(), NodeInfoDTO[].class);
     }
@@ -117,10 +156,10 @@ public class MetadataClient implements AutoCloseable {
     public NodeInfoDTO[] getPlacement(int chunkIndex) throws IOException {
         ensureConnected();
         byte[] payload = objectMapper.writeValueAsBytes(Map.of("chunkIndex", chunkIndex));
-        sendRequest(MetadataProtocol.GET_PLACEMENT, payload);
+        sendRequest(MetadataProtocol.GET_PLACEMENT, payload, "GET_PLACEMENT");
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
-            throw new IOException("GET_PLACEMENT failed: " + new String(response.data()));
+            throw createIOException("GET_PLACEMENT", response);
         }
         return objectMapper.readValue(response.data(), NodeInfoDTO[].class);
     }
@@ -128,10 +167,10 @@ public class MetadataClient implements AutoCloseable {
     @SuppressWarnings("unchecked")
     public Map<String, Object> getClusterStatus() throws IOException {
         ensureConnected();
-        sendRequest(MetadataProtocol.GET_CLUSTER_STATUS, new byte[0]);
+        sendRequest(MetadataProtocol.GET_CLUSTER_STATUS, new byte[0], "GET_CLUSTER_STATUS");
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
-            throw new IOException("GET_CLUSTER_STATUS failed: " + new String(response.data()));
+            throw createIOException("GET_CLUSTER_STATUS", response);
         }
         return objectMapper.readValue(response.data(), Map.class);
     }
@@ -139,28 +178,42 @@ public class MetadataClient implements AutoCloseable {
     @SuppressWarnings("unchecked")
     public Map<String, Object> repair() throws IOException {
         ensureConnected();
-        sendRequest(MetadataProtocol.REPAIR, new byte[0]);
+        sendRequest(MetadataProtocol.REPAIR, new byte[0], "REPAIR");
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
-            throw new IOException("REPAIR failed: " + new String(response.data()));
+            throw createIOException("REPAIR", response);
         }
         return objectMapper.readValue(response.data(), Map.class);
     }
 
     private void ensureConnected() throws IOException {
-        if (channel == null || !channel.isOpen()) {
+        if (!isConnected()) {
             connect();
         }
     }
 
-    private void sendRequest(byte opcode, byte[] payload) throws IOException {
-        int requestSize = 1 + 4 + payload.length;
+    private void sendRequest(byte opcode, byte[] payload, String operation) throws IOException {
+        // Wrap payload in request envelope if clientId and requestId are set
+        byte[] envelopePayload;
+        if (clientId != null && currentRequestId != null) {
+            Map<String, Object> envelope = Map.of(
+                "clientId", clientId,
+                "requestId", currentRequestId,
+                "operation", operation,
+                "payload", objectMapper.readValue(payload, Map.class)
+            );
+            envelopePayload = objectMapper.writeValueAsBytes(envelope);
+        } else {
+            envelopePayload = payload;
+        }
+
+        int requestSize = 1 + 4 + envelopePayload.length;
         ByteBuffer buffer = ByteBuffer.allocate(4 + requestSize);
         buffer.putInt(requestSize);
         buffer.put(opcode);
-        buffer.putInt(payload.length);
-        if (payload.length > 0) {
-            buffer.put(payload);
+        buffer.putInt(envelopePayload.length);
+        if (envelopePayload.length > 0) {
+            buffer.put(envelopePayload);
         }
         buffer.flip();
         writeFully(channel, buffer);
@@ -168,12 +221,16 @@ public class MetadataClient implements AutoCloseable {
 
     private Response readResponse() throws IOException {
         ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
-        readFully(channel, lengthBuffer);
+        if (!readFullyWithTimeout(channel, lengthBuffer)) {
+            throw new IOException("Request timed out waiting for response length");
+        }
         lengthBuffer.flip();
         int responseSize = lengthBuffer.getInt();
 
         ByteBuffer responseBuffer = ByteBuffer.allocate(responseSize);
-        readFully(channel, responseBuffer);
+        if (!readFullyWithTimeout(channel, responseBuffer)) {
+            throw new IOException("Request timed out waiting for response body");
+        }
         responseBuffer.flip();
 
         byte status = responseBuffer.get();
@@ -195,6 +252,22 @@ public class MetadataClient implements AutoCloseable {
         }
     }
 
+    private boolean readFullyWithTimeout(SocketChannel channel, ByteBuffer buffer) throws IOException {
+        long deadline = System.currentTimeMillis() + requestTimeoutMs;
+        while (buffer.hasRemaining()) {
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                return false; // Timeout
+            }
+            channel.socket().setSoTimeout((int) Math.min(remaining, Integer.MAX_VALUE));
+            int read = channel.read(buffer);
+            if (read == -1) {
+                throw new IOException("Connection closed prematurely");
+            }
+        }
+        return true;
+    }
+
     private void writeFully(SocketChannel channel, ByteBuffer buffer) throws IOException {
         while (buffer.hasRemaining()) {
             channel.write(buffer);
@@ -203,9 +276,26 @@ public class MetadataClient implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        if (channel != null && channel.isOpen()) {
-            channel.close();
+        if (channel != null) {
+            try {
+                if (channel.isOpen()) {
+                    channel.close();
+                }
+            } finally {
+                channel = null;
+            }
         }
+    }
+
+    /**
+     * Creates an IOException with appropriate message based on response status.
+     */
+    private IOException createIOException(String operation, Response response) {
+        String message = new String(response.data());
+        if (response.status() == MetadataProtocol.NOT_LEADER) {
+            return new IOException(operation + " NOT_LEADER: " + message);
+        }
+        return new IOException(operation + " failed: " + message);
     }
 
     private record Response(byte status, byte[] data) {}

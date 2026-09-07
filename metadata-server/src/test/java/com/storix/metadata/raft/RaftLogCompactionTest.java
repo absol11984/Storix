@@ -30,7 +30,7 @@ class RaftLogCompactionTest {
         for (int i = 1; i <= 10; i++) {
             long term = (i <= 5) ? 1 : ((i <= 8) ? 2 : 3); // Terms change at boundaries
             LogEntry entry = new LogEntry(term, i, System.currentTimeMillis(),
-                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes());
+                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes(), null, null);
             log.append(entry);
         }
 
@@ -79,7 +79,7 @@ class RaftLogCompactionTest {
         // Append entries 1..10
         for (int i = 1; i <= 10; i++) {
             LogEntry entry = new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes());
+                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes(), null, null);
             log.append(entry);
         }
 
@@ -88,9 +88,9 @@ class RaftLogCompactionTest {
 
         // Append new entries
         LogEntry entry11 = new LogEntry(2, 11, System.currentTimeMillis(),
-                LogEntry.OpType.CREATE_OBJECT, "data11".getBytes());
+                LogEntry.OpType.CREATE_OBJECT, "data11".getBytes(), null, null);
         LogEntry entry12 = new LogEntry(2, 12, System.currentTimeMillis(),
-                LogEntry.OpType.CREATE_OBJECT, "data12".getBytes());
+                LogEntry.OpType.CREATE_OBJECT, "data12".getBytes(), null, null);
 
         log.append(entry11);
         log.append(entry12);
@@ -122,7 +122,7 @@ class RaftLogCompactionTest {
         // Append entries 1..100
         for (int i = 1; i <= 100; i++) {
             LogEntry entry = new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]);
+                    LogEntry.OpType.NO_OP, new byte[0], null, null);
             log.append(entry);
         }
 
@@ -140,9 +140,9 @@ class RaftLogCompactionTest {
 
         // Append new entries
         LogEntry entry101 = new LogEntry(2, 101, System.currentTimeMillis(),
-                LogEntry.OpType.NO_OP, new byte[0]);
+                LogEntry.OpType.NO_OP, new byte[0], null, null);
         LogEntry entry102 = new LogEntry(2, 102, System.currentTimeMillis(),
-                LogEntry.OpType.NO_OP, new byte[0]);
+                LogEntry.OpType.NO_OP, new byte[0], null, null);
 
         log.append(entry101);
         log.append(entry102);
@@ -169,7 +169,7 @@ class RaftLogCompactionTest {
         // First add entries 1..100
         for (int i = 1; i <= 100; i++) {
             LogEntry entry = new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes());
+                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes(), null, null);
             log.append(entry);
         }
 
@@ -180,7 +180,7 @@ class RaftLogCompactionTest {
         java.util.List<LogEntry> recoveredEntries = new java.util.ArrayList<>();
         for (int i = 51; i <= 100; i++) {
             LogEntry entry = new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes());
+                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes(), null, null);
             recoveredEntries.add(entry);
         }
 
@@ -216,7 +216,7 @@ class RaftLogCompactionTest {
 
         for (int i = 1; i <= 20; i++) {
             LogEntry entry = new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]);
+                    LogEntry.OpType.NO_OP, new byte[0], null, null);
             log.append(entry);
         }
 
@@ -240,7 +240,7 @@ class RaftLogCompactionTest {
         // Append entries 1..10
         for (int i = 1; i <= 10; i++) {
             LogEntry entry = new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]);
+                    LogEntry.OpType.NO_OP, new byte[0], null, null);
             log.append(entry);
         }
 
@@ -257,7 +257,7 @@ class RaftLogCompactionTest {
         // Re-append entries
         for (int i = 5; i <= 10; i++) {
             LogEntry entry = new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]);
+                    LogEntry.OpType.NO_OP, new byte[0], null, null);
             log.append(entry);
         }
 
@@ -280,11 +280,11 @@ class RaftLogCompactionTest {
 
         // Entries 1-5 in term 1
         for (int i = 1; i <= 5; i++) {
-            log.append(new LogEntry(1, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0]));
+            log.append(new LogEntry(1, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
         // Entries 6-10 in term 2
         for (int i = 6; i <= 10; i++) {
-            log.append(new LogEntry(2, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0]));
+            log.append(new LogEntry(2, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
 
         assertEquals(1, log.getTermAt(5));
@@ -309,7 +309,7 @@ class RaftLogCompactionTest {
 
         for (int i = 1; i <= 20; i++) {
             log.append(new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes()));
+                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes(), null, null));
         }
 
         // Compact through index 10
@@ -333,7 +333,7 @@ class RaftLogCompactionTest {
         RaftLog log = new RaftLog();
 
         for (int i = 1; i <= 10; i++) {
-            log.append(new LogEntry(1, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0]));
+            log.append(new LogEntry(1, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
 
         log.compactThrough(5, 1);

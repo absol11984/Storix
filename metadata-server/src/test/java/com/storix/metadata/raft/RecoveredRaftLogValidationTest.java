@@ -24,7 +24,7 @@ class RecoveredRaftLogValidationTest {
      * Helper: Create a LogEntry with specific index.
      */
     private LogEntry makeEntry(long term, long index, LogEntry.OpType opType) {
-        return new LogEntry(term, index, System.currentTimeMillis(), opType, ("data-" + index).getBytes());
+        return new LogEntry(term, index, System.currentTimeMillis(), opType, ("data-" + index).getBytes(), null, null);
     }
 
     /**

@@ -43,11 +43,11 @@ class RaftLogTruncateBoundaryTest {
 
         // Build log: 1(T1)2(T1)3(T1)4(T1)5(T1)
         List<LogEntry> initial = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}),
-            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null),
+            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)
         );
         log.appendEntries(0, 0, initial);
 
@@ -113,11 +113,11 @@ class RaftLogTruncateBoundaryTest {
 
         // Build log: 1(T1)2(T1)3(T1)4(T1)5(T1)
         List<LogEntry> initial = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}),
-            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null),
+            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)
         );
         log.appendEntries(0, 0, initial);
 
@@ -178,11 +178,11 @@ class RaftLogTruncateBoundaryTest {
 
         // Build log: 1(T1)2(T1)3(T1)4(T1)5(T1)
         List<LogEntry> initial = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}),
-            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null),
+            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)
         );
         log.appendEntries(0, 0, initial);
 
@@ -242,11 +242,11 @@ class RaftLogTruncateBoundaryTest {
 
         // Build log: 1(T1)2(T1)3(T1)4(T1)5(T1)
         List<LogEntry> initial = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}),
-            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null),
+            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)
         );
         log.appendEntries(0, 0, initial);
 
@@ -304,11 +304,11 @@ class RaftLogTruncateBoundaryTest {
 
         // Build log with 5 entries
         List<LogEntry> initial = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}),
-            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null),
+            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)
         );
         log.appendEntries(0, 0, initial);
 
@@ -353,11 +353,11 @@ class RaftLogTruncateBoundaryTest {
 
         // Build log: 1(T1)2(T1)3(T1)4(T1)5(T1)
         List<LogEntry> initial = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}),
-            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null),
+            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)
         );
         log.appendEntries(0, 0, initial);
 

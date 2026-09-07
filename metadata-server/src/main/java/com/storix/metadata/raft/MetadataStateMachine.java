@@ -7,17 +7,35 @@ import com.storix.metadata.ObjectMetadata;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Applies committed Raft log entries to the metadata state machine.
  */
 public class MetadataStateMachine {
 
+    // True deduplication cache: clientId + requestId → committed result
+    private final Map<String, byte[]> committedResults = new ConcurrentHashMap<>();
+
     private final MetadataStore store;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public MetadataStateMachine(MetadataStore store) {
         this.store = store;
+    }
+
+    /**
+     * Returns a cached result for a duplicate request identity.
+     */
+    public byte[] getCachedResult(String dedupKey) {
+        return committedResults.get(dedupKey);
+    }
+
+    /**
+     * Clears the deduplication cache (used during snapshot/recovery).
+     */
+    public void clearDedupCache() {
+        committedResults.clear();
     }
 
     /**
@@ -31,6 +49,25 @@ public class MetadataStateMachine {
      * Applies a single log entry to the state machine.
      */
     public void apply(LogEntry entry) throws IOException {
+        // True deduplication using clientId + requestId
+        if (entry.clientId() != null && entry.requestId() != null) {
+            String dedupKey = entry.clientId() + ":" + entry.requestId();
+            byte[] cachedResult = committedResults.get(dedupKey);
+            if (cachedResult != null) {
+                // Duplicate retry: already committed, skip re-application
+                return;
+            }
+            // Apply operation and cache result for future retries
+            applyOperation(entry);
+            byte[] result = snapshot(); // Store result snapshot after commit
+            committedResults.put(dedupKey, result);
+            return;
+        }
+        // No request identity: apply directly (backward compatibility)
+        applyOperation(entry);
+    }
+
+    private void applyOperation(LogEntry entry) throws IOException {
         switch (entry.opType()) {
             case NO_OP -> {
                 // No action needed

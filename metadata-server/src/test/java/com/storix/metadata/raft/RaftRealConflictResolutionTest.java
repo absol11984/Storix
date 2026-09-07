@@ -70,10 +70,10 @@ class RaftRealConflictResolutionTest {
         // Simulate follower having conflicting state: 1(T1)2(T1)3(T3)4(T3)
         // Use appendEntries to set up the state
         List<LogEntry> conflictEntries = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, objectMapper.writeValueAsBytes(new ObjectMetadata("obj1", 100L, 4096))),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, objectMapper.writeValueAsBytes(new ObjectMetadata("obj2", 100L, 4096))),
-            new LogEntry(3, 3, 1002, LogEntry.OpType.CREATE_OBJECT, objectMapper.writeValueAsBytes(new ObjectMetadata("obj3", 100L, 4096))),
-            new LogEntry(3, 4, 1003, LogEntry.OpType.CREATE_OBJECT, objectMapper.writeValueAsBytes(new ObjectMetadata("obj4", 100L, 4096)))
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, objectMapper.writeValueAsBytes(new ObjectMetadata("obj1", 100L, 4096)), null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, objectMapper.writeValueAsBytes(new ObjectMetadata("obj2", 100L, 4096)), null, null),
+            new LogEntry(3, 3, 1002, LogEntry.OpType.CREATE_OBJECT, objectMapper.writeValueAsBytes(new ObjectMetadata("obj3", 100L, 4096)), null, null),
+            new LogEntry(3, 4, 1003, LogEntry.OpType.CREATE_OBJECT, objectMapper.writeValueAsBytes(new ObjectMetadata("obj4", 100L, 4096)), null, null)
         );
         log.appendEntries(0, 0, conflictEntries);
 
@@ -89,7 +89,7 @@ class RaftRealConflictResolutionTest {
         // Leader has: 1(T1)2(T1)3(T2)
         // Follower should become: 1(T1)2(T1)3(T2)
         List<LogEntry> correctEntries = List.of(
-            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, objectMapper.writeValueAsBytes(new ObjectMetadata("obj3-correct", 100L, 4096)))
+            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, objectMapper.writeValueAsBytes(new ObjectMetadata("obj3-correct", 100L, 4096)), null, null)
         );
 
         // Send through actual handleAppendEntries
@@ -162,11 +162,11 @@ class RaftRealConflictResolutionTest {
         // Set up conflicting state: 1(T1)2(T1)3(T3)4(T3)5(T3)
         // We need entries 1 and 2 for handleAppendEntries to accept the conflict resolution
         List<LogEntry> conflictEntries = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(3, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(3, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}),
-            new LogEntry(3, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(3, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(3, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null),
+            new LogEntry(3, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)
         );
         log.appendEntries(0, 0, conflictEntries);
 
@@ -177,9 +177,9 @@ class RaftRealConflictResolutionTest {
 
         // Leader sends correct entries
         List<LogEntry> correctEntries = Arrays.asList(
-            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(2, 4, 2001, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}),
-            new LogEntry(2, 5, 2002, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})
+            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(2, 4, 2001, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null),
+            new LogEntry(2, 5, 2002, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)
         );
 
         RaftMessage.AppendEntriesResponse response = follower.handleAppendEntries(
@@ -244,8 +244,8 @@ class RaftRealConflictResolutionTest {
 
         // Set up initial state
         List<LogEntry> initialEntries = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null)
         );
         log.appendEntries(0, 0, initialEntries);
 
@@ -255,7 +255,7 @@ class RaftRealConflictResolutionTest {
 
         // Leader sends new entry
         List<LogEntry> newEntries = List.of(
-            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
 
         RaftMessage.AppendEntriesResponse response = follower.handleAppendEntries(
@@ -308,9 +308,9 @@ class RaftRealConflictResolutionTest {
 
         // Set up state
         List<LogEntry> initialEntries = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
         log.appendEntries(0, 0, initialEntries);
 
@@ -320,7 +320,7 @@ class RaftRealConflictResolutionTest {
 
         // Leader sends duplicate entry 3
         List<LogEntry> duplicateEntries = List.of(
-            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
 
         RaftMessage.AppendEntriesResponse response = follower.handleAppendEntries(

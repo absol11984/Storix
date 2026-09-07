@@ -34,7 +34,7 @@ class RaftDuplicateAppendEntriesTest {
 
         // First AppendEntries with entry X
         List<LogEntry> entries1 = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null)
         );
         log.appendEntries(0, 0, entries1);
 
@@ -43,7 +43,7 @@ class RaftDuplicateAppendEntriesTest {
 
         // Second AppendEntries with SAME entry X (duplicate)
         List<LogEntry> entries2 = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null)
         );
         log.appendEntries(0, 0, entries2);
 
@@ -75,9 +75,9 @@ class RaftDuplicateAppendEntriesTest {
 
         // First AppendEntries with entries [1, 2, 3]
         List<LogEntry> entries1 = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
         log.appendEntries(0, 0, entries1);
 
@@ -85,9 +85,9 @@ class RaftDuplicateAppendEntriesTest {
 
         // Second AppendEntries with SAME entries [1, 2, 3] (duplicate)
         List<LogEntry> entries2 = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
         log.appendEntries(0, 0, entries2);
 
@@ -119,13 +119,13 @@ class RaftDuplicateAppendEntriesTest {
 
         // First: appendEntries with [1]
         List<LogEntry> entries1 = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null)
         );
         log.appendEntries(0, 0, entries1);
 
         // Second: appendEntries with [2]
         List<LogEntry> entries2 = List.of(
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2})
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null)
         );
         log.appendEntries(1, 1, entries2);
 
@@ -133,7 +133,7 @@ class RaftDuplicateAppendEntriesTest {
 
         // Third: duplicate AppendEntries with [3]
         List<LogEntry> entries3 = List.of(
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
         log.appendEntries(2, 1, entries3);
 
@@ -141,7 +141,7 @@ class RaftDuplicateAppendEntriesTest {
 
         // Fourth: SAME AppendEntries with [3] (duplicate)
         List<LogEntry> entries4 = List.of(
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
         log.appendEntries(2, 1, entries4);
 
@@ -174,7 +174,7 @@ class RaftDuplicateAppendEntriesTest {
         // Append entries
         for (int i = 1; i <= 5; i++) {
             List<LogEntry> entries = List.of(
-                new LogEntry(1, i, 1000 + i, LogEntry.OpType.CREATE_OBJECT, new byte[]{(byte) i})
+                new LogEntry(1, i, 1000 + i, LogEntry.OpType.CREATE_OBJECT, new byte[]{(byte) i}, null, null)
             );
             log.appendEntries(i - 1, i > 1 ? 1 : 0, entries);
         }
@@ -209,13 +209,13 @@ class RaftDuplicateAppendEntriesTest {
 
         // First AppendEntries
         List<LogEntry> entries1 = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null)
         );
         log.appendEntries(0, 0, entries1);
 
         // Duplicate AppendEntries
         List<LogEntry> entries2 = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null)
         );
         log.appendEntries(0, 0, entries2);
 

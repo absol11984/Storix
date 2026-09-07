@@ -37,10 +37,10 @@ class RaftLogConflictResolutionTest {
         // Set up follower state using appendEntries
         // Use prevLogIndex=0 to indicate starting from empty log
         List<LogEntry> initialEntries = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(3, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}), // Wrong term
-            new LogEntry(3, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4})  // Wrong term
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(3, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null), // Wrong term
+            new LogEntry(3, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null)  // Wrong term
         );
         log.appendEntries(0, 0, initialEntries);
 
@@ -52,7 +52,7 @@ class RaftLogConflictResolutionTest {
 
         // Leader sends entry 3 with correct term
         List<LogEntry> leaderEntries = List.of(
-            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
 
         log.appendEntries(2, 1, leaderEntries);
@@ -81,16 +81,16 @@ class RaftLogConflictResolutionTest {
         // Set up follower state
         // Use prevLogIndex=0 to indicate starting from empty log
         List<LogEntry> initialEntries = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(3, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(3, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(3, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(3, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null)
         );
         log.appendEntries(0, 0, initialEntries);
 
         // Apply conflict resolution
         List<LogEntry> leaderEntries = List.of(
-            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(2, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
         log.appendEntries(2, 1, leaderEntries);
 
@@ -125,14 +125,14 @@ class RaftLogConflictResolutionTest {
 
         // Set up log
         List<LogEntry> initialEntries = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(2, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(2, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null)
         );
         log.appendEntries(0, 0, initialEntries);
 
         // Leader sends same entry
         List<LogEntry> leaderEntries = List.of(
-            new LogEntry(2, 2, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{2})
+            new LogEntry(2, 2, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null)
         );
 
         log.appendEntries(1, 1, leaderEntries);
@@ -159,9 +159,9 @@ class RaftLogConflictResolutionTest {
 
         // Set up follower with entries 3,4,5
         List<LogEntry> initialEntries = List.of(
-            new LogEntry(3, 3, 999, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(3, 4, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}), // Wrong term
-            new LogEntry(3, 5, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})  // Wrong term
+            new LogEntry(3, 3, 999, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(3, 4, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null), // Wrong term
+            new LogEntry(3, 5, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)  // Wrong term
         );
         log.appendEntries(2, 0, initialEntries);
 
@@ -169,8 +169,8 @@ class RaftLogConflictResolutionTest {
 
         // Leader sends correct entries for 4 and 5
         List<LogEntry> leaderEntries = List.of(
-            new LogEntry(4, 4, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}),
-            new LogEntry(4, 5, 2001, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})
+            new LogEntry(4, 4, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null),
+            new LogEntry(4, 5, 2001, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)
         );
 
         log.appendEntries(3, 3, leaderEntries);
@@ -197,14 +197,14 @@ class RaftLogConflictResolutionTest {
 
         // Set up initial entries
         List<LogEntry> initialEntries = List.of(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null)
         );
         log.appendEntries(0, 0, initialEntries);
 
         // Leader sends new entry
         List<LogEntry> leaderEntries = List.of(
-            new LogEntry(1, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(1, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
 
         log.appendEntries(2, 1, leaderEntries);

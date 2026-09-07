@@ -24,6 +24,7 @@ import java.util.concurrent.Executors;
 public class MetadataServer {
 
     private final int port;
+    private final int raftPort;
     private final MetadataStore metadataStore;
     private final NodeRegistry nodeRegistry;
     private final PlacementManager placementManager;
@@ -63,6 +64,9 @@ public class MetadataServer {
                           long nodeTimeoutMillis, long healthCheckIntervalMillis,
                           ClusterConfig clusterConfig, Path raftStateDir) throws IOException {
         this.port = port;
+        // In cluster mode, use a separate port for Raft RPC (port + 10000 to avoid conflicts)
+        // The client-facing server uses the main port
+        this.raftPort = (clusterConfig != null) ? port + 10000 : port;
         this.nodeRegistry = new NodeRegistry();
         this.clusterConfig = clusterConfig;
 
@@ -344,7 +348,7 @@ public class MetadataServer {
      */
     private void handleClient(SocketChannel clientChannel) {
         MetadataHandler handler = new MetadataHandler(metadataStore, nodeRegistry,
-                placementManager, repairManager, raftNode, stateMachine);
+                placementManager, repairManager, raftNode, stateMachine, port);
         try (clientChannel) {
             handler.handle(clientChannel);
         } catch (IOException e) {
@@ -419,7 +423,7 @@ public class MetadataServer {
                 })
                 .toList();
 
-        return new ClusterConfig("storix", nodeId, host, port, peers);
+        return new ClusterConfig("storix", nodeId, host, port, port + 10000, peers);
     }
 
     /**

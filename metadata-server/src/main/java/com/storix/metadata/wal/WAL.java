@@ -534,7 +534,7 @@ public class WAL implements AutoCloseable {
                         );
                     }
 
-                    LogEntry entry = new LogEntry(term, index, timestamp, opType, data);
+                    LogEntry entry = new LogEntry(term, index, timestamp, opType, data, null, null);
                     entries.add(entry);
                     lastSyncedIndex = Math.max(lastSyncedIndex, entry.index());
 

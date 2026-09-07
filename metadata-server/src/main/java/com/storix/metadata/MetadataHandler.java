@@ -3,6 +3,7 @@ package com.storix.metadata;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.storix.metadata.raft.*;
 import com.storix.metadata.wal.DeduplicationCache;
+import com.storix.metadata.wal.RequestEnvelope;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -16,7 +17,7 @@ import java.util.Optional;
 /**
  * Handles metadata client requests.
  * Processes multiple requests on the same connection in a loop.
- * Supports request deduplication for idempotent operations.
+ * Supports request deduplication for idempotent operations using clientId + requestId.
  */
 public class MetadataHandler {
 
@@ -26,30 +27,42 @@ public class MetadataHandler {
     private final RepairManager repairManager;
     private final RaftNode raftNode;
     private final MetadataStateMachine stateMachine;
+    private final int port;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     // Request deduplication cache (TTL 1 hour)
     private final DeduplicationCache deduplicationCache = new DeduplicationCache();
 
-    // Deduplication key prefix per operation type
-    private static final String CREATE_PREFIX = "CREATE:";
-    private static final String UPDATE_PREFIX = "UPDATE:";
-    private static final String DELETE_PREFIX = "DELETE:";
-
     public MetadataHandler(MetadataStore store, NodeRegistry nodeRegistry,
                           PlacementManager placementManager, RepairManager repairManager) {
-        this(store, nodeRegistry, placementManager, repairManager, null, null);
+        this(store, nodeRegistry, placementManager, repairManager, null, null, 0);
     }
 
     public MetadataHandler(MetadataStore store, NodeRegistry nodeRegistry,
                           PlacementManager placementManager, RepairManager repairManager,
-                          RaftNode raftNode, MetadataStateMachine stateMachine) {
+                          int port) {
+        this(store, nodeRegistry, placementManager, repairManager, null, null, port);
+    }
+
+    public MetadataHandler(MetadataStore store, NodeRegistry nodeRegistry,
+                          PlacementManager placementManager, RepairManager repairManager,
+                          RaftNode raftNode, MetadataStateMachine stateMachine, int port) {
         this.store = store;
         this.nodeRegistry = nodeRegistry;
         this.placementManager = placementManager;
         this.repairManager = repairManager;
         this.raftNode = raftNode;
         this.stateMachine = stateMachine;
+        this.port = port;
+    }
+
+    /**
+     * Backward-compatible constructor without port.
+     */
+    public MetadataHandler(MetadataStore store, NodeRegistry nodeRegistry,
+                          PlacementManager placementManager, RepairManager repairManager,
+                          RaftNode raftNode, MetadataStateMachine stateMachine) {
+        this(store, nodeRegistry, placementManager, repairManager, raftNode, stateMachine, 0);
     }
 
     /**
@@ -132,24 +145,30 @@ public class MetadataHandler {
             return createNotLeaderResponse();
         }
 
-        ObjectMetadata metadata = objectMapper.readValue(payload, ObjectMetadata.class);
+        // Parse request envelope to extract clientId and requestId
+        RequestEnvelope envelope = parseRequestEnvelope(payload);
+        String clientId = envelope != null ? envelope.clientId() : null;
+        String requestId = envelope != null ? envelope.requestId() : null;
+
+        // Parse the actual object metadata from the inner payload
+        byte[] innerPayload = envelope != null ? envelope.payload() : payload;
+        ObjectMetadata metadata = objectMapper.readValue(innerPayload, ObjectMetadata.class);
+
+        // Use clientId + requestId for true deduplication
+        String dedupKey = getRequestDedupKey(clientId, requestId);
 
         // Check deduplication cache
-        String dedupKey = CREATE_PREFIX + metadata.getObjectName();
         Optional<DeduplicationCache.CachedResult> cached = deduplicationCache.get(dedupKey);
         if (cached.isPresent()) {
             // Return cached result for idempotent operation
-            if (cached.get().success()) {
-                return createSuccessResponse(cached.get().responseData());
-            } else {
-                return createErrorResponse(MetadataProtocol.ERROR, cached.get().errorMessage());
-            }
+            System.out.println("[HANDLER] Duplicate request detected: " + dedupKey);
+            return createSuccessResponse(cached.get().responseData());
         }
 
         if (raftNode != null && stateMachine != null) {
-            // Submit to Raft for replication
+            // Submit to Raft for replication with client identity
             byte[] data = objectMapper.writeValueAsBytes(metadata);
-            LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data);
+            LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data, clientId, requestId);
 
             if (!raftNode.submit(entry)) {
                 return createErrorResponse(MetadataProtocol.ERROR, "Failed to submit to Raft");
@@ -188,23 +207,29 @@ public class MetadataHandler {
             return createNotLeaderResponse();
         }
 
-        ObjectMetadata metadata = objectMapper.readValue(payload, ObjectMetadata.class);
+        // Parse request envelope to extract clientId and requestId
+        RequestEnvelope envelope = parseRequestEnvelope(payload);
+        String clientId = envelope != null ? envelope.clientId() : null;
+        String requestId = envelope != null ? envelope.requestId() : null;
+
+        // Parse the actual object metadata from the inner payload
+        byte[] innerPayload = envelope != null ? envelope.payload() : payload;
+        ObjectMetadata metadata = objectMapper.readValue(innerPayload, ObjectMetadata.class);
+
+        // Use clientId + requestId for true deduplication
+        String dedupKey = getRequestDedupKey(clientId, requestId);
 
         // Check deduplication cache
-        String dedupKey = UPDATE_PREFIX + metadata.getObjectName();
         Optional<DeduplicationCache.CachedResult> cached = deduplicationCache.get(dedupKey);
         if (cached.isPresent()) {
-            if (cached.get().success()) {
-                return createSuccessResponse(cached.get().responseData());
-            } else {
-                return createErrorResponse(MetadataProtocol.ERROR, cached.get().errorMessage());
-            }
+            System.out.println("[HANDLER] Duplicate request detected: " + dedupKey);
+            return createSuccessResponse(cached.get().responseData());
         }
 
         if (raftNode != null && stateMachine != null) {
-            // Submit to Raft for replication
+            // Submit to Raft for replication with client identity
             byte[] data = objectMapper.writeValueAsBytes(metadata);
-            LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.UPDATE_OBJECT, data);
+            LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.UPDATE_OBJECT, data, clientId, requestId);
 
             if (!raftNode.submit(entry)) {
                 return createErrorResponse(MetadataProtocol.ERROR, "Failed to submit to Raft");
@@ -227,23 +252,29 @@ public class MetadataHandler {
             return createNotLeaderResponse();
         }
 
-        Map<String, String> request = objectMapper.readValue(payload, Map.class);
+        // Parse request envelope to extract clientId and requestId
+        RequestEnvelope envelope = parseRequestEnvelope(payload);
+        String clientId = envelope != null ? envelope.clientId() : null;
+        String requestId = envelope != null ? envelope.requestId() : null;
+
+        // Parse the actual object name from the inner payload
+        byte[] innerPayload = envelope != null ? envelope.payload() : payload;
+        Map<String, String> request = objectMapper.readValue(innerPayload, Map.class);
         String objectName = request.get("objectName");
 
+        // Use clientId + requestId for true deduplication
+        String dedupKey = getRequestDedupKey(clientId, requestId);
+
         // Check deduplication cache
-        String dedupKey = DELETE_PREFIX + objectName;
         Optional<DeduplicationCache.CachedResult> cached = deduplicationCache.get(dedupKey);
         if (cached.isPresent()) {
-            if (cached.get().success()) {
-                return createSuccessResponse(cached.get().responseData());
-            } else {
-                return createErrorResponse(MetadataProtocol.ERROR, cached.get().errorMessage());
-            }
+            System.out.println("[HANDLER] Duplicate request detected: " + dedupKey);
+            return createSuccessResponse(cached.get().responseData());
         }
 
         if (raftNode != null && stateMachine != null) {
-            // Submit to Raft for replication
-            LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.DELETE_OBJECT, objectName.getBytes());
+            // Submit to Raft for replication with client identity
+            LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.DELETE_OBJECT, objectName.getBytes(), clientId, requestId);
 
             if (!raftNode.submit(entry)) {
                 return createErrorResponse(MetadataProtocol.ERROR, "Failed to submit to Raft");
@@ -363,15 +394,23 @@ public class MetadataHandler {
 
     /**
      * Creates a NOT_LEADER response with leader info.
+     * Returns the CLIENT-FACING port, not the Raft port.
      */
     private ByteBuffer createNotLeaderResponse() {
         Map<String, String> leaderInfo = new HashMap<>();
+        leaderInfo.put("leaderHost", "127.0.0.1");
 
         if (raftNode != null) {
             raftNode.getLeader().ifPresent(leader -> {
                 leaderInfo.put("leaderHost", leader.host());
-                leaderInfo.put("leaderPort", String.valueOf(leader.port()));
+                leaderInfo.put("leaderId", leader.nodeId());
+                // Use client-facing port (deduct 10000 from Raft port)
+                leaderInfo.put("leaderPort", String.valueOf(leader.port() - 10000));
             });
+            leaderInfo.put("raftState", raftNode.getState().name());
+            leaderInfo.put("term", String.valueOf(raftNode.getCurrentTerm()));
+        } else {
+            leaderInfo.put("leaderPort", String.valueOf(port));
         }
 
         try {
@@ -426,5 +465,57 @@ public class MetadataHandler {
         while (buffer.hasRemaining()) {
             channel.write(buffer);
         }
+    }
+
+    /**
+     * Parses the request envelope from payload.
+     * The payload may be a request envelope JSON or raw operation data (backward compatible).
+     */
+    private RequestEnvelope parseRequestEnvelope(byte[] payload) {
+        if (payload == null || payload.length == 0) {
+            return null;
+        }
+        try {
+            // Try to parse as JSON envelope
+            Map<String, Object> json = objectMapper.readValue(payload, Map.class);
+            if (json.containsKey("clientId") && json.containsKey("requestId")) {
+                String clientId = String.valueOf(json.get("clientId"));
+                String requestId = String.valueOf(json.get("requestId"));
+                String operation = json.containsKey("operation") ? String.valueOf(json.get("operation")) : null;
+
+                // Extract inner payload if present
+                byte[] innerPayload = payload;
+                if (json.containsKey("payload")) {
+                    Object payloadObj = json.get("payload");
+                    if (payloadObj instanceof String) {
+                        innerPayload = ((String) payloadObj).getBytes();
+                    } else if (payloadObj instanceof Map) {
+                        innerPayload = objectMapper.writeValueAsBytes(payloadObj);
+                    }
+                }
+
+                return RequestEnvelope.of(clientId, requestId, operation, innerPayload);
+            }
+        } catch (Exception e) {
+            // Not a JSON envelope, treat as raw payload
+        }
+        return null;
+    }
+
+    /**
+     * Generates a deduplication key from clientId and requestId.
+     */
+    private String getRequestDedupKey(String clientId, String requestId) {
+        if (clientId != null && requestId != null) {
+            return clientId + ":" + requestId;
+        }
+        return "unknown:" + System.identityHashCode(this);
+    }
+
+    /**
+     * Gets the deduplication cache for testing.
+     */
+    public DeduplicationCache getDeduplicationCache() {
+        return deduplicationCache;
     }
 }

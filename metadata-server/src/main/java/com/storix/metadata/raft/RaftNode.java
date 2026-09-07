@@ -1669,7 +1669,7 @@ public class RaftNode implements AutoCloseable {
 
         byte[] data = readLengthPrefixedBytes(channel);
 
-        return new LogEntry(term, index, timestamp, LogEntry.OpType.fromCode(opTypeCode), data);
+        return new LogEntry(term, index, timestamp, LogEntry.OpType.fromCode(opTypeCode), data, null, null);
     }
 
     private <T> T sendRpc(RaftPeer peer, RaftMessage message) throws IOException {

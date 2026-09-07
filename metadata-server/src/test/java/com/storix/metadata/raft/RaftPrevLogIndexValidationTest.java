@@ -48,11 +48,11 @@ class RaftPrevLogIndexValidationTest {
 
         // Create initial log with 5 entries via appendEntries
         List<LogEntry> initialEntries = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}),
-            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}),
-            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}),
-            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null),
+            new LogEntry(1, 3, 1002, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null),
+            new LogEntry(1, 4, 1003, LogEntry.OpType.CREATE_OBJECT, new byte[]{4}, null, null),
+            new LogEntry(1, 5, 1004, LogEntry.OpType.CREATE_OBJECT, new byte[]{5}, null, null)
         );
         log.appendEntries(0, 0, initialEntries);
 
@@ -65,7 +65,7 @@ class RaftPrevLogIndexValidationTest {
         // Now send entries with prevLogIndex=10 (beyond our log)
         // This simulates leader sending entries when prevLogIndex > lastLogIndex
         List<LogEntry> newEntries = List.of(
-            new LogEntry(2, 11, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{11})
+            new LogEntry(2, 11, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{11}, null, null)
         );
 
         // Through appendEntries with prevLogIndex beyond our log
@@ -127,8 +127,8 @@ class RaftPrevLogIndexValidationTest {
 
         // Create initial log with 2 entries
         List<LogEntry> initial = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null)
         );
         log.appendEntries(0, 0, initial);
 
@@ -136,7 +136,7 @@ class RaftPrevLogIndexValidationTest {
 
         // Send AppendEntries with prevLogIndex=2 (lastLogIndex), entries=[3]
         List<LogEntry> newEntries = List.of(
-            new LogEntry(1, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3})
+            new LogEntry(1, 3, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{3}, null, null)
         );
 
         log.appendEntries(2, 1, newEntries);
@@ -170,8 +170,8 @@ class RaftPrevLogIndexValidationTest {
 
         // Create entries 1(T1), 2(T2)
         List<LogEntry> initial = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(2, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(2, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null)
         );
         log.appendEntries(0, 0, initial);
 
@@ -184,7 +184,7 @@ class RaftPrevLogIndexValidationTest {
         // Leader claims prevLogIndex=1 but prevLogTerm=T2 (WRONG - entry 1 is T1)
         // This should trigger conflict resolution
         List<LogEntry> newEntries = List.of(
-            new LogEntry(2, 2, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{2})
+            new LogEntry(2, 2, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null)
         );
 
         // With prevLogTerm mismatch, the first entry's index is beyond our prevLogIndex
@@ -221,8 +221,8 @@ class RaftPrevLogIndexValidationTest {
 
         // Create entries 1,2
         List<LogEntry> initial = Arrays.asList(
-            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}),
-            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2})
+            new LogEntry(1, 1, 1000, LogEntry.OpType.CREATE_OBJECT, new byte[]{1}, null, null),
+            new LogEntry(1, 2, 1001, LogEntry.OpType.CREATE_OBJECT, new byte[]{2}, null, null)
         );
         log.appendEntries(0, 0, initial);
 
@@ -231,7 +231,7 @@ class RaftPrevLogIndexValidationTest {
 
         // Try to append with prevLogIndex=5 (gap)
         List<LogEntry> newEntries = List.of(
-            new LogEntry(2, 6, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{6})
+            new LogEntry(2, 6, 2000, LogEntry.OpType.CREATE_OBJECT, new byte[]{6}, null, null)
         );
 
         log.appendEntries(5, 1, newEntries);

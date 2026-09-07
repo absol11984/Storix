@@ -16,7 +16,7 @@ class RaftLogTest {
         RaftLog log = new RaftLog();
 
         LogEntry entry = new LogEntry(1, 1, System.currentTimeMillis(),
-                LogEntry.OpType.CREATE_OBJECT, "test".getBytes());
+                LogEntry.OpType.CREATE_OBJECT, "test".getBytes(), null, null);
         log.append(entry);
 
         assertEquals(1, log.getLastLogIndex());
@@ -31,7 +31,7 @@ class RaftLogTest {
         // Add 5 entries
         for (int i = 1; i <= 5; i++) {
             LogEntry entry = new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]);
+                    LogEntry.OpType.NO_OP, new byte[0], null, null);
             log.append(entry);
         }
 
@@ -48,7 +48,7 @@ class RaftLogTest {
         // Add entries
         for (int i = 1; i <= 5; i++) {
             log.append(new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]));
+                    LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
 
         assertEquals(0, log.getCommitIndex());
@@ -68,7 +68,7 @@ class RaftLogTest {
         // Add entries at term 1
         for (int i = 1; i <= 3; i++) {
             log.append(new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]));
+                    LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
 
         // Same term, same or higher index
@@ -92,7 +92,7 @@ class RaftLogTest {
         // Add entries: (1,1), (1,2), (1,3)
         for (int i = 1; i <= 3; i++) {
             log.append(new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]));
+                    LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
 
         // Append entries at prevLogIndex=1 with prevLogTerm=2 (mismatch - we have term 1)
@@ -100,8 +100,8 @@ class RaftLogTest {
         // Since entry 1 has term 1 ≠ prevLogTerm 2, no truncation occurs,
         // and new entries are simply appended.
         List<LogEntry> newEntries = List.of(
-                new LogEntry(2, 2, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0]),
-                new LogEntry(2, 3, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0])
+                new LogEntry(2, 2, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0], null, null),
+                new LogEntry(2, 3, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0], null, null)
         );
 
         log.appendEntries(1, 2, newEntries);
@@ -120,7 +120,7 @@ class RaftLogTest {
         // Add 5 entries
         for (int i = 1; i <= 5; i++) {
             log.append(new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes()));
+                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes(), null, null));
         }
 
         assertEquals(0, log.getLastApplied());
@@ -153,9 +153,9 @@ class RaftLogTest {
         RaftLog log = new RaftLog();
 
         log.append(new LogEntry(1, 1, System.currentTimeMillis(),
-                LogEntry.OpType.NO_OP, new byte[0]));
+                LogEntry.OpType.NO_OP, new byte[0], null, null));
         log.append(new LogEntry(1, 2, System.currentTimeMillis(),
-                LogEntry.OpType.NO_OP, new byte[0]));
+                LogEntry.OpType.NO_OP, new byte[0], null, null));
 
         assertTrue(log.containsEntry(1, 1));
         assertTrue(log.containsEntry(2, 1));
@@ -175,7 +175,7 @@ class RaftLogTest {
         // Append entries 1..10 at term 2
         for (int i = 1; i <= 10; i++) {
             log.append(new LogEntry(2, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]));
+                    LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
 
         // Verify initial state
@@ -196,7 +196,7 @@ class RaftLogTest {
 
         // Append a new entry
         log.append(new LogEntry(3, 11, System.currentTimeMillis(),
-                LogEntry.OpType.NO_OP, new byte[0]));
+                LogEntry.OpType.NO_OP, new byte[0], null, null));
 
         // Verify new entry
         assertNotNull(log.getEntry(11));
@@ -216,7 +216,7 @@ class RaftLogTest {
         // Append entries 1..20 at term 1
         for (int i = 1; i <= 20; i++) {
             log.append(new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]));
+                    LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
 
         // First compaction through index 10
@@ -237,7 +237,7 @@ class RaftLogTest {
 
         // Append new entry
         log.append(new LogEntry(2, 21, System.currentTimeMillis(),
-                LogEntry.OpType.NO_OP, new byte[0]));
+                LogEntry.OpType.NO_OP, new byte[0], null, null));
         assertEquals(21, log.getLastLogIndex());
         assertEquals(2, log.getLastLogTerm());
     }

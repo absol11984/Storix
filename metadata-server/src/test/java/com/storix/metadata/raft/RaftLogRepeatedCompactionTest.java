@@ -34,7 +34,7 @@ class RaftLogRepeatedCompactionTest {
         for (int i = 1; i <= 10; i++) {
             long term = 1; // All entries in term 1
             LogEntry entry = new LogEntry(term, i, System.currentTimeMillis(),
-                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes());
+                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes(), null, null);
             log.append(entry);
         }
 
@@ -74,7 +74,7 @@ class RaftLogRepeatedCompactionTest {
 
         // APPEND: entry 11
         LogEntry entry11 = new LogEntry(2, 11, System.currentTimeMillis(),
-                LogEntry.OpType.CREATE_OBJECT, "data11".getBytes());
+                LogEntry.OpType.CREATE_OBJECT, "data11".getBytes(), null, null);
         log.append(entry11);
 
         assertNotNull(log.getEntry(11), "Entry 11 should exist");
@@ -83,7 +83,7 @@ class RaftLogRepeatedCompactionTest {
 
         // APPEND: entry 12
         LogEntry entry12 = new LogEntry(2, 12, System.currentTimeMillis(),
-                LogEntry.OpType.CREATE_OBJECT, "data12".getBytes());
+                LogEntry.OpType.CREATE_OBJECT, "data12".getBytes(), null, null);
         log.append(entry12);
 
         assertNotNull(log.getEntry(12), "Entry 12 should exist");
@@ -124,7 +124,7 @@ class RaftLogRepeatedCompactionTest {
         // Append entries 21..40
         for (int i = 21; i <= 40; i++) {
             LogEntry entry = new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes());
+                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes(), null, null);
             log.append(entry);
         }
 
@@ -149,7 +149,7 @@ class RaftLogRepeatedCompactionTest {
 
         // APPEND: entry 41
         LogEntry entry41 = new LogEntry(2, 41, System.currentTimeMillis(),
-                LogEntry.OpType.CREATE_OBJECT, "data41".getBytes());
+                LogEntry.OpType.CREATE_OBJECT, "data41".getBytes(), null, null);
         log.append(entry41);
 
         assertNotNull(log.getEntry(41), "Entry 41 should exist");
@@ -178,15 +178,15 @@ class RaftLogRepeatedCompactionTest {
         // Append entries with different terms
         // Entries 1-5 in term 1
         for (int i = 1; i <= 5; i++) {
-            log.append(new LogEntry(1, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0]));
+            log.append(new LogEntry(1, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
         // Entries 6-10 in term 2
         for (int i = 6; i <= 10; i++) {
-            log.append(new LogEntry(2, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0]));
+            log.append(new LogEntry(2, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
         // Entries 11-15 in term 3
         for (int i = 11; i <= 15; i++) {
-            log.append(new LogEntry(3, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0]));
+            log.append(new LogEntry(3, i, System.currentTimeMillis(), LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
 
         // First compaction at index 5 (term 1)
@@ -226,7 +226,7 @@ class RaftLogRepeatedCompactionTest {
         // Append entries 1..20
         for (int i = 1; i <= 20; i++) {
             log.append(new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.NO_OP, new byte[0]));
+                    LogEntry.OpType.NO_OP, new byte[0], null, null));
         }
 
         // First compaction at index 10
@@ -267,7 +267,7 @@ class RaftLogRepeatedCompactionTest {
         // Append 1..30
         for (int i = 1; i <= 30; i++) {
             log.append(new LogEntry(1, i, System.currentTimeMillis(),
-                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes()));
+                    LogEntry.OpType.CREATE_OBJECT, ("data" + i).getBytes(), null, null));
         }
 
         // First compaction
@@ -280,11 +280,11 @@ class RaftLogRepeatedCompactionTest {
 
         // Simulate recovery: WAL has entries 26..30
         var recoveredEntries = java.util.Arrays.asList(
-                new LogEntry(1, 26, System.currentTimeMillis(), LogEntry.OpType.CREATE_OBJECT, "data26".getBytes()),
-                new LogEntry(1, 27, System.currentTimeMillis(), LogEntry.OpType.CREATE_OBJECT, "data27".getBytes()),
-                new LogEntry(1, 28, System.currentTimeMillis(), LogEntry.OpType.CREATE_OBJECT, "data28".getBytes()),
-                new LogEntry(1, 29, System.currentTimeMillis(), LogEntry.OpType.CREATE_OBJECT, "data29".getBytes()),
-                new LogEntry(1, 30, System.currentTimeMillis(), LogEntry.OpType.CREATE_OBJECT, "data30".getBytes())
+                new LogEntry(1, 26, System.currentTimeMillis(), LogEntry.OpType.CREATE_OBJECT, "data26".getBytes(), null, null),
+                new LogEntry(1, 27, System.currentTimeMillis(), LogEntry.OpType.CREATE_OBJECT, "data27".getBytes(), null, null),
+                new LogEntry(1, 28, System.currentTimeMillis(), LogEntry.OpType.CREATE_OBJECT, "data28".getBytes(), null, null),
+                new LogEntry(1, 29, System.currentTimeMillis(), LogEntry.OpType.CREATE_OBJECT, "data29".getBytes(), null, null),
+                new LogEntry(1, 30, System.currentTimeMillis(), LogEntry.OpType.CREATE_OBJECT, "data30".getBytes(), null, null)
         );
 
         // Clear and reload
@@ -301,7 +301,7 @@ class RaftLogRepeatedCompactionTest {
 
         // Append new entry
         LogEntry entry31 = new LogEntry(2, 31, System.currentTimeMillis(),
-                LogEntry.OpType.CREATE_OBJECT, "data31".getBytes());
+                LogEntry.OpType.CREATE_OBJECT, "data31".getBytes(), null, null);
         log.append(entry31);
 
         assertEquals(31, log.getEntry(31).index());

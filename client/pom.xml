@@ -18,7 +18,6 @@
             <groupId>com.storix</groupId>
             <artifactId>metadata-server</artifactId>
             <version>1.0.0</version>
-            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>com.storix</groupId>
