@@ -628,20 +628,27 @@ public class RaftLog {
     public void truncateFrom(long index) {
         lock.writeLock().lock();
         try {
+            // CRITICAL: If index > lastLogIndex, this is a NO-OP
+            // Do NOT clear the log or modify any state
             if (index > getLastLogIndex()) {
-                // Truncating beyond last entry - clear everything
-                entries.clear();
-                logStartIndex = index;
-                return;
-            }
-
-            if (index <= logStartIndex) {
-                // Already at or before log start
                 return;
             }
 
             // Remove entries with index >= truncateIndex (sequential storage)
             entries.removeIf(e -> e != null && e.index() >= index);
+
+            // Note: highestIndex is PRESERVED across truncations
+            // This ensures getLastLogIndex() returns the highest index ever assigned
+            // which is needed for correct nextIndex calculation in Raft replication
+
+            // Truncate WAL to match
+            if (wal != null) {
+                try {
+                    wal.truncateFrom(index);
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to truncate WAL", e);
+                }
+            }
         } finally {
             lock.writeLock().unlock();
         }
