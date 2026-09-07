@@ -56,6 +56,10 @@ public class WAL implements AutoCloseable {
     private long pendingTerm = 0;
     private String pendingVotedFor = null;
 
+    // Last persisted commit/applied indices (for deduplication)
+    private volatile long lastPersistedCommitIndex = -1;
+    private volatile long lastPersistedLastApplied = -1;
+
     /**
      * Recovery exception with detailed information.
      */
@@ -195,12 +199,20 @@ public class WAL implements AutoCloseable {
     /**
      * Persists the current commit and applied indices.
      * Format: type(1) + term(8) + votedForLen(4) + votedFor(variable) + commitIndex(8) + lastApplied(8)
+     *
+     * Only writes to WAL if commitIndex or lastApplied has changed since last persist,
+     * to prevent WAL bloat from repeated identical state records.
      */
     public synchronized void persistCommitIndex(long commitIndex, long lastApplied) throws IOException {
         lock.lock();
         try {
             if (closed) {
                 throw new IOException("WAL is closed");
+            }
+
+            // Only write if state actually changed (deduplication)
+            if (commitIndex == lastPersistedCommitIndex && lastApplied == lastPersistedLastApplied) {
+                return;
             }
 
             // votedFor string
@@ -224,6 +236,8 @@ public class WAL implements AutoCloseable {
 
             recoveredCommitIndex = commitIndex;
             recoveredLastApplied = lastApplied;
+            lastPersistedCommitIndex = commitIndex;
+            lastPersistedLastApplied = lastApplied;
 
         } finally {
             lock.unlock();
@@ -439,6 +453,9 @@ public class WAL implements AutoCloseable {
                     recoveredLastApplied = lastApplied;
                     pendingTerm = term;
                     pendingVotedFor = votedFor;
+                    // Initialize deduplication state to recovered values
+                    lastPersistedCommitIndex = commitIndex;
+                    lastPersistedLastApplied = lastApplied;
 
                     // Record end position
                     long recordEndPos = recordStartPos + 1 + 8 + 4 + votedForLen + 16;
@@ -736,6 +753,10 @@ public class WAL implements AutoCloseable {
                     StandardOpenOption.SYNC);
             this.channel.position(this.channel.size());
 
+            // Reset deduplication state after compaction (WAL was rewritten from scratch)
+            lastPersistedCommitIndex = commitIndex;
+            lastPersistedLastApplied = recoveryResult.lastApplied;
+
         } finally {
             lock.unlock();
         }
@@ -889,6 +910,10 @@ public class WAL implements AutoCloseable {
                     StandardOpenOption.WRITE,
                     StandardOpenOption.SYNC);
             channel.position(channel.size());
+
+            // Reset deduplication state after truncation (WAL was rewritten)
+            lastPersistedCommitIndex = recoveryResult.commitIndex;
+            lastPersistedLastApplied = recoveryResult.lastApplied;
 
         } finally {
             lock.unlock();
