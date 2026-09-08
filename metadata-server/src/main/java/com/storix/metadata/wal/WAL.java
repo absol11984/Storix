@@ -27,7 +27,7 @@ public class WAL implements AutoCloseable {
 
     // Magic number to identify WAL file
     private static final long WAL_MAGIC = 0x57414C01L; // "WAL\001"
-    private static final int WAL_VERSION = 3; // Version 3 adds readFully semantics and proper corruption handling
+    private static final int WAL_VERSION = 4; // Version 4 adds clientId/requestId preservation
     private static final int HEADER_END_MARKER = 0xDEADBEEF;
     private static final byte STATE_RECORD_TYPE = 1;
     private static final byte ENTRY_RECORD_TYPE = 2;
@@ -386,6 +386,16 @@ public class WAL implements AutoCloseable {
         }
 
         int version = headerBuf.getInt();
+        if (version == 3) {
+            // v3 parser branch
+        } else if (version == 4) {
+            // v4 parser branch
+        } else {
+            throw new WALRecoveryException(
+                "Unsupported WAL version: " + version + ". Expected version 3 or 4.",
+                WALRecoveryException.RecoveryStatus.INVALID_FORMAT
+            );
+        }
         int endMarker = headerBuf.getInt();
         if (endMarker != HEADER_END_MARKER) {
             throw new WALRecoveryException(
@@ -463,10 +473,7 @@ public class WAL implements AutoCloseable {
                     recordStartPos = recordEndPos;
 
                 } else if (recordType == ENTRY_RECORD_TYPE) {
-                    // Read entry record
-                    // Format: term(8) + index(8) + timestamp(8) + opType(1) + dataLen(4) + data(variable) + checksum(4)
-                    // Fixed header: 8 + 8 + 8 + 1 + 4 = 29 bytes
-
+                    // Read fixed header: term(8) + index(8) + timestamp(8) + opType(1) + dataLen(4) = 29 bytes
                     ByteBuffer fixedBuf = ByteBuffer.allocate(29);
                     readFully(fixedBuf, recordStartPos + 1, 29);
                     fixedBuf.flip();
@@ -485,62 +492,150 @@ public class WAL implements AutoCloseable {
                         );
                     }
 
-                    // Read data + checksum
-                    int recordBodySize = dataLen + 4;
-                    long dataStartPos = recordStartPos + 1 + 29;
-                    long recordEndPos = dataStartPos + recordBodySize;
-
-                    // Check if record is complete
-                    if (recordEndPos > fileSize) {
-                        // Truncated final record - this is recoverable
-                        System.err.println("[WAL] Truncated final record at position " + recordStartPos +
-                            ": expected " + recordBodySize + " bytes, have " + (fileSize - dataStartPos));
-                        overallStatus = WALRecoveryResult.Status.TRUNCATED_TAIL;
-                        errorMessage = "Truncated final record at index " + index;
-                        break;
-                    }
-
                     // Read data
                     byte[] data = new byte[dataLen];
+                    long dataPos = recordStartPos + 1 + 29;
                     if (dataLen > 0) {
                         ByteBuffer dataBuf = ByteBuffer.wrap(data);
-                        readFully(dataBuf, dataStartPos, dataLen);
+                        readFully(dataBuf, dataPos, dataLen);
                     }
 
-                    // Read checksum
-                    ByteBuffer checksumBuf = ByteBuffer.allocate(4);
-                    readFully(checksumBuf, dataStartPos + dataLen, 4);
-                    checksumBuf.flip();
-                    int storedChecksum = checksumBuf.getInt();
+                    // Based on WAL version, parse identity fields explicitly.
+                    // v4 format: data + clientIdLen(4) + clientId + requestIdLen(4) + requestId + checksum(4)
+                    // v3 format: data + checksum(4)
+                    long identityPos = dataPos + dataLen;
+                    long remainingBeforeChecksum = fileSize - identityPos;
+                    long checksumPosition;
+                    if (version == 4) {
+                        // v4: read identity strings using serialized lengths as authoritative
+                        String clientId = null;
+                        String requestId = null;
+                        int cidLen = 0;
+                        int reqIdLen = 0;
+                        // Boundary: clientId length field must have 4 bytes remaining
+                        if (remainingBeforeChecksum >= 4) {
+                            ByteBuffer clientLenBuf = ByteBuffer.allocate(4);
+                            readFully(clientLenBuf, identityPos, 4);
+                            clientLenBuf.flip();
+                            cidLen = clientLenBuf.getInt();
+                            // Boundary: cidLen must be non-negative and within max
+                            if (cidLen < 0 || cidLen > 1024) {
+                                throw new WALRecoveryException(
+                                    "Invalid clientId length: " + cidLen,
+                                    WALRecoveryException.RecoveryStatus.CORRUPTED_RECORD
+                                );
+                            }
+                            // Boundary: enough bytes for clientId content
+                            if (remainingBeforeChecksum - 4 < cidLen) {
+                                throw new WALRecoveryException(
+                                    "Truncated clientId: expected " + cidLen + " bytes, only " + (remainingBeforeChecksum - 4) + " available",
+                                    WALRecoveryException.RecoveryStatus.TRUNCATED_TAIL
+                                );
+                            }
+                            byte[] cBytes = new byte[cidLen];
+                            if (cidLen > 0) {
+                                ByteBuffer cb = ByteBuffer.wrap(cBytes);
+                                readFully(cb, identityPos + 4, cidLen);
+                            }
+                            clientId = new String(cBytes);
 
-                    // Verify checksum
-                    int computedChecksum = computeChecksum(term, index, timestamp, opTypeCode, data);
-                    if (storedChecksum != computedChecksum) {
-                        throw new WALRecoveryException(
-                            "Checksum mismatch for entry at index " + index +
-                            ": expected " + computedChecksum + ", got " + storedChecksum,
-                            WALRecoveryException.RecoveryStatus.CHECKSUM_MISMATCH
-                        );
+                            long afterClientId = identityPos + 4 + cidLen;
+                            long remainingAfterClientId = fileSize - afterClientId;
+                            // Boundary: requestId length field must have 4 bytes remaining
+                            if (remainingAfterClientId >= 4) {
+                                ByteBuffer reqLenBuf = ByteBuffer.allocate(4);
+                                readFully(reqLenBuf, afterClientId, 4);
+                                reqLenBuf.flip();
+                                reqIdLen = reqLenBuf.getInt();
+                                if (reqIdLen < 0 || reqIdLen > 1024) {
+                                    throw new WALRecoveryException(
+                                        "Invalid requestId length: " + reqIdLen,
+                                        WALRecoveryException.RecoveryStatus.CORRUPTED_RECORD
+                                    );
+                                }
+                                // Boundary: enough bytes for requestId content
+                                if (remainingAfterClientId - 4 < reqIdLen) {
+                                    throw new WALRecoveryException(
+                                        "Truncated requestId: expected " + reqIdLen + " bytes, only " + (remainingAfterClientId - 4) + " available",
+                                        WALRecoveryException.RecoveryStatus.TRUNCATED_TAIL
+                                    );
+                                }
+                                byte[] rBytes = new byte[reqIdLen];
+                                if (reqIdLen > 0) {
+                                    ByteBuffer rb = ByteBuffer.wrap(rBytes);
+                                    readFully(rb, afterClientId + 4, reqIdLen);
+                                }
+                                requestId = new String(rBytes);
+                            }
+                        }
+                        // Only normalize to null AFTER parsing; serialized lengths remain authoritative
+                        if (clientId != null && clientId.isEmpty()) clientId = null;
+                        if (requestId != null && requestId.isEmpty()) requestId = null;
+
+                        // Calculate checksum position directly from serialized lengths read (not normalized null lengths)
+                        checksumPosition = identityPos + 4 + cidLen + 4 + reqIdLen;
+
+                        // Boundary: enough bytes remain for checksum
+                        if (checksumPosition + 4 > fileSize) {
+                            throw new WALRecoveryException(
+                                "Truncated checksum: expected 4 bytes at position " + checksumPosition,
+                                WALRecoveryException.RecoveryStatus.TRUNCATED_TAIL
+                            );
+                        }
+
+                        ByteBuffer checksumBuf = ByteBuffer.allocate(4);
+                        readFully(checksumBuf, checksumPosition, 4);
+                        checksumBuf.flip();
+                        int storedChecksum = checksumBuf.getInt();
+
+                        int computedChecksum = computeChecksumV4(term, index, timestamp, opTypeCode, data,
+                                clientId, requestId);
+                        boolean checksumValid = (storedChecksum == computedChecksum);
+                        if (!checksumValid) {
+                            throw new WALRecoveryException(
+                                "Checksum mismatch for entry at index " + index +
+                                ": expected " + computedChecksum + ", got " + storedChecksum,
+                                WALRecoveryException.RecoveryStatus.CHECKSUM_MISMATCH
+                            );
+                        }
+
+                        LogEntry entry = new LogEntry(term, index, timestamp,
+                                LogEntry.OpType.fromCode(opTypeCode), data, clientId, requestId);
+                        entries.add(entry);
+                        lastSyncedIndex = Math.max(lastSyncedIndex, entry.index());
+                        lastValidPosition = checksumPosition + 4;
+                        recordStartPos = checksumPosition + 4;
+                    } else if (version == 3) {
+                        // v3: checksum directly after data
+                        long checksumPos = dataPos + dataLen;
+                        // Boundary: ensure checksum fits
+                        if (checksumPos + 4 > fileSize) {
+                            throw new WALRecoveryException(
+                                "Truncated v3 checksum at position " + checksumPos,
+                                WALRecoveryException.RecoveryStatus.TRUNCATED_TAIL
+                            );
+                        }
+                        ByteBuffer checksumBuf = ByteBuffer.allocate(4);
+                        readFully(checksumBuf, checksumPos, 4);
+                        checksumBuf.flip();
+                        int storedChecksum = checksumBuf.getInt();
+
+                        int computedChecksum = computeChecksumV3(term, index, timestamp, opTypeCode, data);
+                        if (storedChecksum != computedChecksum) {
+                            throw new WALRecoveryException(
+                                "Checksum mismatch for v3 entry at index " + index +
+                                ": expected " + computedChecksum + ", got " + storedChecksum,
+                                WALRecoveryException.RecoveryStatus.CHECKSUM_MISMATCH
+                            );
+                        }
+
+                        LogEntry entry = new LogEntry(term, index, timestamp,
+                                LogEntry.OpType.fromCode(opTypeCode), data, null, null);
+                        entries.add(entry);
+                        lastSyncedIndex = Math.max(lastSyncedIndex, entry.index());
+                        lastValidPosition = checksumPos + 4;
+                        recordStartPos = checksumPos + 4;
                     }
-
-                    // Validate opType
-                    LogEntry.OpType opType;
-                    try {
-                        opType = LogEntry.OpType.fromCode(opTypeCode);
-                    } catch (IllegalArgumentException e) {
-                        throw new WALRecoveryException(
-                            "Invalid opType code in entry at index " + index + ": " + opTypeCode,
-                            WALRecoveryException.RecoveryStatus.CORRUPTED_RECORD
-                        );
-                    }
-
-                    LogEntry entry = new LogEntry(term, index, timestamp, opType, data, null, null);
-                    entries.add(entry);
-                    lastSyncedIndex = Math.max(lastSyncedIndex, entry.index());
-
-                    // Update last valid position and move to next record
-                    lastValidPosition = recordEndPos;
-                    recordStartPos = recordEndPos;
 
                 } else {
                     // Unknown record type - this is internal corruption, not truncated tail
@@ -635,9 +730,11 @@ public class WAL implements AutoCloseable {
     }
 
     /**
-     * Computes a CRC32 checksum for a log entry.
+     * Computes the ORIGINAL v3 CRC32 checksum.
+     * Covers ONLY: term, index, timestamp, opType, data.
+     * Does NOT include identity fields.
      */
-    private int computeChecksum(long term, long index, long timestamp, byte opTypeCode, byte[] data) {
+    private int computeChecksumV3(long term, long index, long timestamp, byte opTypeCode, byte[] data) {
         CRC32 crc = new CRC32();
         crc.update(toBytes(term));
         crc.update(toBytes(index));
@@ -646,6 +743,30 @@ public class WAL implements AutoCloseable {
         if (data != null && data.length > 0) {
             crc.update(data, 0, data.length);
         }
+        return (int) crc.getValue();
+    }
+
+    /**
+     * Computes the v4 CRC32 checksum including identity fields.
+     * Covers: term, index, timestamp, opType, data, clientId length, clientId bytes,
+     * requestId length, requestId bytes.
+     */
+    private int computeChecksumV4(long term, long index, long timestamp, byte opTypeCode, byte[] data,
+                                  String clientId, String requestId) {
+        CRC32 crc = new CRC32();
+        crc.update(toBytes(term));
+        crc.update(toBytes(index));
+        crc.update(toBytes(timestamp));
+        crc.update(opTypeCode);
+        if (data != null && data.length > 0) {
+            crc.update(data, 0, data.length);
+        }
+        byte[] clientBytes = clientId != null ? clientId.getBytes() : new byte[0];
+        byte[] requestBytes = requestId != null ? requestId.getBytes() : new byte[0];
+        crc.update(toBytes(clientBytes.length));
+        if (clientBytes.length > 0) crc.update(clientBytes);
+        crc.update(toBytes(requestBytes.length));
+        if (requestBytes.length > 0) crc.update(requestBytes);
         return (int) crc.getValue();
     }
 
@@ -797,11 +918,16 @@ public class WAL implements AutoCloseable {
 
     private ByteBuffer serialize(LogEntry entry) {
         byte[] data = entry.data() != null ? entry.data() : new byte[0];
+        String clientId = entry.clientId() != null ? entry.clientId() : "";
+        String requestId = entry.requestId() != null ? entry.requestId() : "";
+        byte[] clientBytes = clientId.getBytes();
+        byte[] requestBytes = requestId.getBytes();
 
-        // Format: type(1) + term(8) + index(8) + timestamp(8) + opType(1) + dataLen(4) + data + checksum(4)
-        int checksum = computeChecksum(entry.term(), entry.index(), entry.timestamp(), entry.opType().code(), data);
+        // Version 4 format: type(1) + term(8) + index(8) + timestamp(8) + opType(1) + dataLen(4) + data + clientIdLen(4) + clientId + requestIdLen(4) + requestId + checksum(4)
+        int checksum = computeChecksumV4(entry.term(), entry.index(), entry.timestamp(), entry.opType().code(), data,
+                entry.clientId(), entry.requestId());
 
-        ByteBuffer buf = ByteBuffer.allocate(1 + 8 + 8 + 8 + 1 + 4 + data.length + 4);
+        ByteBuffer buf = ByteBuffer.allocate(1 + 8 + 8 + 8 + 1 + 4 + data.length + 4 + clientBytes.length + 4 + requestBytes.length + 4);
         buf.put(ENTRY_RECORD_TYPE);
         buf.putLong(entry.term());
         buf.putLong(entry.index());
@@ -809,6 +935,10 @@ public class WAL implements AutoCloseable {
         buf.put(entry.opType().code());
         buf.putInt(data.length);
         buf.put(data);
+        buf.putInt(clientBytes.length);
+        if (clientBytes.length > 0) buf.put(clientBytes);
+        buf.putInt(requestBytes.length);
+        if (requestBytes.length > 0) buf.put(requestBytes);
         buf.putInt(checksum);
         buf.flip();
         return buf;

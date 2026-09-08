@@ -33,9 +33,6 @@ import static org.junit.jupiter.api.Assertions.*;
 class MultiNodeMetadataServerIntegrationTest {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    // Atomic counter for unique port assignment per test
-    private static final AtomicLong portCounter = new AtomicLong(System.currentTimeMillis() % 10000);
-
     // Ports for the three nodes
     private int portA;
     private int portB;
@@ -56,20 +53,22 @@ class MultiNodeMetadataServerIntegrationTest {
     private ClusterConfig configA;
     private ClusterConfig configB;
     private ClusterConfig configC;
+    private TestPortAllocator.Lease portLease;
 
     // For tracking previous terms across restarts
     private final AtomicLong previousHighestTerm = new AtomicLong(0);
 
     @BeforeEach
     void setupCluster() throws Exception {
-        // Use incrementing ports to avoid conflicts between tests
-        long base = portCounter.addAndGet(10);
-        portA = (int) (45000 + base % 15000);
-        portB = portA + 10;  // Separate ports for client and raft
-        portC = portA + 20;
-        int raftPortA = portA + 1;
-        int raftPortB = portB + 1;
-        int raftPortC = portC + 1;
+        // Reserve six independent ports before constructing the cluster.
+        portLease = TestPortAllocator.lease(6);
+        portA = portLease.port(0);
+        portB = portLease.port(1);
+        portC = portLease.port(2);
+        int raftPortA = portLease.port(3);
+        int raftPortB = portLease.port(4);
+        int raftPortC = portLease.port(5);
+        portLease.release();
 
         // Create unique cluster directory for this test
         clusterDir = Files.createTempDirectory("meta-cluster-integration-" + System.nanoTime());
@@ -117,12 +116,10 @@ class MultiNodeMetadataServerIntegrationTest {
         } catch (IOException e) {
             // ignore
         }
-        // Extra wait for OS to release ports (TIME_WAIT state)
-        // Must exceed election timeout (6000ms) to ensure election deadlines fully expire
-        // and election activity settles before the next test's startAllServers().
-        // Without this, previous test's servers may still be timing out/electing, causing
-        // stale state to pollute the next test's fresh server initialization.
-        try { Thread.sleep(8000); } catch (InterruptedException e) { /* ignore */ }
+        if (portLease != null) {
+            portLease.close();
+            portLease = null;
+        }
     }
 
     /**
@@ -235,11 +232,27 @@ class MultiNodeMetadataServerIntegrationTest {
     }
 
     private void stopAllServers() {
-        try { if (serverA != null) serverA.stop(); } catch (Exception e) { /* ignore */ }
-        try { if (serverB != null) serverB.stop(); } catch (Exception e) { /* ignore */ }
-        try { if (serverC != null) serverC.stop(); } catch (Exception e) { /* ignore */ }
-        // Wait for ports to be released (OS TIME_WAIT)
-        try { Thread.sleep(1000); } catch (InterruptedException e) { /* ignore */ }
+        RuntimeException failure = null;
+        for (MetadataServer server : Arrays.asList(serverA, serverB, serverC)) {
+            if (server == null) {
+                continue;
+            }
+            try {
+                server.stop();
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        serverA = null;
+        serverB = null;
+        serverC = null;
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     private MetadataServer getLeaderServer() {
@@ -548,9 +561,10 @@ class MultiNodeMetadataServerIntegrationTest {
 
         // Restart only ONE node (simulating a network partition)
         // Use fresh ports for the isolated node
-        long base = portCounter.addAndGet(10);
-        int isolatedPortA = (int) (45000 + base % 15000);
-        int isolatedRaftPortA = isolatedPortA + 1;
+        try (TestPortAllocator.Lease isolatedPorts = TestPortAllocator.lease(2)) {
+        int isolatedPortA = isolatedPorts.port(0);
+        int isolatedRaftPortA = isolatedPorts.port(1);
+        isolatedPorts.release();
 
         Path metaFileA = dataDirA.resolve("metadata-isolated.json");
         ClusterConfig isolatedConfig = new ClusterConfig("storix",
@@ -584,6 +598,7 @@ class MultiNodeMetadataServerIntegrationTest {
         System.out.println("\n========================================");
         System.out.println("TEST: Majority Required - PASSED");
         System.out.println("========================================\n");
+        }
     }
 
     // ===== TEST 6: Higher Term Step-Down =====
@@ -718,7 +733,7 @@ class MultiNodeMetadataServerIntegrationTest {
         previousHighestTerm.set(Math.max(previousHighestTerm.get(), term3));
 
         // Verify all nodes have terms >= maxTerm
-        for (MetadataServer server : List.of(serverA, serverB, serverC)) {
+        for (MetadataServer server : Arrays.asList(serverA, serverB, serverC)) {
             if (server != null && server.getRaftNode() != null) {
                 long nodeTerm = server.getRaftNode().getCurrentTerm();
                 assertTrue(nodeTerm >= maxTerm - 1, // Allow for one-term difference during transition
@@ -823,7 +838,7 @@ class MultiNodeMetadataServerIntegrationTest {
         System.out.println("Leader 2 (after recovery): " + leader2Id);
 
         // Verify all servers are in valid states
-        for (MetadataServer server : List.of(serverA, serverB, serverC)) {
+        for (MetadataServer server : Arrays.asList(serverA, serverB, serverC)) {
             if (server != null && server.getRaftNode() != null) {
                 RaftState state = server.getRaftNode().getState();
                 assertTrue(state == RaftState.LEADER || state == RaftState.FOLLOWER,

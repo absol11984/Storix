@@ -8,7 +8,6 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -29,25 +28,25 @@ import static org.junit.jupiter.api.Assertions.*;
 class RaftFollowerCatchUpTest {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final AtomicLong portCounter = new AtomicLong(System.currentTimeMillis() % 10000);
-
     private int portA, portB, portC;
     private Path clusterDir;
     private Path dataDirA, dataDirB, dataDirC;
     private MetadataServer serverA, serverB, serverC;
     private ClusterConfig configA, configB, configC;
+    private TestPortAllocator.Lease portLease;
 
     @TempDir
     Path tempDir;
 
     private void setupCluster() throws Exception {
-        long base = portCounter.addAndGet(10);
-        portA = (int) (56000 + base % 10000);
-        portB = portA + 10;
-        portC = portA + 20;
-        int raftPortA = portA + 1;
-        int raftPortB = portB + 1;
-        int raftPortC = portC + 1;
+        portLease = TestPortAllocator.lease(6);
+        portA = portLease.port(0);
+        portB = portLease.port(1);
+        portC = portLease.port(2);
+        int raftPortA = portLease.port(3);
+        int raftPortB = portLease.port(4);
+        int raftPortC = portLease.port(5);
+        portLease.release();
 
         clusterDir = Files.createTempDirectory("follower-catchup-test-" + System.nanoTime());
         dataDirA = clusterDir.resolve("meta-a");
@@ -72,9 +71,14 @@ class RaftFollowerCatchUpTest {
 
     private MetadataServer startServer(int port, Path metaFile, ClusterConfig config, Path dataDir) throws Exception {
         MetadataServer server = new MetadataServer(port, metaFile, 2, 6000, 2000, config, dataDir);
-        server.getRaftNode().start();
-        server.getRaftNode().waitForRpcServerReady();
-        return server;
+        try {
+            server.getRaftNode().start();
+            server.getRaftNode().waitForRpcServerReady();
+            return server;
+        } catch (Exception e) {
+            server.stop();
+            throw e;
+        }
     }
 
     private MetadataServer getLeader() {
@@ -104,7 +108,8 @@ class RaftFollowerCatchUpTest {
         ObjectMetadata obj = new ObjectMetadata(name, 1024L, 4096);
         byte[] data = objectMapper.writeValueAsBytes(obj);
         LogEntry entry = LogEntry.create(leader.getRaftNode().getCurrentTerm(),
-            LogEntry.OpType.CREATE_OBJECT, data);
+            LogEntry.OpType.CREATE_OBJECT, data,
+            "catchup-client", "catchup-req-" + System.nanoTime()).withIndex(leader.getRaftNode().getRaftLog().getLastLogIndex() + 1);
         boolean ok = leader.getRaftNode().submit(entry);
         assertTrue(ok, "submit() should succeed with majority available");
         return leader.getRaftNode().getRaftLog().getLastLogIndex();
@@ -148,16 +153,43 @@ class RaftFollowerCatchUpTest {
 
     @AfterEach
     void teardown() {
-        try { if (serverA != null) serverA.stop(); } catch (Exception e) { /* ignore */ }
-        try { if (serverB != null) serverB.stop(); } catch (Exception e) { /* ignore */ }
-        try { if (serverC != null) serverC.stop(); } catch (Exception e) { /* ignore */ }
+        RuntimeException failure = null;
+        for (MetadataServer server : Arrays.asList(serverA, serverB, serverC)) {
+            if (server == null) {
+                continue;
+            }
+            try {
+                server.stop();
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        serverA = null;
+        serverB = null;
+        serverC = null;
         try {
             if (clusterDir != null) {
                 Files.walk(clusterDir).sorted(Comparator.reverseOrder())
                     .map(Path::toFile).forEach(java.io.File::delete);
             }
-        } catch (Exception e) { /* ignore */ }
-        try { Thread.sleep(8000); } catch (InterruptedException e) { /* ignore */ }
+        } catch (Exception e) {
+            if (failure == null) {
+                failure = new RuntimeException("Failed to remove cluster directory", e);
+            } else {
+                failure.addSuppressed(e);
+            }
+        }
+        if (portLease != null) {
+            portLease.close();
+            portLease = null;
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     // ===== TEST 1: Follower catch-up from offline state =====
@@ -222,7 +254,6 @@ class RaftFollowerCatchUpTest {
 
         // Stop the follower
         slowFollower.stop();
-        Thread.sleep(200);
 
         // Phase 3: Submit more entries while follower is offline
         int midEntries = 2;
@@ -294,6 +325,12 @@ class RaftFollowerCatchUpTest {
                 "Entry opType must match at index " + idx);
             assertEquals(leaderEntry.index(), followerEntry.index(),
                 "Entry index must match at index " + idx);
+            assertArrayEquals(leaderEntry.data(), followerEntry.data(),
+                "Entry data must match at index " + idx);
+            assertEquals(leaderEntry.clientId(), followerEntry.clientId(),
+                "Entry clientId must match at index " + idx);
+            assertEquals(leaderEntry.requestId(), followerEntry.requestId(),
+                "Entry requestId must match at index " + idx);
         }
         System.out.println("All log entries verified: indexes, terms, commands match");
 
@@ -364,7 +401,6 @@ class RaftFollowerCatchUpTest {
         // Stop follower completely
         System.out.println("Stopping follower: " + followerId);
         follower.stop();
-        Thread.sleep(200);
 
         // Leader continues with more entries
         int moreEntries = 2;
@@ -380,11 +416,30 @@ class RaftFollowerCatchUpTest {
         expectedCommitIndex = leader.getRaftNode().getRaftLog().getCommitIndex();
         expectedLastApplied = leader.getRaftNode().getRaftLog().getLastApplied();
 
-        // Restart follower with same data directory (recovery)
+        // Restart follower with the same client/Raft ports and data directory.
+        // Register the replacement in the fixture before starting it so an
+        // exception during startup cannot leave an unowned RaftNode running.
         System.out.println("Restarting follower: " + followerId + " with same data dir");
         ClusterConfig followerConfig = followerId.equals("meta-a") ? configA :
                                        followerId.equals("meta-b") ? configB : configC;
-        follower = new MetadataServer(portB, followerDataDir.resolve("meta.json"), 2, 6000, 2000, followerConfig, followerDataDir);
+        int followerPort = followerId.equals("meta-a") ? portA :
+                           followerId.equals("meta-b") ? portB : portC;
+        MetadataServer restartedFollower = new MetadataServer(
+            followerPort,
+            followerDataDir.resolve("meta.json"),
+            2,
+            6000,
+            2000,
+            followerConfig,
+            followerDataDir);
+        if (followerId.equals("meta-a")) {
+            serverA = restartedFollower;
+        } else if (followerId.equals("meta-b")) {
+            serverB = restartedFollower;
+        } else {
+            serverC = restartedFollower;
+        }
+        follower = restartedFollower;
         follower.getRaftNode().start();
         follower.getRaftNode().waitForRpcServerReady();
         wireApplier(follower);

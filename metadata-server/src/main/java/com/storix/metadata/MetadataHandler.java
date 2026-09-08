@@ -105,6 +105,10 @@ public class MetadataHandler {
                 ByteBuffer response = processRequest(opcode, payload);
                 response.flip();
                 writeFully(channel, response);
+                // Flush to ensure client receives complete response before any close
+                if (channel.isOpen()) {
+                    // Socket write flush is implicit; no extra flush needed for blocking channel
+                }
             } catch (IOException e) {
                 // Connection error - break out of loop
                 break;
@@ -112,25 +116,76 @@ public class MetadataHandler {
         }
     }
 
+    // Normalized request context produced by central unwrapping
+    private record RequestContext(byte opcode, byte[] innerPayload, String clientId, String requestId, String operation) {}
+
+    /**
+     * Parses the request envelope ONCE at the beginning of request processing.
+     */
+    private static RequestContext unwrapRequest(byte opcode, byte[] payload) {
+        RequestEnvelope envelope = parseRequestEnvelopeStatic(payload);
+        String clientId = envelope != null ? envelope.clientId() : null;
+        String requestId = envelope != null ? envelope.requestId() : null;
+        String operation = envelope != null ? envelope.operation() : null;
+        byte[] innerPayload = envelope != null ? envelope.payload() : payload;
+        return new RequestContext(opcode, innerPayload, clientId, requestId, operation);
+    }
+
+    private static RequestEnvelope parseRequestEnvelopeStatic(byte[] payload) {
+        if (payload == null || payload.length == 0) {
+            return null;
+        }
+        try {
+            // Try to parse as JSON envelope
+            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            Map<String, Object> json = mapper.readValue(payload, Map.class);
+            if (json.containsKey("clientId") && json.containsKey("requestId")) {
+                String clientId = String.valueOf(json.get("clientId"));
+                String requestId = String.valueOf(json.get("requestId"));
+                String operation = json.containsKey("operation") ? String.valueOf(json.get("operation")) : null;
+
+                byte[] innerPayload = payload;
+                if (json.containsKey("payload")) {
+                    Object payloadObj = json.get("payload");
+                    if (payloadObj instanceof String) {
+                        innerPayload = ((String) payloadObj).getBytes();
+                    } else if (payloadObj instanceof Map) {
+                        innerPayload = mapper.writeValueAsBytes(payloadObj);
+                    } else if (payloadObj instanceof java.util.LinkedHashMap || payloadObj instanceof java.util.HashMap) {
+                        innerPayload = mapper.writeValueAsBytes(payloadObj);
+                    } else {
+                        // If payload is a JSON object embedded as map, serialize it back to JSON bytes
+                        innerPayload = mapper.writeValueAsBytes(payloadObj);
+                    }
+                }
+                return RequestEnvelope.of(clientId, requestId, operation, innerPayload);
+            }
+        } catch (Exception e) {
+            // Not a JSON envelope, treat as raw payload
+        }
+        return null;
+    }
+
     /**
      * Processes a request and returns the response buffer.
      */
     private ByteBuffer processRequest(byte opcode, byte[] payload) throws IOException {
+        RequestContext ctx = unwrapRequest(opcode, payload);
         try {
             return switch (opcode) {
-                case MetadataProtocol.CREATE_OBJECT -> handleCreateObject(payload);
-                case MetadataProtocol.GET_OBJECT -> handleGetObject(payload);
-                case MetadataProtocol.UPDATE_OBJECT -> handleUpdateObject(payload);
-                case MetadataProtocol.DELETE_OBJECT -> handleDeleteObject(payload);
-                case MetadataProtocol.LIST_OBJECTS -> handleListObjects();
+                case MetadataProtocol.CREATE_OBJECT -> handleCreateObject(ctx);
+                case MetadataProtocol.GET_OBJECT -> handleGetObject(ctx);
+                case MetadataProtocol.UPDATE_OBJECT -> handleUpdateObject(ctx);
+                case MetadataProtocol.DELETE_OBJECT -> handleDeleteObject(ctx);
+                case MetadataProtocol.LIST_OBJECTS -> handleListObjects(ctx);
 
                 // Node Registry commands
-                case MetadataProtocol.REGISTER_NODE -> handleRegisterNode(payload);
-                case MetadataProtocol.HEARTBEAT -> handleHeartbeat(payload);
-                case MetadataProtocol.GET_NODES -> handleGetNodes();
-                case MetadataProtocol.GET_PLACEMENT -> handleGetPlacement(payload);
-                case MetadataProtocol.GET_CLUSTER_STATUS -> handleGetClusterStatus();
-                case MetadataProtocol.REPAIR -> handleRepair();
+                case MetadataProtocol.REGISTER_NODE -> handleRegisterNode(ctx);
+                case MetadataProtocol.HEARTBEAT -> handleHeartbeat(ctx);
+                case MetadataProtocol.GET_NODES -> handleGetNodes(ctx);
+                case MetadataProtocol.GET_PLACEMENT -> handleGetPlacement(ctx);
+                case MetadataProtocol.GET_CLUSTER_STATUS -> handleGetClusterStatus(ctx);
+                case MetadataProtocol.REPAIR -> handleRepair(ctx);
 
                 default -> createErrorResponse(MetadataProtocol.ERROR, "Unknown opcode: " + opcode);
             };
@@ -139,20 +194,15 @@ public class MetadataHandler {
         }
     }
 
-    private ByteBuffer handleCreateObject(byte[] payload) throws IOException {
+    private ByteBuffer handleCreateObject(RequestContext ctx) throws IOException {
         // Check if we're the leader (if Raft is enabled)
         if (raftNode != null && !raftNode.isLeader()) {
             return createNotLeaderResponse();
         }
-
-        // Parse request envelope to extract clientId and requestId
-        RequestEnvelope envelope = parseRequestEnvelope(payload);
-        String clientId = envelope != null ? envelope.clientId() : null;
-        String requestId = envelope != null ? envelope.requestId() : null;
-
-        // Parse the actual object metadata from the inner payload
-        byte[] innerPayload = envelope != null ? envelope.payload() : payload;
-        ObjectMetadata metadata = objectMapper.readValue(innerPayload, ObjectMetadata.class);
+        byte[] payload = ctx.innerPayload;
+        String clientId = ctx.clientId;
+        String requestId = ctx.requestId;
+        ObjectMetadata metadata = objectMapper.readValue(payload, ObjectMetadata.class);
 
         // Use clientId + requestId for true deduplication
         String dedupKey = getRequestDedupKey(clientId, requestId);
@@ -171,9 +221,10 @@ public class MetadataHandler {
             LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.CREATE_OBJECT, data, clientId, requestId);
 
             if (!raftNode.submit(entry)) {
+                // Do NOT cache failure - allow retry to attempt again
                 return createErrorResponse(MetadataProtocol.ERROR, "Failed to submit to Raft");
             }
-            // Cache successful result
+            // Cache successful result ONLY after successful submit
             deduplicationCache.put(dedupKey, DeduplicationCache.CachedResult.success(new byte[0]));
             return createSuccessResponse(new byte[0]);
         } else {
@@ -185,9 +236,14 @@ public class MetadataHandler {
         }
     }
 
-    private ByteBuffer handleGetObject(byte[] payload) throws IOException {
+    private ByteBuffer handleGetObject(RequestContext ctx) throws IOException {
+        byte[] payload = ctx.innerPayload;
+        System.out.println("[DEBUG-GET_OBJECT] payload=" + new String(payload));
         Map<String, String> request = objectMapper.readValue(payload, Map.class);
         String objectName = request.get("objectName");
+        if (objectName == null) {
+            return createErrorResponse(MetadataProtocol.ERROR, "Missing objectName. Received requests keys: " + request.keySet());
+        }
 
         return store.getObject(objectName)
                 .map(meta -> {
@@ -201,20 +257,15 @@ public class MetadataHandler {
                 .orElseGet(() -> createErrorResponse(MetadataProtocol.NOT_FOUND, "Object not found"));
     }
 
-    private ByteBuffer handleUpdateObject(byte[] payload) throws IOException {
+    private ByteBuffer handleUpdateObject(RequestContext ctx) throws IOException {
+        byte[] payload = ctx.innerPayload;
+        String clientId = ctx.clientId;
+        String requestId = ctx.requestId;
         // Check if we're the leader (if Raft is enabled)
         if (raftNode != null && !raftNode.isLeader()) {
             return createNotLeaderResponse();
         }
-
-        // Parse request envelope to extract clientId and requestId
-        RequestEnvelope envelope = parseRequestEnvelope(payload);
-        String clientId = envelope != null ? envelope.clientId() : null;
-        String requestId = envelope != null ? envelope.requestId() : null;
-
-        // Parse the actual object metadata from the inner payload
-        byte[] innerPayload = envelope != null ? envelope.payload() : payload;
-        ObjectMetadata metadata = objectMapper.readValue(innerPayload, ObjectMetadata.class);
+        ObjectMetadata metadata = objectMapper.readValue(payload, ObjectMetadata.class);
 
         // Use clientId + requestId for true deduplication
         String dedupKey = getRequestDedupKey(clientId, requestId);
@@ -232,9 +283,10 @@ public class MetadataHandler {
             LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.UPDATE_OBJECT, data, clientId, requestId);
 
             if (!raftNode.submit(entry)) {
+                // Do NOT cache failure - allow retry to attempt again
                 return createErrorResponse(MetadataProtocol.ERROR, "Failed to submit to Raft");
             }
-            // Cache successful result
+            // Cache successful result ONLY after successful submit
             deduplicationCache.put(dedupKey, DeduplicationCache.CachedResult.success(new byte[0]));
             return createSuccessResponse(new byte[0]);
         } else {
@@ -246,20 +298,15 @@ public class MetadataHandler {
         }
     }
 
-    private ByteBuffer handleDeleteObject(byte[] payload) throws IOException {
+    private ByteBuffer handleDeleteObject(RequestContext ctx) throws IOException {
+        byte[] payload = ctx.innerPayload;
+        String clientId = ctx.clientId;
+        String requestId = ctx.requestId;
         // Check if we're the leader (if Raft is enabled)
         if (raftNode != null && !raftNode.isLeader()) {
             return createNotLeaderResponse();
         }
-
-        // Parse request envelope to extract clientId and requestId
-        RequestEnvelope envelope = parseRequestEnvelope(payload);
-        String clientId = envelope != null ? envelope.clientId() : null;
-        String requestId = envelope != null ? envelope.requestId() : null;
-
-        // Parse the actual object name from the inner payload
-        byte[] innerPayload = envelope != null ? envelope.payload() : payload;
-        Map<String, String> request = objectMapper.readValue(innerPayload, Map.class);
+        Map<String, String> request = objectMapper.readValue(payload, Map.class);
         String objectName = request.get("objectName");
 
         // Use clientId + requestId for true deduplication
@@ -277,9 +324,10 @@ public class MetadataHandler {
             LogEntry entry = LogEntry.create(raftNode.getCurrentTerm(), LogEntry.OpType.DELETE_OBJECT, objectName.getBytes(), clientId, requestId);
 
             if (!raftNode.submit(entry)) {
+                // Do NOT cache failure - allow retry to attempt again
                 return createErrorResponse(MetadataProtocol.ERROR, "Failed to submit to Raft");
             }
-            // Cache successful result
+            // Cache successful result ONLY after successful submit
             deduplicationCache.put(dedupKey, DeduplicationCache.CachedResult.success(new byte[0]));
             return createSuccessResponse(new byte[0]);
         } else {
@@ -297,7 +345,7 @@ public class MetadataHandler {
         }
     }
 
-    private ByteBuffer handleListObjects() throws IOException {
+    private ByteBuffer handleListObjects(RequestContext ctx) throws IOException {
         String[] objects = store.listObjects().toArray(new String[0]);
         byte[] data = objectMapper.writeValueAsBytes(objects);
         return createSuccessResponse(data);
@@ -305,13 +353,15 @@ public class MetadataHandler {
 
     // Node registry handlers
 
-    private ByteBuffer handleRegisterNode(byte[] payload) throws IOException {
+    private ByteBuffer handleRegisterNode(RequestContext ctx) throws IOException {
+        byte[] payload = ctx.innerPayload;
         NodeInfo nodeInfo = objectMapper.readValue(payload, NodeInfo.class);
         nodeRegistry.registerNode(nodeInfo.getNodeId(), nodeInfo.getHost(), nodeInfo.getPort());
         return createSuccessResponse(new byte[0]);
     }
 
-    private ByteBuffer handleHeartbeat(byte[] payload) throws IOException {
+    private ByteBuffer handleHeartbeat(RequestContext ctx) throws IOException {
+        byte[] payload = ctx.innerPayload;
         Map<String, String> request = objectMapper.readValue(payload, Map.class);
         String nodeId = request.get("nodeId");
 
@@ -323,17 +373,27 @@ public class MetadataHandler {
         }
     }
 
-    private ByteBuffer handleGetNodes() throws IOException {
+    private ByteBuffer handleGetNodes(RequestContext ctx) throws IOException {
         List<NodeInfo> healthyNodes = nodeRegistry.getHealthyNodes();
         byte[] data = objectMapper.writeValueAsBytes(healthyNodes);
         return createSuccessResponse(data);
     }
 
-    private ByteBuffer handleGetPlacement(byte[] payload) throws IOException {
-        Map<String, Integer> request = objectMapper.readValue(payload, Map.class);
-        Integer chunkIndex = request.get("chunkIndex");
+    private ByteBuffer handleGetPlacement(RequestContext ctx) throws IOException {
+        byte[] payload = ctx.innerPayload;
+        String payloadStr = new String(payload);
+        System.out.println("[DEBUG-GET_PLACEMENT] payload=" + payloadStr);
+        Map<String, Object> request = objectMapper.readValue(payload, Map.class); // Use Object to be safe
+        Object chunkIndexObj = request.get("chunkIndex");
+        System.out.println("[DEBUG-GET_PLACEMENT] chunkIndexObj=" + chunkIndexObj + " type=" + (chunkIndexObj != null ? chunkIndexObj.getClass().getName() : "null"));
+        Integer chunkIndex = null;
+        if (chunkIndexObj instanceof Number) {
+            chunkIndex = ((Number) chunkIndexObj).intValue();
+        } else if (chunkIndexObj instanceof String) {
+            chunkIndex = Integer.parseInt((String) chunkIndexObj);
+        }
         if (chunkIndex == null) {
-            return createErrorResponse(MetadataProtocol.ERROR, "Missing chunkIndex");
+            return createErrorResponse(MetadataProtocol.ERROR, "Missing chunkIndex. Received: " + request);
         }
 
         List<NodeInfo> selectedNodes = placementManager.selectNodes(chunkIndex);
@@ -341,7 +401,7 @@ public class MetadataHandler {
         return createSuccessResponse(data);
     }
 
-    private ByteBuffer handleGetClusterStatus() throws IOException {
+    private ByteBuffer handleGetClusterStatus(RequestContext ctx) throws IOException {
         Collection<NodeInfo> allNodes = nodeRegistry.getAllNodes();
 
         // Calculate replication stats
@@ -386,7 +446,7 @@ public class MetadataHandler {
         return createSuccessResponse(data);
     }
 
-    private ByteBuffer handleRepair() throws IOException {
+    private ByteBuffer handleRepair(RequestContext ctx) throws IOException {
         RepairManager.RepairResult result = repairManager.repairAll();
         byte[] data = objectMapper.writeValueAsBytes(result);
         return createSuccessResponse(data);
@@ -415,7 +475,7 @@ public class MetadataHandler {
 
         try {
             byte[] data = objectMapper.writeValueAsBytes(leaderInfo);
-            return createErrorResponse(MetadataProtocol.NOT_LEADER, objectMapper.writeValueAsString(leaderInfo));
+            return createErrorResponse(MetadataProtocol.NOT_LEADER, new String(data));
         } catch (IOException e) {
             return createErrorResponse(MetadataProtocol.NOT_LEADER, "{}");
         }
@@ -431,6 +491,7 @@ public class MetadataHandler {
     }
 
     private ByteBuffer createErrorResponse(byte status, String message) {
+        if (message == null) message = "Unknown error (null message)";
         byte[] msgBytes = message.getBytes();
         int size = 1 + MetadataProtocol.encodedSize(msgBytes);
         ByteBuffer buffer = ByteBuffer.allocate(4 + size);

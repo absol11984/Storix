@@ -1097,6 +1097,8 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
 
     private void waitForLeader(RaftNode node, long timeoutMs) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;
+        // Allow single-node election to start before polling
+        Thread.sleep(150);
         while (!node.isLeader() && System.currentTimeMillis() < deadline) {
             Thread.sleep(50);
         }

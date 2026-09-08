@@ -1041,6 +1041,9 @@ class InstallSnapshotPersistenceTest {
      */
     private void waitForLeader(RaftNode node, long timeoutMs) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;
+        // Brief initial delay allows single-node becomeLeader() to complete,
+        // preventing premature timeout when election is in progress.
+        Thread.sleep(150);
         while (!node.isLeader() && System.currentTimeMillis() < deadline) {
             Thread.sleep(50);
         }

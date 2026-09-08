@@ -65,6 +65,8 @@ public class RaftNode implements AutoCloseable {
     // Threading
     private ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private ExecutorService rpcExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    private final Object lifecycleLock = new Object();
+    private final Set<SocketChannel> activeRpcChannels = ConcurrentHashMap.newKeySet();
     private volatile boolean running = false;
 
     // Election
@@ -79,8 +81,18 @@ public class RaftNode implements AutoCloseable {
     // Vote tracking - thread-safe set of voters who granted us their vote this term
     private final Set<String> votesReceived = ConcurrentHashMap.newKeySet();
 
-    // Log index counter
-    private AtomicLong logIndexCounter = new AtomicLong(1);
+    // Log index counter. Reservation is serialized with logIndexLock so a
+    // concurrent submit cannot observe the same absolute index.
+    private final AtomicLong logIndexCounter = new AtomicLong(1);
+    private final Object logIndexLock = new Object();
+
+    // State-machine application is ordered and has one owner at a time. A
+    // failed committed entry blocks application until restart/operator
+    // intervention; it is never silently skipped or retried in a hot loop.
+    private final Object applyLock = new Object();
+    private volatile ApplyFailure terminalApplyFailure;
+
+    public record ApplyFailure(long index, LogEntry entry, Throwable cause) {}
 
     // RPC port for peer communication
     private ServerSocketChannel rpcServer;
@@ -184,11 +196,11 @@ public class RaftNode implements AutoCloseable {
         // Track that this term has already been persisted to WAL
         this.persistedTerm = recoveredTerm;
 
-        // Restore logIndexCounter to highest index + 1
-        // Use getHighestIndex() to get the absolute highest index ever assigned
-        // This is critical for correctly assigning new entry indexes after recovery
+        // Restore the allocator from the recovered absolute log boundary.
+        // The field itself is final; all subsequent boundary reconciliation is
+        // serialized by logIndexLock.
         long highestIndex = raftLog.getHighestIndex();
-        this.logIndexCounter = new AtomicLong(highestIndex + 1);
+        this.logIndexCounter.set(highestIndex + 1);
 
         // Initialize nextIndex for all peers based on current log state
         for (RaftPeer peer : peers) {
@@ -276,42 +288,58 @@ public class RaftNode implements AutoCloseable {
     }
 
     public void start() throws IOException {
-        if (running) {
-            return; // Already started
-        }
-        running = true;
+        synchronized (lifecycleLock) {
+            if (running) {
+                return; // Already started
+            }
 
-        // Re-create executors if they were shut down (from previous stop())
-        if (rpcExecutor.isShutdown()) {
-            rpcExecutor = Executors.newVirtualThreadPerTaskExecutor();
-        }
-        if (scheduler.isShutdown()) {
-            scheduler = Executors.newSingleThreadScheduledExecutor();
-        }
+            // Re-create executors if they were shut down (from previous stop()).
+            if (rpcExecutor.isShutdown()) {
+                rpcExecutor = Executors.newVirtualThreadPerTaskExecutor();
+            }
+            if (scheduler.isShutdown()) {
+                scheduler = Executors.newSingleThreadScheduledExecutor();
+            }
 
-        // If this is a restart (state was LEADER), reset to FOLLOWER.
-        // The node must re-join the cluster as a follower; it cannot assume
-        // it is still the leader without going through election again.
-        if (state == RaftState.LEADER) {
-            state = RaftState.FOLLOWER;
-            leaderId = null;
-            System.out.println("[RAFT] Node " + nodeId + " reset to FOLLOWER on restart");
-        }
+            running = true;
+            try {
+                // If this is a restart (state was LEADER), reset to FOLLOWER.
+                // The node must re-join the cluster as a follower; it cannot assume
+                // it is still the leader without going through election again.
+                if (state == RaftState.LEADER) {
+                    state = RaftState.FOLLOWER;
+                    leaderId = null;
+                    System.out.println("[RAFT] Node " + nodeId + " reset to FOLLOWER on restart");
+                }
 
-        // Start RPC server for peer communication (skip if already bound)
-        if (rpcServer == null || !rpcServer.isOpen()) {
-            startRpcServer();
-        }
+                // Start RPC server for peer communication (skip if already bound).
+                if (rpcServer == null || !rpcServer.isOpen()) {
+                    startRpcServer();
+                }
 
-        // Start election timeout checker
-        startElectionTimeoutLoop();
+                // Start election timeout checker.
+                startElectionTimeoutLoop();
 
-        // Start applying committed entries to state machine
-        startApplyLoop();
+                // Single-node clusters apply entries synchronously inside submit().
+                // Starting the background apply loop can race with the submit path
+                // and re-apply the same committed entry, causing state-machine
+                // conflicts (e.g., "Object already exists").
+                if (!singleNode && !peers.isEmpty()) {
+                    startApplyLoop();
+                }
 
-        // If single node, become leader immediately
-        if (singleNode) {
-            becomeLeader();
+                // If single node, become leader immediately.
+                if (singleNode) {
+                    becomeLeader();
+                }
+            } catch (IOException | RuntimeException e) {
+                running = false;
+                rpcServerReady = false;
+                closeRpcResources();
+                scheduler.shutdownNow();
+                rpcExecutor.shutdownNow();
+                throw e;
+            }
         }
     }
 
@@ -337,27 +365,77 @@ public class RaftNode implements AutoCloseable {
     }
 
     public void stop() {
-        running = false;
-        rpcServerReady = false;
-        // When a node stops, it must not appear to be a leader.
-        // Reset to FOLLOWER so that any observer checking isLeader()
-        // (which checks only state in the base implementation) sees a non-leader.
-        state = RaftState.FOLLOWER;
-        leaderId = null;
-        scheduler.shutdownNow();
-        try {
-            scheduler.awaitTermination(500, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException ignored) {}
-        rpcExecutor.shutdownNow();
-        try {
-            rpcExecutor.awaitTermination(500, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException ignored) {}
-        if (rpcServer != null && rpcServer.isOpen()) {
-            try {
-                rpcServer.close();
-            } catch (IOException ignored) {}
+        synchronized (lifecycleLock) {
+            // Stop admission before closing resources so scheduled callbacks and
+            // RPC handlers cannot create more work while shutdown is in progress.
+            running = false;
+            rpcServerReady = false;
+            state = RaftState.FOLLOWER;
+            leaderId = null;
+
+            for (CompletableFuture<Boolean> future : pendingCommits.values()) {
+                future.complete(false);
+            }
+            pendingCommits.clear();
+
+            // Closing the listener first wakes the non-blocking accept loop. Close
+            // every accepted/outgoing channel as well so handlers blocked in I/O
+            // cannot keep the executor alive.
+            closeRpcResources();
+
+            scheduler.shutdownNow();
+            rpcExecutor.shutdownNow();
+            awaitTermination(scheduler, "scheduler");
+            awaitTermination(rpcExecutor, "RPC executor");
+
+            // Persist the final term/vote after all background writers have stopped.
+            saveState();
         }
-        saveState();
+    }
+
+    private void closeRpcResources() {
+        ServerSocketChannel server = rpcServer;
+        rpcServer = null;
+        if (server != null && server.isOpen()) {
+            try {
+                server.close();
+            } catch (IOException ignored) {
+                // Shutdown is best effort; the channel is no longer usable.
+            }
+        }
+
+        for (SocketChannel channel : activeRpcChannels) {
+            try {
+                channel.close();
+            } catch (IOException ignored) {
+                // The handler will observe the close and exit.
+            }
+        }
+        activeRpcChannels.clear();
+    }
+
+    private void awaitTermination(ExecutorService executor, String name) {
+        boolean interrupted = false;
+        try {
+            while (!executor.isTerminated()) {
+                try {
+                    if (executor.awaitTermination(2, TimeUnit.SECONDS)) {
+                        break;
+                    }
+                    executor.shutdownNow();
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                    executor.shutdownNow();
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (!executor.isTerminated()) {
+            System.err.println("[RAFT] " + nodeId + " " + name + " did not terminate");
+        }
     }
 
     @Override
@@ -366,26 +444,77 @@ public class RaftNode implements AutoCloseable {
     }
 
     /**
+     * Reconciles the next-index allocator with the absolute boundary currently
+     * known by the log. This is intentionally synchronized with reservation:
+     * follower replication, leader promotion, and concurrent submissions must
+     * not be able to observe or reserve the same absolute index.
+     */
+    private void synchronizeLogIndexCounter() {
+        synchronized (logIndexLock) {
+            // The log boundary is authoritative.  In particular, conflict
+            // resolution may remove an uncommitted suffix, so retaining a
+            // previously larger counter would skip valid absolute indexes.
+            logIndexCounter.set(raftLog.getHighestIndex() + 1);
+        }
+    }
+
+    /**
+     * Reserves an unused absolute index and appends its entry while holding the
+     * same lock. Keeping reservation and append together prevents concurrent
+     * submissions from leaving the in-memory log out of order.
+     */
+    private LogEntry reserveAndAppend(LogEntry entry) {
+        synchronized (logIndexLock) {
+            long index = Math.max(logIndexCounter.get(), raftLog.getHighestIndex() + 1);
+            // The boundary should already make this loop unnecessary. Keep the
+            // explicit check so malformed/recovered state cannot duplicate an
+            // absolute index even if its cached boundary is stale.
+            while (raftLog.getEntry(index) != null) {
+                index++;
+            }
+
+            LogEntry indexedEntry = entry.withIndex(index);
+            try {
+                raftLog.append(indexedEntry);
+                logIndexCounter.set(index + 1);
+                return indexedEntry;
+            } catch (RuntimeException failure) {
+                // No other reservation can run while this lock is held. Roll
+                // back only our reservation so a failed WAL append does not
+                // create a permanent allocator gap.
+                logIndexCounter.compareAndSet(index + 1, index);
+                throw failure;
+            }
+        }
+    }
+
+    /**
      * Submits an entry for replication through Raft.
      * Only valid when this node is the leader.
      * Waits for majority commit before returning success.
      */
     public boolean submit(LogEntry entry) {
-        if (state != RaftState.LEADER) {
+        if (state != RaftState.LEADER || entry == null || terminalApplyFailure != null) {
             return false;
         }
 
-        // Assign index and term
-        long index = logIndexCounter.getAndIncrement();
-        LogEntry indexedEntry = entry.withIndex(index);
+        // Re-read the actual log boundary and append under one reservation lock.
+        LogEntry indexedEntry;
+        try {
+            indexedEntry = reserveAndAppend(entry);
+        } catch (RuntimeException e) {
+            System.err.println("[RAFT] Submit append failed: " + e.getMessage());
+            return false;
+        }
+        long index = indexedEntry.index();
 
         // Create future for commit acknowledgement
         CompletableFuture<Boolean> commitFuture = new CompletableFuture<>();
         pendingCommits.put(index, commitFuture);
 
         try {
-            // Append to local log (writes to WAL)
-            raftLog.append(indexedEntry);
+            // The entry was durably appended by reserveAndAppend() before its
+            // commit future was published. Do not append it a second time.
 
             // For single-node clusters, immediately commit the entry
             // (no followers to replicate to, so we commit locally)
@@ -399,15 +528,37 @@ public class RaftNode implements AutoCloseable {
                 // Apply to state machine SYNCHRONOUSLY for single-node
                 // (avoids issues with async scheduler not running)
                 if (stateMachineApplier != null) {
-                    try {
-                        stateMachineApplier.accept(indexedEntry);
-                        raftLog.advanceLastApplied();
-                    } catch (Exception e) {
-                        System.err.println("[RAFT] Failed to apply entry: " + e.getMessage());
+                    synchronized (applyLock) {
+                        if (terminalApplyFailure != null) {
+                            commitFuture.complete(false);
+                            return false;
+                        }
+                        try {
+                            stateMachineApplier.accept(indexedEntry);
+                            raftLog.advanceLastAppliedTo(indexedEntry.index());
+                            // Complete the future immediately on success
+                            commitFuture.complete(true);
+                        } catch (Exception e) {
+                            terminalApplyFailure = new ApplyFailure(indexedEntry.index(), indexedEntry, e);
+                            System.err.println("[RAFT] Terminal apply failure (submit path) index=" + indexedEntry.index()
+                                + ", term=" + indexedEntry.term()
+                                + ", opType=" + indexedEntry.opType()
+                                + ", clientId=" + indexedEntry.clientId()
+                                + ", requestId=" + indexedEntry.requestId()
+                                + ", exceptionClass=" + e.getClass().getName()
+                                + ", message=" + e.getMessage()
+                                + ", cause=" + (e.getCause() != null ? e.getCause().toString() : "none")
+                                + "; application halted until restart/operator recovery");
+                            e.printStackTrace();
+                            // CRITICAL: fail the commit future so submit() returns false
+                            commitFuture.complete(false);
+                            return false;
+                        }
                     }
+                } else {
+                    // No applier: just mark committed
+                    commitFuture.complete(true);
                 }
-                // Complete the future immediately
-                commitFuture.complete(true);
                 return true;
             }
 
@@ -443,6 +594,30 @@ public class RaftNode implements AutoCloseable {
      */
     public void setLogEntryApplier(Consumer<LogEntry> applier) {
         this.stateMachineApplier = applier;
+    }
+
+    /**
+     * Returns the next absolute index that a submission would reserve after
+     * reconciling the allocator with the current log boundary.
+     */
+    public long getNextLogIndex() {
+        synchronized (logIndexLock) {
+            return Math.max(logIndexCounter.get(), raftLog.getHighestIndex() + 1);
+        }
+    }
+
+    /**
+     * Returns the leader replication cursor for a peer.
+     */
+    public long getNextIndex(String peerId) {
+        return nextIndex.getOrDefault(peerId, 1L);
+    }
+
+    /**
+     * Returns the highest index known replicated on a peer.
+     */
+    public long getMatchIndex(String peerId) {
+        return matchIndex.getOrDefault(peerId, 0L);
     }
 
     /**
@@ -482,6 +657,9 @@ public class RaftNode implements AutoCloseable {
     // ===== Election and State Transitions =====
 
     private void startElectionTimeoutLoop() {
+        if (!running || scheduler.isShutdown()) {
+            return;
+        }
         // Initialize election deadline when starting
         resetElectionDeadline();
 
@@ -568,9 +746,19 @@ public class RaftNode implements AutoCloseable {
                 sendRequestVote(peer, lastLogIndex, lastLogTerm);
             }
 
-            // For single node, immediately become leader
-            if (singleNode) {
+            // For single-node cluster, become leader immediately (self-vote sufficient)
+            if (singleNode || peers.isEmpty()) {
                 becomeLeader();
+            }
+            // For multi-node: only become leader if we have enough votes for majority
+            else {
+                int votes = countVotes();
+                int majority = calculateMajority();
+                System.out.println("[RAFT] Node " + nodeId + " votes=" + votes + "/" + majority +
+                    " after sending requests; peers=" + peers.size());
+                if (votes >= majority) {
+                    becomeLeader();
+                }
             }
         } finally {
             electionLock.unlock();
@@ -578,8 +766,15 @@ public class RaftNode implements AutoCloseable {
     }
 
     private void becomeLeader() {
+        if (!running) {
+            return;
+        }
         state = RaftState.LEADER;
         leaderId = nodeId;
+
+        // A follower may have received entries before becoming leader. Reconcile
+        // the allocator before accepting any client submission.
+        synchronizeLogIndexCounter();
 
         // Reset nextIndex and matchIndex for all peers
         long lastIndex = raftLog.getLastLogIndex();
@@ -746,15 +941,26 @@ public class RaftNode implements AutoCloseable {
             // If prevLogIndex < logStartIndex, it's in the snapshot range - considered a match
         }
 
-        // Append new entries (this handles conflicts by overwriting)
+        // Append new entries (this handles conflicts by overwriting). The
+        // allocator is reconciled only after appendEntries returns normally;
+        // rejected/gap batches must not move it forward.
         if (entries != null && !entries.isEmpty()) {
             try {
-                raftLog.appendEntries(prevLogIndex, prevLogTerm, entries);
-            } catch (UncheckedIOException e) {
+                boolean appended = raftLog.appendEntries(prevLogIndex, prevLogTerm, entries);
+                if (!appended) {
+                    return new RaftMessage.AppendEntriesResponse(currentTerm, false, 0);
+                }
+            } catch (UncheckedIOException | IllegalArgumentException e) {
                 System.err.println("[RAFT] Failed to append entries to WAL: " + e.getMessage());
                 return new RaftMessage.AppendEntriesResponse(currentTerm, false, 0);
             }
         }
+
+        // A successful heartbeat is also a successful AppendEntries RPC.  Keep
+        // the allocator reconciled even when the batch is empty, so a follower
+        // that learned its boundary through an earlier recovery/compaction
+        // cannot later reserve an already-used absolute index after promotion.
+        synchronizeLogIndexCounter();
 
         // Update commit index
         if (leaderCommit > raftLog.getCommitIndex()) {
@@ -1040,7 +1246,7 @@ public class RaftNode implements AutoCloseable {
                 if (pendingSnapshotIndex > raftLog.getCommitIndex()) {
                     raftLog.advanceCommitIndex(pendingSnapshotIndex);
                 }
-                raftLog.advanceLastApplied();
+                raftLog.advanceLastAppliedTo(pendingSnapshotIndex);
 
                 // ===== PHASE 5: COMPACT WAL (best effort, non-fatal) =====
                 // WAL compaction is a performance optimization, not a correctness requirement
@@ -1148,105 +1354,114 @@ public class RaftNode implements AutoCloseable {
     // ===== RPC Senders =====
 
     private void sendRequestVote(RaftPeer peer, long lastLogIndex, long lastLogTerm) {
-        rpcExecutor.submit(() -> {
-            try {
-                RaftMessage.RequestVote request = new RaftMessage.RequestVote(
-                        currentTerm, nodeId, lastLogIndex, lastLogTerm);
+        if (!running || rpcExecutor.isShutdown()) {
+            return;
+        }
+        try {
+            rpcExecutor.submit(() -> {
+                try {
+                    RaftMessage.RequestVote request = new RaftMessage.RequestVote(
+                            currentTerm, nodeId, lastLogIndex, lastLogTerm);
 
-                RaftMessage.RequestVoteResponse response = sendRpc(peer, request);
+                    RaftMessage.RequestVoteResponse response = sendRpc(peer, request);
+                    if (response == null) {
+                        return;
+                    }
 
-                if (response == null) {
-                    return;
-                }
-
-                // Update term if needed
-                if (response.term() > currentTerm) {
-                    currentTerm = response.term();
-                    state = RaftState.FOLLOWER;
-                    votedFor = null;
-                    votesReceived.clear();
-                    // CRITICAL: new term must be durable before we act as follower.
-                    try {
-                        saveStateOrThrow();
-                    } catch (IOException e) {
-                        System.err.println("[RAFT] Node " + nodeId + " failed to persist higher term " +
-                            response.term() + " from vote response: " + e.getMessage());
-                        // Rollback to candidate state — can't safely be follower without persistence.
-                        // The election loop will retry in the next term.
-                        state = RaftState.CANDIDATE;
-                        currentTerm = response.term() - 1; // revert to old term
+                    // Update term if needed
+                    if (response.term() > currentTerm) {
+                        currentTerm = response.term();
+                        state = RaftState.FOLLOWER;
+                        votedFor = null;
                         votesReceived.clear();
+                        // CRITICAL: new term must be durable before we act as follower.
+                        try {
+                            saveStateOrThrow();
+                        } catch (IOException e) {
+                            System.err.println("[RAFT] Node " + nodeId + " failed to persist higher term " +
+                                response.term() + " from vote response: " + e.getMessage());
+                            state = RaftState.CANDIDATE;
+                            currentTerm = response.term() - 1;
+                            votesReceived.clear();
+                        }
+                        return;
                     }
-                    return;
-                }
 
-                // Only process vote if we're still a candidate in the same term
-                if (state == RaftState.CANDIDATE && response.term() == currentTerm && response.voteGranted()) {
-                    // Record the vote
-                    votesReceived.add(peer.nodeId());
-                    int votes = countVotes();
-                    int majority = calculateMajority();
+                    // Only process vote if we're still a candidate in the same term
+                    if (state == RaftState.CANDIDATE && response.term() == currentTerm && response.voteGranted()) {
+                        votesReceived.add(peer.nodeId());
+                        int votes = countVotes();
+                        int majority = calculateMajority();
 
-                    System.out.println("[RAFT] Node " + nodeId + " received vote from " + peer.nodeId() +
-                            " (votes=" + votes + "/" + majority + ")");
+                        System.out.println("[RAFT] Node " + nodeId + " received vote from " + peer.nodeId() +
+                                " (votes=" + votes + "/" + majority + ")");
 
-                    if (votes >= majority) {
-                        System.out.println("[RAFT] Node " + nodeId + " has majority! Becoming leader.");
-                        becomeLeader();
-                    } else {
-                        System.out.println("[RAFT] Node " + nodeId + " still waiting for more votes.");
+                        if (votes >= majority) {
+                            System.out.println("[RAFT] Node " + nodeId + " has majority! Becoming leader.");
+                            becomeLeader();
+                        } else {
+                            System.out.println("[RAFT] Node " + nodeId + " still waiting for more votes.");
+                        }
+                    }
+                } catch (Exception e) {
+                    if (running) {
+                        System.err.println("[RAFT] RequestVote to " + peer + " failed: " + e.getMessage());
                     }
                 }
-            } catch (Exception e) {
-                System.err.println("[RAFT] RequestVote to " + peer + " failed: " + e.getMessage());
-                e.printStackTrace();
-            }
-        });
+            });
+        } catch (RejectedExecutionException ignored) {
+            // Shutdown raced with election work submission.
+        }
     }
 
     private void sendAppendEntries(RaftPeer peer) {
-        rpcExecutor.submit(() -> {
-            try {
-                long prevLogIndex = nextIndex.getOrDefault(peer.nodeId(), 1L) - 1;
-                long prevLogTerm = prevLogIndex > 0 ? raftLog.getTermAt(prevLogIndex) : 0;
+        if (!running || rpcExecutor.isShutdown()) {
+            return;
+        }
+        try {
+            rpcExecutor.submit(() -> {
+                try {
+                    long prevLogIndex = nextIndex.getOrDefault(peer.nodeId(), 1L) - 1;
+                    long prevLogTerm = prevLogIndex > 0 ? raftLog.getTermAt(prevLogIndex) : 0;
+                    List<LogEntry> entries = raftLog.getEntriesFrom(nextIndex.get(peer.nodeId()));
 
-                List<LogEntry> entries = raftLog.getEntriesFrom(nextIndex.get(peer.nodeId()));
+                    RaftMessage.AppendEntries request = new RaftMessage.AppendEntries(
+                            currentTerm, nodeId, prevLogIndex, prevLogTerm, entries, raftLog.getCommitIndex());
+                    RaftMessage.AppendEntriesResponse response = sendRpc(peer, request);
+                    if (response == null) {
+                        return;
+                    }
 
-                RaftMessage.AppendEntries request = new RaftMessage.AppendEntries(
-                        currentTerm, nodeId, prevLogIndex, prevLogTerm, entries, raftLog.getCommitIndex());
+                    if (response.term() > currentTerm) {
+                        currentTerm = response.term();
+                        state = RaftState.FOLLOWER;
+                        votedFor = null;
+                        saveState();
+                        return;
+                    }
 
-                RaftMessage.AppendEntriesResponse response = sendRpc(peer, request);
-
-                if (response == null) {
-                    return;
+                    if (response.success()) {
+                        long lastEntryIndex = entries.isEmpty() ? prevLogIndex :
+                                entries.get(entries.size() - 1).index();
+                        nextIndex.put(peer.nodeId(), lastEntryIndex + 1);
+                        matchIndex.put(peer.nodeId(), lastEntryIndex);
+                        System.out.println("[RAFT] " + nodeId + " updated matchIndex[" + peer.nodeId() + "]=" + lastEntryIndex +
+                            " (entries=" + entries.size() + ", prevLogIndex=" + prevLogIndex + ")");
+                        updateCommitIndex();
+                    } else {
+                        nextIndex.computeIfPresent(peer.nodeId(), (k, v) -> Math.max(1, v - 1));
+                        System.out.println("[RAFT] " + nodeId + " AppendEntries rejected by " + peer.nodeId() +
+                            ", decrementing nextIndex to " + nextIndex.get(peer.nodeId()));
+                    }
+                } catch (Exception e) {
+                    if (running) {
+                        System.err.println("[RAFT] AppendEntries to " + peer + " failed: " + e.getMessage());
+                    }
                 }
-
-                // Update term if needed
-                if (response.term() > currentTerm) {
-                    currentTerm = response.term();
-                    state = RaftState.FOLLOWER;
-                    votedFor = null;
-                    saveState();
-                    return;
-                }
-
-                if (response.success()) {
-                    // Update nextIndex and matchIndex
-                    long lastEntryIndex = entries.isEmpty() ? prevLogIndex :
-                            entries.get(entries.size() - 1).index();
-                    nextIndex.put(peer.nodeId(), lastEntryIndex + 1);
-                    matchIndex.put(peer.nodeId(), lastEntryIndex);
-
-                    // Check if we can advance commit index
-                    updateCommitIndex();
-                } else {
-                    // Decrement nextIndex and retry
-                    nextIndex.computeIfPresent(peer.nodeId(), (k, v) -> Math.max(1, v - 1));
-                }
-            } catch (Exception e) {
-                System.err.println("[RAFT] AppendEntries to " + peer + " failed: " + e.getMessage());
-            }
-        });
+            });
+        } catch (RejectedExecutionException ignored) {
+            // Shutdown raced with heartbeat work submission.
+        }
     }
 
     private int countVotes() {
@@ -1269,12 +1484,13 @@ public class RaftNode implements AutoCloseable {
      * Uses GenerationManager as the authoritative source for snapshot data.
      */
     private void sendInstallSnapshot(RaftPeer peer) {
-        if (generationManager == null) {
+        if (generationManager == null || !running || rpcExecutor.isShutdown()) {
             return;
         }
 
-        rpcExecutor.submit(() -> {
-            try {
+        try {
+            rpcExecutor.submit(() -> {
+                try {
                 // Get snapshot from GenerationManager (authoritative source)
                 GenerationManager.GenerationState genState = generationManager.loadAuthoritativeState();
                 if (genState == null) {
@@ -1319,13 +1535,21 @@ public class RaftNode implements AutoCloseable {
                 nextIndex.put(peer.nodeId(), lastIncludedIndex + 1);
                 matchIndex.put(peer.nodeId(), lastIncludedIndex);
 
-            } catch (Exception e) {
-                System.err.println("[RAFT] InstallSnapshot to " + peer + " failed: " + e.getMessage());
-            }
-        });
+                } catch (Exception e) {
+                    if (running) {
+                        System.err.println("[RAFT] InstallSnapshot to " + peer + " failed: " + e.getMessage());
+                    }
+                }
+            });
+        } catch (RejectedExecutionException ignored) {
+            // Shutdown raced with snapshot work submission.
+        }
     }
 
     private void startHeartbeatLoop() {
+        if (!running || scheduler.isShutdown()) {
+            return;
+        }
         scheduler.scheduleAtFixedRate(() -> {
             if (!running || state != RaftState.LEADER) {
                 return;
@@ -1341,6 +1565,9 @@ public class RaftNode implements AutoCloseable {
      * Starts a loop that applies committed entries to the state machine.
      */
     private void startApplyLoop() {
+        if (!running || scheduler.isShutdown()) {
+            return;
+        }
         scheduler.scheduleWithFixedDelay(() -> {
             if (!running) {
                 return;
@@ -1353,37 +1580,53 @@ public class RaftNode implements AutoCloseable {
      * Applies committed entries to the state machine if one is set.
      */
     public void applyCommittedEntries() {
-        if (stateMachineApplier == null) {
+        if (stateMachineApplier == null || terminalApplyFailure != null) {
             return;
         }
 
-        List<LogEntry> toApply = raftLog.getEntriesToApply();
-        for (LogEntry entry : toApply) {
-            boolean appliedSuccessfully = false;
-            try {
-                stateMachineApplier.accept(entry);
-                appliedSuccessfully = true;
-            } catch (Exception e) {
-                System.err.println("[RAFT] Failed to apply entry " + entry.index() + ": " + e.getMessage());
-                // Do NOT advance lastApplied when application fails.
-                // The entry will be retried on the next apply loop cycle.
-                // This prevents skipping uncommitted/failed entries and ensures
-                // exactly-once state machine semantics are preserved.
+        synchronized (applyLock) {
+            if (terminalApplyFailure != null) {
+                return;
             }
-            // Only advance lastApplied if application succeeded.
-            // Failed applications will be retried.
-            if (appliedSuccessfully) {
-                raftLog.advanceLastApplied();
+
+            // Re-fetch entries to apply INSIDE the lock, so we see entries whose
+            // lastApplied was advanced by the single-node submit path running
+            // concurrently.
+            List<LogEntry> toApply = raftLog.getEntriesToApply();
+            for (LogEntry entry : toApply) {
+                try {
+                    stateMachineApplier.accept(entry);
+                    // Advance exactly one position only after successful apply.
+                    raftLog.advanceLastAppliedTo(entry.index());
+                } catch (Exception e) {
+                    terminalApplyFailure = new ApplyFailure(entry.index(), entry, e);
+                    System.err.println("[RAFT] Terminal apply failure at index=" + entry.index()
+                        + ", term=" + entry.term()
+                        + ", opType=" + entry.opType()
+                        + ", clientId=" + entry.clientId()
+                        + ", requestId=" + entry.requestId()
+                        + ", exceptionClass=" + e.getClass().getName()
+                        + ", message=" + e.getMessage()
+                        + ", cause=" + (e.getCause() != null ? e.getCause().toString() : "none")
+                        + "; application halted until restart/operator recovery");
+                    e.printStackTrace();
+                    // Do not advance lastApplied and do not retry in a hot loop.
+                    return;
+                }
             }
-        }
 
-        // Persist commit index periodically after applying entries
-        if (wal != null && !toApply.isEmpty()) {
-            persistCommitIndex();
+            if (wal != null && !toApply.isEmpty()) {
+                persistCommitIndex();
+            }
+            maybeCompactLog();
         }
+    }
 
-        // Check if log compaction is needed
-        maybeCompactLog();
+    /**
+     * Returns the committed application failure, if one halted this node.
+     */
+    public Optional<ApplyFailure> getTerminalApplyFailure() {
+        return Optional.ofNullable(terminalApplyFailure);
     }
 
     // Maximum log size before compaction (configurable)
@@ -1495,27 +1738,41 @@ public class RaftNode implements AutoCloseable {
 
     private void updateCommitIndex() {
         int majority = calculateMajority();
+        long oldCommitIndex = raftLog.getCommitIndex();
+        long lastLogIndex = raftLog.getLastLogIndex();
 
-        for (long index = raftLog.getCommitIndex() + 1; index <= raftLog.getLastLogIndex(); index++) {
-            if (raftLog.getEntry(index).term() != currentTerm) {
+        for (long index = oldCommitIndex + 1; index <= lastLogIndex; index++) {
+            LogEntry entry = raftLog.getEntry(index);
+            if (entry == null) {
+                // A malformed gap cannot be committed or applied out of order.
+                continue;
+            }
+            if (entry.term() != currentTerm) {
                 // Only commit entries from current term
                 continue;
             }
 
             int replicationCount = 1; // Self
-            for (long mi : matchIndex.values()) {
-                if (mi >= index) {
+            for (Map.Entry<String, Long> e : matchIndex.entrySet()) {
+                if (e.getValue() >= index) {
                     replicationCount++;
                 }
             }
 
+            System.out.println("[RAFT] " + nodeId + " checking commit for index=" + index +
+                " term=" + entry.term() + " currentTerm=" + currentTerm +
+                " replicationCount=" + replicationCount + "/" + majority +
+                " matchIndex=" + matchIndex);
+
             if (replicationCount >= majority) {
                 raftLog.advanceCommitIndex(index);
+                System.out.println("[RAFT] " + nodeId + " committed index " + index);
 
                 // Complete any pending commit futures
                 CompletableFuture<Boolean> future = pendingCommits.get(index);
                 if (future != null) {
                     future.complete(true);
+                    System.out.println("[RAFT] " + nodeId + " completed commit future for index " + index);
                 }
             }
         }
@@ -1524,31 +1781,47 @@ public class RaftNode implements AutoCloseable {
     // ===== RPC Transport =====
 
     private void startRpcServer() throws IOException {
-        rpcServer = ServerSocketChannel.open();
-        rpcServer.setOption(java.net.StandardSocketOptions.SO_REUSEADDR, true);
-        rpcServer.bind(new InetSocketAddress(port));
-        rpcServer.configureBlocking(false);
+        ServerSocketChannel server = ServerSocketChannel.open();
+        try {
+            server.setOption(java.net.StandardSocketOptions.SO_REUSEADDR, true);
+            server.bind(new InetSocketAddress(port));
+            server.configureBlocking(false);
+            rpcServer = server;
+            // Mark RPC server as ready BEFORE submitting the accept loop.
+            // This ensures startRpcServer() doesn't return until the port is bound,
+            // preventing race conditions where the election timeout fires before the
+            // server can accept connections.
+            rpcServerReady = true;
 
-        // Mark RPC server as ready BEFORE submitting the accept loop.
-        // This ensures startRpcServer() doesn't return until the port is bound,
-        // preventing race conditions where the election timeout fires before the
-        // server can accept connections.
-        rpcServerReady = true;
-
-        rpcExecutor.submit(() -> {
-            while (running) {
-                try {
-                    SocketChannel client = rpcServer.accept();
-                    if (client != null) {
-                        rpcExecutor.submit(() -> handleRpc(client));
-                    }
-                } catch (IOException e) {
-                    if (running) {
-                        System.err.println("[RAFT] RPC server error: " + e.getMessage());
+            rpcExecutor.submit(() -> {
+                while (running && server.isOpen()) {
+                    try {
+                        SocketChannel client = server.accept();
+                        if (client != null) {
+                            activeRpcChannels.add(client);
+                            try {
+                                rpcExecutor.submit(() -> handleRpc(client));
+                            } catch (RejectedExecutionException e) {
+                                activeRpcChannels.remove(client);
+                                try {
+                                    client.close();
+                                } catch (IOException ignored) {}
+                            }
+                        }
+                    } catch (IOException e) {
+                        if (running) {
+                            System.err.println("[RAFT] RPC server error: " + e.getMessage());
+                        }
                     }
                 }
-            }
-        });
+            });
+        } catch (IOException | RuntimeException e) {
+            rpcServerReady = false;
+            try {
+                server.close();
+            } catch (IOException ignored) {}
+            throw e;
+        }
 
         System.out.println("[RAFT] RPC server listening on port " + port);
     }
@@ -1569,7 +1842,11 @@ public class RaftNode implements AutoCloseable {
                 case 3 -> handleInstallSnapshotRpc(channel);
             }
         } catch (IOException e) {
-            System.err.println("[RAFT] RPC handler error: " + e.getMessage());
+            if (running) {
+                System.err.println("[RAFT] RPC handler error: " + e.getMessage());
+            }
+        } finally {
+            activeRpcChannels.remove(channel);
         }
     }
 
@@ -1668,12 +1945,19 @@ public class RaftNode implements AutoCloseable {
         byte opTypeCode = buf.get();
 
         byte[] data = readLengthPrefixedBytes(channel);
+        String clientId = readLengthPrefixedString(channel);
+        String requestId = readLengthPrefixedString(channel);
+        // Treat empty strings as null for backward compatibility with legacy entries
+        clientId = clientId.isEmpty() ? null : clientId;
+        requestId = requestId.isEmpty() ? null : requestId;
 
-        return new LogEntry(term, index, timestamp, LogEntry.OpType.fromCode(opTypeCode), data, null, null);
+        return new LogEntry(term, index, timestamp, LogEntry.OpType.fromCode(opTypeCode), data, clientId, requestId);
     }
 
     private <T> T sendRpc(RaftPeer peer, RaftMessage message) throws IOException {
-        try (SocketChannel channel = SocketChannel.open(new InetSocketAddress(peer.host(), peer.port()))) {
+        SocketChannel channel = SocketChannel.open(new InetSocketAddress(peer.host(), peer.port()));
+        activeRpcChannels.add(channel);
+        try (channel) {
             if (message instanceof RaftMessage.RequestVote rv) {
                 return (T) sendRequestVoteRpc(channel, rv);
             } else if (message instanceof RaftMessage.AppendEntries ae) {
@@ -1682,6 +1966,8 @@ public class RaftNode implements AutoCloseable {
                 return (T) sendInstallSnapshotRpc(channel, is);
             }
             return null;
+        } finally {
+            activeRpcChannels.remove(channel);
         }
     }
 
@@ -1847,6 +2133,33 @@ public class RaftNode implements AutoCloseable {
         buf.putLong(entry.timestamp());
         buf.put(entry.opType().code());
         writeLengthPrefixedBytes(buf, entry.data());
+        // Preserve request identity through wire protocol
+        String clientId = entry.clientId() != null ? entry.clientId() : "";
+        String requestId = entry.requestId() != null ? entry.requestId() : "";
+        writeLengthPrefixedString(buf, clientId);
+        writeLengthPrefixedString(buf, requestId);
+    }
+
+    private void writeLengthPrefixedString(ByteBuffer buf, String s) throws IOException {
+        byte[] bytes = s.getBytes();
+        buf.putInt(bytes.length);
+        if (bytes.length > 0) {
+            buf.put(bytes);
+        }
+    }
+
+    private String readLengthPrefixedString(SocketChannel channel) throws IOException {
+        ByteBuffer lenBuf = ByteBuffer.allocate(4);
+        readFully(channel, lenBuf);
+        lenBuf.flip();
+        int len = lenBuf.getInt();
+        if (len <= 0) {
+            return "";
+        }
+        byte[] bytes = new byte[len];
+        ByteBuffer dataBuf = ByteBuffer.wrap(bytes);
+        readFully(channel, dataBuf);
+        return new String(bytes);
     }
 
     private void writeLengthPrefixedBytes(ByteBuffer buf, byte[] data) throws IOException {

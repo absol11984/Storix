@@ -14,6 +14,7 @@ public class HealthMonitor {
     private final RepairManager repairManager;
     private final long nodeTimeoutMillis;
     private final long checkIntervalMillis;
+    private final Object lifecycleLock = new Object();
     private ScheduledExecutorService scheduler;
 
     public HealthMonitor(NodeRegistry nodeRegistry, RepairManager repairManager,
@@ -42,25 +43,53 @@ public class HealthMonitor {
      * Starts the periodic health check.
      */
     public void start() {
-        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "health-monitor");
-            t.setDaemon(true);
-            return t;
-        });
+        synchronized (lifecycleLock) {
+            if (scheduler != null && !scheduler.isShutdown()) {
+                return;
+            }
+            scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "health-monitor");
+                t.setDaemon(true);
+                return t;
+            });
 
-        scheduler.scheduleAtFixedRate(this::checkAndRepair,
-                checkIntervalMillis, checkIntervalMillis, TimeUnit.MILLISECONDS);
+            scheduler.scheduleAtFixedRate(this::checkAndRepair,
+                    checkIntervalMillis, checkIntervalMillis, TimeUnit.MILLISECONDS);
 
-        System.out.println("[HEALTH] Monitor started (timeout=" + nodeTimeoutMillis + "ms, " +
-                "interval=" + checkIntervalMillis + "ms)");
+            System.out.println("[HEALTH] Monitor started (timeout=" + nodeTimeoutMillis + "ms, " +
+                    "interval=" + checkIntervalMillis + "ms)");
+        }
     }
 
     /**
-     * Stops the health monitor.
+     * Stops the health monitor and waits for the scheduled check to terminate.
      */
     public void stop() {
-        if (scheduler != null) {
-            scheduler.shutdownNow();
+        synchronized (lifecycleLock) {
+            if (scheduler == null) {
+                return;
+            }
+            ScheduledExecutorService executor = scheduler;
+            scheduler = null;
+            executor.shutdownNow();
+            boolean interrupted = false;
+            try {
+                while (!executor.isTerminated()) {
+                    try {
+                        if (executor.awaitTermination(2, TimeUnit.SECONDS)) {
+                            break;
+                        }
+                        executor.shutdownNow();
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                        executor.shutdownNow();
+                    }
+                }
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
     }
 

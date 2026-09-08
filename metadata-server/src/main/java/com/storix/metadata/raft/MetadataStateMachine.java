@@ -7,6 +7,7 @@ import com.storix.metadata.ObjectMetadata;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -74,6 +75,11 @@ public class MetadataStateMachine {
             }
             case CREATE_OBJECT -> {
                 ObjectMetadata metadata = deserialize(entry.data(), ObjectMetadata.class);
+                // Request-identity deduplication is handled by apply().  Once
+                // an entry reaches this operation, a duplicate object is a
+                // real state-machine conflict and must remain observable.
+                // Swallowing it would hide duplicate application or a distinct
+                // CREATE_OBJECT command for the same object name.
                 store.createObject(metadata);
             }
             case UPDATE_OBJECT -> {

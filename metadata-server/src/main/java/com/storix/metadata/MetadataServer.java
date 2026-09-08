@@ -12,9 +12,16 @@ import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 
 /**
  * TCP server that handles metadata requests and manages cluster state.
@@ -35,9 +42,12 @@ public class MetadataServer {
     private final SnapshotManager snapshotManager;
     private final GenerationManager generationManager;
     private final ClusterConfig clusterConfig;
-    private volatile boolean running = true;
+    private volatile boolean running = false;
     private volatile long runningThreadId = -1;
+    private final Object lifecycleLock = new Object();
     private ServerSocketChannel serverChannel;
+    private ExecutorService clientExecutor;
+    private final Set<SocketChannel> activeClientChannels = ConcurrentHashMap.newKeySet();
 
     /**
      * Creates a single-node metadata server (no Raft).
@@ -65,8 +75,8 @@ public class MetadataServer {
                           ClusterConfig clusterConfig, Path raftStateDir) throws IOException {
         this.port = port;
         // In cluster mode, use a separate port for Raft RPC (port + 10000 to avoid conflicts)
-        // The client-facing server uses the main port
-        this.raftPort = (clusterConfig != null) ? port + 10000 : port;
+        // The client-facing server uses the main port.
+        this.raftPort = (clusterConfig != null) ? distinctPort(port) : port;
         this.nodeRegistry = new NodeRegistry();
         this.clusterConfig = clusterConfig;
 
@@ -162,32 +172,66 @@ public class MetadataServer {
 
             System.out.println("[SERVER] Loaded from generation, applying " + postSnapshotEntries.size() + " post-snapshot WAL entries");
 
-            // Collect names of objects loaded from GenerationManager
-            java.util.Set<String> loadedObjects = new java.util.HashSet<>();
-            for (String name : metadataStore.listObjects()) {
-                loadedObjects.add(name);
-            }
+            // Apply post-snapshot entries to state machine to reconstruct
+            // complete state.
+            //
+            // IMPORTANT recovery semantics:
+            // - GenerationManager baseline is authoritative for the durable state
+            //   materialized into MetadataStore.
+            // - WAL replay must NOT double-apply entries that are already
+            //   represented by that baseline.
+            // - However, if a CREATE_OBJECT collides with an existing object and
+            //   the metadata differs, that is an actual recovery conflict and
+            //   must fail (no silent swallowing).
 
-            // Apply post-snapshot entries to state machine to reconstruct complete state
+            ObjectMapper recoveryMapper = new ObjectMapper();
             int appliedCount = 0;
-            int skippedCount = 0;
             for (LogEntry entry : postSnapshotEntries) {
-                if (entry.index() <= recoveryData.commitIndex) {
-                    // Skip CREATE_OBJECT for objects already in generation state
-                    if (entry.opType() == LogEntry.OpType.CREATE_OBJECT && loadedObjects.contains(extractObjectName(entry))) {
-                        skippedCount++;
-                        continue;
-                    }
-                    stateMachine.apply(entry);
-                    if (entry.opType() == LogEntry.OpType.CREATE_OBJECT) {
-                        loadedObjects.add(extractObjectName(entry));
-                    }
-                    appliedCount++;
+                if (entry.index() > recoveryData.commitIndex) {
+                    break;
                 }
-            }
-            System.out.println("[SERVER] Applied " + appliedCount + " entries, skipped " + skippedCount + " duplicates");
 
-            this.raftNode = new RaftNode(clusterConfig, resolvedRaftStateDir, raftLog, wal,
+                if (entry.opType() == LogEntry.OpType.CREATE_OBJECT) {
+                    ObjectMetadata incoming = recoveryMapper.readValue(entry.data(), ObjectMetadata.class);
+                    String name = incoming.getObjectName();
+
+                    if (metadataStore.objectExists(name)) {
+                        ObjectMetadata existing = metadataStore.getObject(name)
+                            .orElseThrow(() -> new IllegalStateException(
+                                "Object exists but cannot be retrieved during recovery: " + name));
+
+                        if (objectMetadataEquivalent(existing, incoming)) {
+                            // Already represented in the durable baseline; treat as applied.
+                            raftLog.advanceLastAppliedTo(entry.index());
+                            continue;
+                        }
+
+                        throw new IllegalStateException(
+                            "Recovery conflict: CREATE_OBJECT for existing object has different metadata. " +
+                                "objectName=" + name + ", entryIndex=" + entry.index());
+                    }
+                }
+
+                stateMachine.apply(entry);
+                raftLog.advanceLastAppliedTo(entry.index());
+                appliedCount++;
+            }
+
+            System.out.println("[SERVER] Applied " + appliedCount + " WAL entries during recovery");
+
+            // Note: we do not attempt to update metadataStore directly here; it is
+            // updated inside MetadataStateMachine.apply(entry) during successful replays.
+            // Cases where a CREATE_OBJECT is already represented in the authoritative
+            // baseline are treated as logically-applied, so we only advance RaftLog
+            // lastApplied progress.
+
+            // TODO: objectMetadataEquivalent assumes stable JSON round-tripping;
+            // if that proves too strict, we can switch to field-by-field comparison
+            // while still treating true collisions as conflicts.
+
+
+            ClusterConfig raftConfig = normalizeClusterConfig(clusterConfig, port, raftPort);
+            this.raftNode = new RaftNode(raftConfig, resolvedRaftStateDir, raftLog, wal,
                     recoveryData.term, recoveryData.votedFor);
             // Wire SnapshotManager into RaftNode for log compaction
             this.raftNode.setSnapshotManager(snapshotManager);
@@ -275,6 +319,14 @@ public class MetadataServer {
      * Starts the server and begins accepting connections.
      */
     public void start() throws IOException {
+        synchronized (lifecycleLock) {
+            if (running) {
+                return;
+            }
+            running = true;
+        }
+
+        try {
         // Start Raft if configured
         if (raftNode != null) {
             // Set up state machine applier
@@ -282,7 +334,15 @@ public class MetadataServer {
                 if (stateMachine != null) {
                     try {
                         stateMachine.apply(entry);
-                    } catch (IOException e) {
+                    } catch (Exception e) {
+                        // Log full stack trace safely
+                        System.err.println("[RAFT] Failed to apply entry " + entry.index()
+                            + ", term=" + entry.term()
+                            + ", opType=" + entry.opType()
+                            + ", exceptionClass=" + e.getClass().getName()
+                            + ", message=" + e.getMessage()
+                            + ", cause=" + (e.getCause() != null ? e.getCause().toString() : "none"));
+                        e.printStackTrace();
                         // Re-throw as RuntimeException to propagate failure to InstallSnapshot handler
                         // This is critical: snapshot restore failures must cause success=false
                         throw new RuntimeException("State machine apply failed: " + e.getMessage(), e);
@@ -300,10 +360,14 @@ public class MetadataServer {
 
         // Always start the client-facing server to handle metadata requests.
         // In single-node mode, this is the only server needed.
-        // In multi-node mode, both RaftNode RPC and this server run on the same port.
-        try (ServerSocketChannel sc = ServerSocketChannel.open();
-             var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+        // In multi-node mode, client and Raft ports are independent.
+        ServerSocketChannel sc = ServerSocketChannel.open();
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        synchronized (lifecycleLock) {
             this.serverChannel = sc;
+            this.clientExecutor = executor;
+        }
+        try {
             serverChannel.setOption(java.net.StandardSocketOptions.SO_REUSEADDR, true);
             serverChannel.bind(new InetSocketAddress(port));
             System.out.println("Metadata server listening on port " + port);
@@ -312,34 +376,86 @@ public class MetadataServer {
             while (running) {
                 try {
                     SocketChannel clientChannel = serverChannel.accept();
-                    executor.submit(() -> handleClient(clientChannel));
+                    if (clientChannel == null) {
+                        continue;
+                    }
+                    activeClientChannels.add(clientChannel);
+                    try {
+                        executor.submit(() -> handleClient(clientChannel));
+                    } catch (RejectedExecutionException e) {
+                        activeClientChannels.remove(clientChannel);
+                        clientChannel.close();
+                    }
                 } catch (IOException e) {
                     if (running) {
                         System.err.println("Accept failed: " + e.getMessage());
                     }
                 }
             }
+        } finally {
+            stop();
         }
-
-        healthMonitor.stop();
-        if (raftNode != null) {
-            raftNode.stop();
+        } catch (IOException | RuntimeException e) {
+            stop();
+            throw e;
         }
     }
 
     /**
-     * Stops the server gracefully.
+     * Stops the server gracefully and waits for all owned resources to terminate.
      */
     public void stop() {
-        running = false;
-        healthMonitor.stop();
-        if (raftNode != null) {
-            raftNode.stop();
+        synchronized (lifecycleLock) {
+            running = false;
+            closeClientResources();
+            healthMonitor.stop();
+            if (raftNode != null) {
+                raftNode.stop();
+            }
+            awaitClientExecutor();
         }
-        if (serverChannel != null && serverChannel.isOpen()) {
+    }
+
+    private void closeClientResources() {
+        ServerSocketChannel channel = serverChannel;
+        serverChannel = null;
+        if (channel != null && channel.isOpen()) {
             try {
-                serverChannel.close();
+                channel.close();
             } catch (IOException ignored) {}
+        }
+        for (SocketChannel client : activeClientChannels) {
+            try {
+                client.close();
+            } catch (IOException ignored) {}
+        }
+        activeClientChannels.clear();
+    }
+
+    private void awaitClientExecutor() {
+        ExecutorService executor = clientExecutor;
+        clientExecutor = null;
+        if (executor == null) {
+            return;
+        }
+        executor.shutdownNow();
+        boolean interrupted = false;
+        try {
+            while (!executor.isTerminated()) {
+                try {
+                    if (executor.awaitTermination(2, TimeUnit.SECONDS)) {
+                        break;
+                    }
+                    executor.shutdownNow();
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                    executor.shutdownNow();
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -352,7 +468,11 @@ public class MetadataServer {
         try (clientChannel) {
             handler.handle(clientChannel);
         } catch (IOException e) {
-            System.err.println("Client handler error: " + e.getMessage());
+            if (running) {
+                System.err.println("Client handler error: " + e.getMessage());
+            }
+        } finally {
+            activeClientChannels.remove(clientChannel);
         }
     }
 
@@ -426,6 +546,47 @@ public class MetadataServer {
         return new ClusterConfig("storix", nodeId, host, port, port + 10000, peers);
     }
 
+    private static int distinctPort(int clientPort) {
+        long higher = (long) clientPort + 10000L;
+        if (higher <= 65535L) {
+            return (int) higher;
+        }
+        long lower = (long) clientPort - 10000L;
+        if (lower > 0) {
+            return (int) lower;
+        }
+        return clientPort == 65535 ? 65534 : 65535;
+    }
+
+    /**
+     * Keeps the client and Raft listeners distinct for legacy configurations
+     * that used one port for both services. Explicit client/Raft assignments
+     * are preserved unchanged.
+     */
+    private static ClusterConfig normalizeClusterConfig(
+            ClusterConfig config, int clientPort, int defaultRaftPort) {
+        // If config is null or ports are already distinct, return unchanged
+        if (config == null || config.raftPort() != clientPort) {
+            return config;
+        }
+
+        List<RaftPeer> peers = config.initialPeers();
+        List<RaftPeer> normalizedPeers = peers == null
+                ? null
+                : peers.stream()
+                        .map(peer -> new RaftPeer(
+                                peer.nodeId(), peer.host(), distinctPort(peer.port())))
+                        .toList();
+
+        return new ClusterConfig(
+                config.clusterId(),
+                config.nodeId(),
+                config.host(),
+                clientPort,
+                defaultRaftPort,
+                normalizedPeers);
+    }
+
     /**
      * Extracts the object name from a CREATE_OBJECT log entry.
      */
@@ -437,5 +598,96 @@ public class MetadataServer {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * Strict equivalence check between two ObjectMetadata instances.
+     *
+     * Used only during startup recovery to decide whether a post-snapshot
+     * CREATE_OBJECT entry is already represented by the authoritative
+     * GenerationManager baseline.
+     */
+    private static boolean objectMetadataEquivalent(ObjectMetadata a, ObjectMetadata b) {
+        if (a == b) {
+            return true;
+        }
+        if (a == null || b == null) {
+            return false;
+        }
+
+        if (!Objects.equals(a.getObjectName(), b.getObjectName())) {
+            return false;
+        }
+        if (a.getFileSize() != b.getFileSize()) {
+            return false;
+        }
+        if (a.getChunkSize() != b.getChunkSize()) {
+            return false;
+        }
+
+        List<ChunkInfo> aChunks = a.getChunks();
+        List<ChunkInfo> bChunks = b.getChunks();
+        if (aChunks == null && bChunks == null) {
+            return true;
+        }
+        if (aChunks == null || bChunks == null) {
+            return false;
+        }
+        if (aChunks.size() != bChunks.size()) {
+            return false;
+        }
+
+        // Compare chunks deterministically by chunkId + chunkIndex.
+        List<ChunkInfo> aSorted = new ArrayList<>(aChunks);
+        List<ChunkInfo> bSorted = new ArrayList<>(bChunks);
+
+        aSorted.sort((x, y) -> {
+            int c = Objects.toString(x.getChunkId(), "").compareTo(Objects.toString(y.getChunkId(), ""));
+            if (c != 0) {
+                return c;
+            }
+            return Integer.compare(x.getChunkIndex(), y.getChunkIndex());
+        });
+        bSorted.sort((x, y) -> {
+            int c = Objects.toString(x.getChunkId(), "").compareTo(Objects.toString(y.getChunkId(), ""));
+            if (c != 0) {
+                return c;
+            }
+            return Integer.compare(x.getChunkIndex(), y.getChunkIndex());
+        });
+
+        for (int i = 0; i < aSorted.size(); i++) {
+            ChunkInfo ax = aSorted.get(i);
+            ChunkInfo by = bSorted.get(i);
+
+            if (!Objects.equals(ax.getChunkId(), by.getChunkId())) {
+                return false;
+            }
+            if (ax.getChunkIndex() != by.getChunkIndex()) {
+                return false;
+            }
+            if (ax.getChunkSize() != by.getChunkSize()) {
+                return false;
+            }
+            if (!Objects.equals(ax.getChecksum(), by.getChecksum())) {
+                return false;
+            }
+
+            List<String> aRep = ax.getReplicaNodeIds() == null
+                ? List.of()
+                : new ArrayList<>(ax.getReplicaNodeIds());
+            List<String> bRep = by.getReplicaNodeIds() == null
+                ? List.of()
+                : new ArrayList<>(by.getReplicaNodeIds());
+
+            aRep.sort(Comparator.naturalOrder());
+            bRep.sort(Comparator.naturalOrder());
+
+            if (!aRep.equals(bRep)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 }

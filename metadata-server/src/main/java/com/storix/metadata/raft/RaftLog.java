@@ -99,8 +99,24 @@ public class RaftLog {
      * Used during recovery to load entries without re-writing to WAL.
      */
     public void append(LogEntry entry, boolean writeToWal) {
+        if (entry == null) {
+            throw new IllegalArgumentException("Log entry must not be null");
+        }
+        if (entry.index() <= 0) {
+            throw new IllegalArgumentException(
+                "Log entry index must be positive: " + entry.index());
+        }
+
         lock.writeLock().lock();
         try {
+            // A Raft log has at most one entry for each absolute index.  Check the
+            // index before touching the WAL so a rejected append cannot leave a
+            // durable duplicate behind.
+            if (findEntryUnsafe(entry.index()) != null) {
+                throw new IllegalStateException(
+                    "Duplicate log entry index: " + entry.index());
+            }
+
             // Note: We allow entries with index < logStartIndex during snapshot/recovery
             // scenarios where the test creates entries that reference snapshot state.
             // The validation is handled elsewhere (loadEntries) for recovered entries.
@@ -150,6 +166,14 @@ public class RaftLog {
             long lastIndex = 0;
             for (int i = 0; i < recoveredEntries.size(); i++) {
                 LogEntry entry = recoveredEntries.get(i);
+                if (entry == null) {
+                    throw new IllegalStateException(
+                        "Invalid recovered log: null entry at position " + i);
+                }
+                if (entry.index() <= 0) {
+                    throw new IllegalStateException(
+                        "Invalid recovered log: non-positive index " + entry.index());
+                }
 
                 // Check entry is not behind snapshot boundary
                 if (entry.index() < logStartIndex) {
@@ -194,9 +218,19 @@ public class RaftLog {
             long snapshotBoundaryIndex = logStartIndex - 1;
             this.highestIndex = Math.max(this.highestIndex, Math.max(highest, snapshotBoundaryIndex));
 
-            // Restore commit state
-            this.commitIndex = recoveredCommitIndex;
-            this.lastApplied = Math.min(recoveredLastApplied, recoveredCommitIndex);
+            // Restore commit state without moving progress behind an installed
+            // snapshot boundary.  The snapshot already contains every entry
+            // through snapshotBoundaryIndex, even when the WAL carries older
+            // commit/apply markers from before compaction.
+            long effectiveHighest = Math.max(this.highestIndex, snapshotBoundaryIndex);
+            long recoveredCommit = Math.max(0, recoveredCommitIndex);
+            this.commitIndex = Math.min(
+                effectiveHighest,
+                Math.max(snapshotBoundaryIndex, recoveredCommit));
+            long recoveredApplied = Math.max(0, recoveredLastApplied);
+            this.lastApplied = Math.min(
+                this.commitIndex,
+                Math.max(snapshotBoundaryIndex, recoveredApplied));
 
             return highest;
         } finally {
@@ -227,10 +261,23 @@ public class RaftLog {
      * @param lastIncludedTerm The term of the entry at lastIncludedIndex
      */
     public void setSnapshotBoundary(long lastIncludedIndex, long lastIncludedTerm) {
+        if (lastIncludedIndex < 0) {
+            throw new IllegalArgumentException(
+                "Snapshot index must not be negative: " + lastIncludedIndex);
+        }
+
         lock.writeLock().lock();
         try {
             this.logStartIndex = lastIncludedIndex + 1;
             this.snapshotTerm = lastIncludedTerm;
+            // The snapshot boundary is part of the absolute log history and
+            // must also move the allocator boundary forward.
+            this.highestIndex = Math.max(this.highestIndex, lastIncludedIndex);
+            // A snapshot includes all state through its boundary. Normalize
+            // application progress so the first active entry is not selected
+            // repeatedly when the persisted lastApplied predates the snapshot.
+            this.lastApplied = Math.max(this.lastApplied, lastIncludedIndex);
+            this.commitIndex = Math.max(this.commitIndex, lastIncludedIndex);
             // Clear entries since they are now covered by snapshot
             entries.clear();
         } finally {
@@ -262,15 +309,21 @@ public class RaftLog {
      * 2. Truncate conflicting suffix (local and WAL)
      * 3. Append new entries to WAL and memory
      */
-    public void appendEntries(long prevLogIndex, long prevLogTerm, List<LogEntry> newEntries) {
+    public boolean appendEntries(long prevLogIndex, long prevLogTerm, List<LogEntry> newEntries) {
+        if (newEntries == null || newEntries.isEmpty()) {
+            return true;
+        }
+
         lock.writeLock().lock();
         try {
+            validateIncomingEntries(newEntries);
+
             // CRITICAL: Raft correctness check
             // If prevLogIndex > lastLogIndex AND prevLogTerm > 0, the follower must REJECT.
             // When prevLogTerm=0, the leader is telling us to trust the prevLogIndex
             // (e.g., during test setup or bootstrap scenarios).
             if (prevLogIndex > getLastLogIndex() && prevLogTerm > 0) {
-                return; // Reject - do NOT append anything
+                return false; // Reject - do NOT append anything
             }
 
             // Determine conflict point
@@ -300,11 +353,11 @@ public class RaftLog {
                             conflictIndex = findConflictIndex(newEntries);
                         } else {
                             // Reject: gap in the log
-                            return;
+                            return false;
                         }
                     } else {
                         // prevLogTerm > 0 case handled at the top
-                        return;
+                        return false;
                     }
                 } else {
                     // prevLogIndex is before log start (snapshot region)
@@ -318,7 +371,7 @@ public class RaftLog {
 
             // Check if already in sync
             if (conflictIndex == newEntries.size()) {
-                return;
+                return true;
             }
 
             // Truncate conflicting suffix
@@ -326,33 +379,19 @@ public class RaftLog {
             // conflictIndex is the position in newEntries where conflict starts
             // We need to keep local entries with index < first conflicting entry's index
             long firstConflictEntryIndex = newEntries.get(conflictIndex).index();
-            int entriesToKeep;
-            if (entries.isEmpty()) {
-                entriesToKeep = 0;
-            } else {
-                // Count entries with index < firstConflictEntryIndex
-                entriesToKeep = 0;
-                for (LogEntry e : entries) {
-                    if (e != null && e.index() < firstConflictEntryIndex) {
-                        entriesToKeep++;
-                    }
+            // Remove every local entry at or after the conflict index by
+            // absolute index.  This is safe even if malformed historical state
+            // is out of order or contains a duplicate.
+            entries.removeIf(entry -> entry != null && entry.index() >= firstConflictEntryIndex);
+
+            // CRITICAL: Update highestIndex after truncation.  AppendEntries
+            // replaces the follower's conflicting suffix, so the current log
+            // boundary is the highest remaining active/snapshot index.
+            highestIndex = logStartIndex - 1;
+            for (LogEntry entry : entries) {
+                if (entry != null && entry.index() > highestIndex) {
+                    highestIndex = entry.index();
                 }
-            }
-
-            // Remove entries at and after the conflict point
-            while (entries.size() > entriesToKeep) {
-                entries.remove(entries.size() - 1);
-            }
-
-            // CRITICAL: Update highestIndex after truncation
-            // highestIndex tracks the highest index ever seen for nextIndex assignment
-            // After truncation, it should be the last remaining entry's index
-            if (entries.isEmpty()) {
-                highestIndex = logStartIndex - 1; // Set to snapshot boundary
-            } else {
-                // Find the last entry's index
-                LogEntry lastEntry = entries.get(entries.size() - 1);
-                highestIndex = lastEntry.index();
             }
 
             if (wal != null) {
@@ -385,6 +424,7 @@ public class RaftLog {
                     highestIndex = entry.index();
                 }
             }
+            return true;
         } finally {
             lock.writeLock().unlock();
         }
@@ -396,25 +436,42 @@ public class RaftLog {
      */
     private int findConflictIndex(List<LogEntry> newEntries) {
         for (int i = 0; i < newEntries.size(); i++) {
-            long entryIndex = newEntries.get(i).index();
-            long entryTerm = newEntries.get(i).term();
+            LogEntry incoming = newEntries.get(i);
+            LogEntry localEntry = findEntryUnsafe(incoming.index());
 
-            int localPos = (int) (entryIndex - logStartIndex);
-
-            if (localPos >= 0 && localPos < entries.size()) {
-                // Local entry exists at this index - check term
-                LogEntry localEntry = entries.get(localPos);
-                if (localEntry != null && localEntry.term() != entryTerm) {
-                    return i; // Conflict found
-                }
-                // Terms match - continue checking
-            } else {
-                // No local entry - this and later entries are new
+            if (localEntry == null) {
+                // No local entry - this and later entries are new.
                 return i;
             }
+            if (localEntry.term() != incoming.term()) {
+                return i; // Conflict found.
+            }
         }
-        // All entries match - in sync
+        // All entries match - in sync.
         return newEntries.size();
+    }
+
+    /**
+     * Validates the absolute indexes in an AppendEntries batch before any WAL
+     * mutation.  Raft leaders send entries in increasing order and a batch must
+     * not itself contain duplicate indexes.
+     */
+    private void validateIncomingEntries(List<LogEntry> incoming) {
+        long previousIndex = Long.MIN_VALUE;
+        for (LogEntry entry : incoming) {
+            if (entry == null) {
+                throw new IllegalArgumentException("AppendEntries contains a null entry");
+            }
+            if (entry.index() <= 0) {
+                throw new IllegalArgumentException(
+                    "AppendEntries contains invalid index: " + entry.index());
+            }
+            if (entry.index() <= previousIndex) {
+                throw new IllegalArgumentException(
+                    "AppendEntries indexes must be strictly increasing: " + entry.index());
+            }
+            previousIndex = entry.index();
+        }
     }
 
     /**
@@ -423,11 +480,16 @@ public class RaftLog {
     public List<LogEntry> getEntriesFrom(long startIndex) {
         lock.readLock().lock();
         try {
-            if (startIndex > getLastLogIndex()) {
+            if (startIndex > highestIndex) {
                 return Collections.emptyList();
             }
-            int idx = (int) (startIndex - logStartIndex);
-            return new ArrayList<>(entries.subList(idx, entries.size()));
+            List<LogEntry> result = new ArrayList<>();
+            for (LogEntry entry : entries) {
+                if (entry != null && entry.index() >= startIndex) {
+                    result.add(entry);
+                }
+            }
+            return result;
         } finally {
             lock.readLock().unlock();
         }
@@ -439,12 +501,16 @@ public class RaftLog {
     public List<LogEntry> getEntries(long startIndex, long endIndex) {
         lock.readLock().lock();
         try {
-            if (startIndex > endIndex || startIndex > getLastLogIndex()) {
+            if (startIndex > endIndex || startIndex > highestIndex) {
                 return Collections.emptyList();
             }
-            int startIdx = Math.max(0, (int) (startIndex - logStartIndex));
-            int endIdx = Math.min(entries.size(), (int) (endIndex - logStartIndex + 1));
-            return new ArrayList<>(entries.subList(startIdx, endIdx));
+            List<LogEntry> result = new ArrayList<>();
+            for (LogEntry entry : entries) {
+                if (entry != null && entry.index() >= startIndex && entry.index() <= endIndex) {
+                    result.add(entry);
+                }
+            }
+            return result;
         } finally {
             lock.readLock().unlock();
         }
@@ -456,16 +522,25 @@ public class RaftLog {
     public LogEntry getEntry(long index) {
         lock.readLock().lock();
         try {
-            // Sequential storage: iterate to find entry with matching index
-            for (LogEntry entry : entries) {
-                if (entry != null && entry.index() == index) {
-                    return entry;
-                }
-            }
-            return null;
+            // Use the absolute index, not a list position.  This remains correct
+            // after compaction and safely returns null if malformed state contains
+            // a gap or an out-of-order entry.
+            return findEntryUnsafe(index);
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    /**
+     * Finds an entry by absolute index while the caller holds a log lock.
+     */
+    private LogEntry findEntryUnsafe(long index) {
+        for (LogEntry entry : entries) {
+            if (entry != null && entry.index() == index) {
+                return entry;
+            }
+        }
+        return null;
     }
 
     /**
@@ -524,11 +599,8 @@ public class RaftLog {
     public boolean containsEntry(long index, long term) {
         lock.readLock().lock();
         try {
-            int idx = (int) (index - logStartIndex);
-            if (idx < 0 || idx >= entries.size()) {
-                return false;
-            }
-            return entries.get(idx).term() == term;
+            LogEntry entry = findEntryUnsafe(index);
+            return entry != null && entry.term() == term;
         } finally {
             lock.readLock().unlock();
         }
@@ -570,6 +642,20 @@ public class RaftLog {
     }
 
     /**
+     * Advances application progress to the absolute index that was just applied.
+     * This is required when the active log begins after a snapshot boundary.
+     */
+    public void advanceLastAppliedTo(long appliedIndex) {
+        if (appliedIndex < 0) {
+            throw new IllegalArgumentException(
+                "Applied index must not be negative: " + appliedIndex);
+        }
+        if (appliedIndex > lastApplied) {
+            lastApplied = Math.min(appliedIndex, commitIndex);
+        }
+    }
+
+    /**
      * Returns the last applied index.
      */
     public long getLastApplied() {
@@ -585,14 +671,22 @@ public class RaftLog {
             if (lastApplied >= commitIndex) {
                 return Collections.emptyList();
             }
-            int startIdx = (int) (lastApplied + 1 - logStartIndex);
-            int endIdx = (int) (commitIndex - logStartIndex + 1);
-            startIdx = Math.max(0, startIdx);
-            endIdx = Math.min(entries.size(), endIdx);
-            if (startIdx >= endIdx) {
-                return Collections.emptyList();
+
+            // Select by absolute index. Never infer a list position from an
+            // index: snapshots, gaps, or malformed historical state may make
+            // that mapping invalid. A snapshot already covers indexes before
+            // logStartIndex, so begin at the first active index when the
+            // recovered lastApplied value predates the snapshot boundary.
+            List<LogEntry> result = new ArrayList<>();
+            long firstIndex = Math.max(lastApplied + 1, logStartIndex);
+            for (long index = firstIndex; index <= commitIndex; index++) {
+                LogEntry entry = findEntryUnsafe(index);
+                if (entry == null) {
+                    break;
+                }
+                result.add(entry);
             }
-            return new ArrayList<>(entries.subList(startIdx, endIdx));
+            return result;
         } finally {
             lock.readLock().unlock();
         }

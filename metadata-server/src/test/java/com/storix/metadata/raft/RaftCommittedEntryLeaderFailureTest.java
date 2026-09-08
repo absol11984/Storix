@@ -8,7 +8,6 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -23,25 +22,25 @@ import static org.junit.jupiter.api.Assertions.*;
 class RaftCommittedEntryLeaderFailureTest {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final AtomicLong portCounter = new AtomicLong(System.currentTimeMillis() % 10000);
-
     private int portA, portB, portC;
     private Path clusterDir;
     private Path dataDirA, dataDirB, dataDirC;
     private MetadataServer serverA, serverB, serverC;
     private ClusterConfig configA, configB, configC;
+    private TestPortAllocator.Lease portLease;
 
     @TempDir
     Path tempDir;
 
     private void setupCluster() throws Exception {
-        long base = portCounter.addAndGet(10);
-        portA = (int) (55000 + base % 10000);
-        portB = portA + 10;
-        portC = portA + 20;
-        int raftPortA = portA + 1;
-        int raftPortB = portB + 1;
-        int raftPortC = portC + 1;
+        portLease = TestPortAllocator.lease(6);
+        portA = portLease.port(0);
+        portB = portLease.port(1);
+        portC = portLease.port(2);
+        int raftPortA = portLease.port(3);
+        int raftPortB = portLease.port(4);
+        int raftPortC = portLease.port(5);
+        portLease.release();
 
         clusterDir = Files.createTempDirectory("committed-entry-test-" + System.nanoTime());
         dataDirA = clusterDir.resolve("meta-a");
@@ -135,16 +134,43 @@ class RaftCommittedEntryLeaderFailureTest {
 
     @AfterEach
     void teardown() {
-        try { if (serverA != null) serverA.stop(); } catch (Exception e) { /* ignore */ }
-        try { if (serverB != null) serverB.stop(); } catch (Exception e) { /* ignore */ }
-        try { if (serverC != null) serverC.stop(); } catch (Exception e) { /* ignore */ }
+        RuntimeException failure = null;
+        for (MetadataServer server : Arrays.asList(serverA, serverB, serverC)) {
+            if (server == null) {
+                continue;
+            }
+            try {
+                server.stop();
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        serverA = null;
+        serverB = null;
+        serverC = null;
         try {
             if (clusterDir != null) {
                 Files.walk(clusterDir).sorted(Comparator.reverseOrder())
                     .map(Path::toFile).forEach(java.io.File::delete);
             }
-        } catch (Exception e) { /* ignore */ }
-        try { Thread.sleep(8000); } catch (InterruptedException e) { /* ignore */ }
+        } catch (Exception e) {
+            if (failure == null) {
+                failure = new RuntimeException("Failed to remove cluster directory", e);
+            } else {
+                failure.addSuppressed(e);
+            }
+        }
+        if (portLease != null) {
+            portLease.close();
+            portLease = null;
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     /**

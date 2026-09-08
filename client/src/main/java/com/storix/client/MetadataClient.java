@@ -9,6 +9,7 @@ import java.nio.channels.SocketChannel;
 import java.nio.channels.UnresolvedAddressException;
 import java.util.List;
 import java.util.Map;
+import java.util.HashMap;
 
 /**
  * Client for communicating with the Metadata Server.
@@ -196,12 +197,17 @@ public class MetadataClient implements AutoCloseable {
         // Wrap payload in request envelope if clientId and requestId are set
         byte[] envelopePayload;
         if (clientId != null && currentRequestId != null) {
-            Map<String, Object> envelope = Map.of(
-                "clientId", clientId,
-                "requestId", currentRequestId,
-                "operation", operation,
-                "payload", objectMapper.readValue(payload, Map.class)
-            );
+            Object payloadObj;
+            if (payload == null || payload.length == 0) {
+                payloadObj = Map.of();
+            } else {
+                payloadObj = objectMapper.readValue(payload, Object.class);
+            }
+            Map<String, Object> envelope = new HashMap<>();
+            envelope.put("clientId", clientId);
+            envelope.put("requestId", currentRequestId);
+            envelope.put("operation", operation);
+            envelope.put("payload", payloadObj);
             envelopePayload = objectMapper.writeValueAsBytes(envelope);
         } else {
             envelopePayload = payload;

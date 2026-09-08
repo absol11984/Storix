@@ -118,6 +118,7 @@ class Phase1MasterCrashTest {
         });
 
         Thread leaderThread = startNode(leader);
+        RaftNode[] nodesToStop = new RaftNode[1];
 
         try {
             waitForLeader(leader, 5000);
@@ -175,7 +176,6 @@ class Phase1MasterCrashTest {
 
             // Simulate crash by stopping process
             follower.stop();
-            Thread.sleep(100);
 
             System.out.println("Simulating crash AFTER commit (process stopped)...");
 
@@ -188,6 +188,7 @@ class Phase1MasterCrashTest {
             RaftNode restartedFollower = new RaftNode(followerConfig, followerRaftDir, restartedLog, restartedWal);
             restartedFollower.setGenerationManager(restartedGenMgr);
             restartedFollower.setMetadataStore(restartedStore);
+            nodesToStop[0] = restartedFollower;
 
             // Check recovery using GenerationManager.loadAuthoritativeState()
             GenerationManager.GenerationState authState = restartedGenMgr.loadAuthoritativeState();
@@ -212,8 +213,23 @@ class Phase1MasterCrashTest {
             System.out.println("========================================\n");
 
         } finally {
-            leader.stop();
-            leaderThread.interrupt();
+            try {
+                leader.stop();
+            } finally {
+                leaderThread.interrupt();
+            }
+            try {
+                follower.stop();
+            } catch (Exception ignored) {
+                // follower may be null or already stopped
+            }
+            if (nodesToStop[0] != null) {
+                try {
+                    nodesToStop[0].stop();
+                } catch (Exception ignored) {
+                    // restartedFollower may be null or already stopped
+                }
+            }
         }
     }
 
@@ -355,7 +371,6 @@ class Phase1MasterCrashTest {
             // Now simulate restart
             System.out.println("\nSimulating restart after failed commit...");
             follower.stop();
-            Thread.sleep(100);
 
             MetadataStore restartedStore = new MetadataStore(followerMetaFile);
             GenerationManager restartedGenMgr = new GenerationManager(followerRaftDir);
@@ -371,8 +386,16 @@ class Phase1MasterCrashTest {
             System.out.println("========================================\n");
 
         } finally {
-            leader.stop();
-            leaderThread.interrupt();
+            try {
+                leader.stop();
+            } finally {
+                leaderThread.interrupt();
+            }
+            try {
+                follower.stop();
+            } catch (Exception ignored) {
+                // follower may be null or already stopped
+            }
         }
     }
 
@@ -509,7 +532,6 @@ class Phase1MasterCrashTest {
             // Restart simulation
             System.out.println("\nSimulating restart after failed commit...");
             follower.stop();
-            Thread.sleep(100);
 
             MetadataStore restartedStore = new MetadataStore(followerMetaFile);
             GenerationManager restartedGenMgr = new GenerationManager(followerRaftDir);
@@ -525,8 +547,16 @@ class Phase1MasterCrashTest {
             System.out.println("========================================\n");
 
         } finally {
-            leader.stop();
-            leaderThread.interrupt();
+            try {
+                leader.stop();
+            } finally {
+                leaderThread.interrupt();
+            }
+            try {
+                follower.stop();
+            } catch (Exception ignored) {
+                // follower may be null or already stopped
+            }
         }
     }
 
@@ -592,6 +622,7 @@ class Phase1MasterCrashTest {
         });
 
         Thread leaderThread = startNode(leader);
+        Thread followerThread = null;
 
         try {
             waitForLeader(leader, 5000);
@@ -662,7 +693,6 @@ class Phase1MasterCrashTest {
 
             // Stop and restart follower to simulate a fresh node
             follower.stop();
-            Thread.sleep(100);
 
             followerStore = new MetadataStore(followerMetaFile);
             GenerationManager newGenMgr = new GenerationManager(followerRaftDir);
@@ -678,8 +708,7 @@ class Phase1MasterCrashTest {
                 catch (IOException e) { throw new RuntimeException(e); }
             });
 
-            Thread followerThread = startNode(follower);
-            Thread.sleep(200);
+            followerThread = startNode(follower);
 
             // Try to install A B C D - should fail due to checksum mismatch
             System.out.println("Installing A B C D snapshot (will fail due to checksum mismatch)...");
@@ -723,7 +752,6 @@ class Phase1MasterCrashTest {
             System.out.println("\nSimulating restart after failed commit...");
             follower.stop();
             followerThread.interrupt();
-            Thread.sleep(100);
 
             MetadataStore restartedStore = new MetadataStore(followerMetaFile);
             GenerationManager restartedGenMgr = new GenerationManager(followerRaftDir);
@@ -747,8 +775,22 @@ class Phase1MasterCrashTest {
             System.out.println("========================================\n");
 
         } finally {
-            leader.stop();
-            leaderThread.interrupt();
+            try {
+                leader.stop();
+            } finally {
+                leaderThread.interrupt();
+            }
+            try {
+                follower.stop();
+            } catch (Exception ignored) {
+                // follower may be null or already stopped
+            }
+            if (followerThread != null) {
+                try {
+                    followerThread.interrupt();
+                } catch (Exception ignored) {
+                }
+            }
         }
     }
 

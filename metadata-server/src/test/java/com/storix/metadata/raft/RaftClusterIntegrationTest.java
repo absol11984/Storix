@@ -10,7 +10,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.Random;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -22,14 +21,13 @@ class RaftClusterIntegrationTest {
 
     private static final Path tempDir = Path.of("/tmp/raft-integration-test-" + System.currentTimeMillis());
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final Random random = new Random();
-
     private int metaAPort;
     private int metaBPort;
     private int metaCPort;
     private RaftNode nodeA;
     private RaftNode nodeB;
     private RaftNode nodeC;
+    private TestPortAllocator.Lease portLease;
 
     @BeforeAll
     static void setupDir() throws IOException {
@@ -39,6 +37,9 @@ class RaftClusterIntegrationTest {
     @AfterAll
     static void cleanupDir() throws IOException {
         // Clean up test directories
+        if (!Files.exists(tempDir)) {
+            return;
+        }
         Files.walk(tempDir)
             .sorted(Comparator.reverseOrder())
             .map(Path::toFile)
@@ -47,13 +48,11 @@ class RaftClusterIntegrationTest {
 
     @BeforeEach
     void startCluster() throws Exception {
-        // Wait for previous test's ports to be released
-        Thread.sleep(500);
-
-        // Use random ports in a high range to avoid conflicts
-        metaAPort = 50000 + random.nextInt(10000);
-        metaBPort = metaAPort + 1;
-        metaCPort = metaAPort + 2;
+        portLease = TestPortAllocator.lease(3);
+        metaAPort = portLease.port(0);
+        metaBPort = portLease.port(1);
+        metaCPort = portLease.port(2);
+        portLease.release();
 
         // Clean up any existing state
         try {
@@ -86,14 +85,21 @@ class RaftClusterIntegrationTest {
                 new RaftPeer("meta-b", "127.0.0.1", metaBPort)
             ));
 
-        // Create and start Raft nodes directly
+        // Create and start Raft nodes directly. Start them in sequence so every
+        // node is ready to receive votes before the next election deadline can
+        // expire; this keeps startup deterministic without changing Raft logic.
         nodeA = new RaftNode(configA, tempDir.resolve("meta-a"), new RaftLog());
         nodeB = new RaftNode(configB, tempDir.resolve("meta-b"), new RaftLog());
         nodeC = new RaftNode(configC, tempDir.resolve("meta-c"), new RaftLog());
 
         nodeA.start();
+        nodeA.waitForRpcServerReady();
+        Thread.sleep(100);
         nodeB.start();
+        nodeB.waitForRpcServerReady();
+        Thread.sleep(100);
         nodeC.start();
+        nodeC.waitForRpcServerReady();
 
         // Wait for leader election
         waitForLeaderElection(10000);
@@ -103,15 +109,31 @@ class RaftClusterIntegrationTest {
 
     @AfterEach
     void stopCluster() {
-        try {
-            if (nodeA != null) nodeA.stop();
-            if (nodeB != null) nodeB.stop();
-            if (nodeC != null) nodeC.stop();
-        } catch (Exception e) {
-            // ignore
+        RuntimeException failure = null;
+        for (RaftNode node : new RaftNode[]{nodeA, nodeB, nodeC}) {
+            if (node == null) {
+                continue;
+            }
+            try {
+                node.stop();
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
         }
-        // Give ports time to be released
-        try { Thread.sleep(500); } catch (InterruptedException e) { /* ignore */ }
+        nodeA = null;
+        nodeB = null;
+        nodeC = null;
+        if (portLease != null) {
+            portLease.close();
+            portLease = null;
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     private RaftNode getLeader() {
@@ -298,13 +320,21 @@ class RaftClusterIntegrationTest {
         long currentTerm = leader.getCurrentTerm();
         assertTrue(currentTerm >= initialTerm, "Term should never decrease");
 
-        // Kill leader to force new election
+        // Kill leader to force new election. Poll for the result instead of
+        // treating a fixed sleep as shutdown/election synchronization.
         leader.stop();
-        Thread.sleep(3000);
+        long electionDeadline = System.currentTimeMillis() + 3000;
+        RaftNode newLeader = null;
+        while (System.currentTimeMillis() < electionDeadline) {
+            newLeader = getLeader();
+            if (newLeader != null) {
+                break;
+            }
+            Thread.sleep(50);
+        }
 
         // Find new leader - term may or may not increase depending on timing
         // (same term election is valid if it completes before any candidate increments term)
-        RaftNode newLeader = getLeader();
         assertNotNull(newLeader, "New leader should be elected after stopping old leader");
         System.out.println("[TEST] New leader: " + newLeader.getNodeId() + " term: " + newLeader.getCurrentTerm());
     }
