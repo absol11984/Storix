@@ -568,7 +568,53 @@ public class RaftNode implements AutoCloseable {
             // Wait for majority commit with timeout
             // Use 10 seconds to allow for network latency and slow followers in test environments.
             // The commit index advances when majority acknowledges, which may take multiple heartbeats.
+            System.out.println("[RAFT] " + nodeId + " waiting for commit future for index=" + index +
+                " (commitIndex=" + raftLog.getCommitIndex() + ", lastApplied=" + raftLog.getLastApplied() + ")");
             boolean committed = commitFuture.get(10, TimeUnit.SECONDS);
+
+            if (committed) {
+                if (stateMachineApplier != null) {
+                    // SYNCHRONOUS apply for multi-node too
+                    // This ensures the entry is applied to the state machine before returning success
+                    synchronized (applyLock) {
+                        if (terminalApplyFailure != null) {
+                            return false;
+                        }
+                        // Check if already applied by background loop
+                        if (raftLog.getLastApplied() >= index) {
+                            System.out.println("[RAFT] " + nodeId + " entry " + index + " already applied by background loop");
+                        } else {
+                            // Apply synchronously
+                            try {
+                                System.out.println("[RAFT] " + nodeId + " applying entry " + index + " synchronously (multi-node)");
+                                stateMachineApplier.accept(indexedEntry);
+                                raftLog.advanceLastAppliedTo(indexedEntry.index());
+                                System.out.println("[RAFT] " + nodeId + " successfully applied entry " + index + " synchronously");
+                            } catch (Exception e) {
+                                terminalApplyFailure = new ApplyFailure(indexedEntry.index(), indexedEntry, e);
+                                System.err.println("[RAFT] Terminal apply failure (multi-node sync path) index=" + indexedEntry.index()
+                                    + ", term=" + indexedEntry.term()
+                                    + ", opType=" + indexedEntry.opType()
+                                    + ", clientId=" + indexedEntry.clientId()
+                                    + ", requestId=" + indexedEntry.requestId()
+                                    + ", exceptionClass=" + e.getClass().getName()
+                                    + ", message=" + e.getMessage()
+                                    + ", cause=" + (e.getCause() != null ? e.getCause().toString() : "none")
+                                    + "; application halted until restart/operator recovery");
+                                e.printStackTrace();
+                                return false;
+                            }
+                        }
+                    }
+                } else {
+                    // No state machine applier - still mark as applied for tests without applier
+                    raftLog.advanceLastAppliedTo(index);
+                }
+            }
+
+            System.out.println("[RAFT] " + nodeId + " commit future completed for index=" + index +
+                ", result=" + committed +
+                " (commitIndex=" + raftLog.getCommitIndex() + ", lastApplied=" + raftLog.getLastApplied() + ")");
             return committed;
         } catch (TimeoutException e) {
             // Timeout - entry may still be pending
@@ -1593,11 +1639,25 @@ public class RaftNode implements AutoCloseable {
             // lastApplied was advanced by the single-node submit path running
             // concurrently.
             List<LogEntry> toApply = raftLog.getEntriesToApply();
+            if (!toApply.isEmpty()) {
+                System.out.println("[RAFT] " + nodeId + " applyCommittedEntries: " + toApply.size() + " entries to apply" +
+                    " (commitIndex=" + raftLog.getCommitIndex() + ", lastApplied=" + raftLog.getLastApplied() + ")");
+            }
             for (LogEntry entry : toApply) {
                 try {
+                    System.out.println("[RAFT] " + nodeId + " applying entry " + entry.index() +
+                        " opType=" + entry.opType() + " clientId=" + entry.clientId() + " requestId=" + entry.requestId());
                     stateMachineApplier.accept(entry);
                     // Advance exactly one position only after successful apply.
                     raftLog.advanceLastAppliedTo(entry.index());
+
+                    // Complete any pending commit futures for this applied index
+                    CompletableFuture<Boolean> future = pendingCommits.get(entry.index());
+                    if (future != null) {
+                        System.out.println("[RAFT] " + nodeId + " completing commit future for index " + entry.index());
+                        future.complete(true);
+                        System.out.println("[RAFT] " + nodeId + " completed commit future for index " + entry.index() + " after apply");
+                    }
                 } catch (Exception e) {
                     terminalApplyFailure = new ApplyFailure(entry.index(), entry, e);
                     System.err.println("[RAFT] Terminal apply failure at index=" + entry.index()
@@ -1611,6 +1671,11 @@ public class RaftNode implements AutoCloseable {
                         + "; application halted until restart/operator recovery");
                     e.printStackTrace();
                     // Do not advance lastApplied and do not retry in a hot loop.
+                    // Complete futures with failure
+                    CompletableFuture<Boolean> future = pendingCommits.get(entry.index());
+                    if (future != null) {
+                        future.complete(false);
+                    }
                     return;
                 }
             }
@@ -1768,7 +1833,7 @@ public class RaftNode implements AutoCloseable {
                 raftLog.advanceCommitIndex(index);
                 System.out.println("[RAFT] " + nodeId + " committed index " + index);
 
-                // Complete any pending commit futures
+                // Complete the commit future for committed entries
                 CompletableFuture<Boolean> future = pendingCommits.get(index);
                 if (future != null) {
                     future.complete(true);

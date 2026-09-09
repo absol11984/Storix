@@ -183,11 +183,13 @@ public class ClusterMetadataClient implements AutoCloseable {
 
     /**
      * Gets an object.
+     * Retries on NOT_FOUND responses (may be a follower that hasn't received
+     * the data through replication yet).
      */
     public ObjectMetadataDTO getObject(String objectName) throws IOException {
         beginRequest();
         try {
-            return executeWithLeaderRouting(() -> {
+            return executeWithLeaderRoutingForObjectGet(() -> {
                 setClientRequestId();
                 return currentClient.getObject(objectName);
             });
@@ -373,6 +375,13 @@ public class ClusterMetadataClient implements AutoCloseable {
                     cachedLeader = null;
                     closeCurrentClient();
                     serverIndex++;
+                } else if (message.contains("Object not found") || message.contains("NOT_FOUND")) {
+                    // Object not found on this server - might be a follower that hasn't received
+                    // the data through replication yet. Try another server.
+                    System.out.println("[CLIENT] Object not found, trying another server");
+                    cachedLeader = null;
+                    closeCurrentClient();
+                    serverIndex++;
                 }
 
                 // Brief backoff before retry
@@ -389,6 +398,93 @@ public class ClusterMetadataClient implements AutoCloseable {
 
         throw new IOException("Operation failed after " + attempts + " attempts. Last error: " +
                 (lastException != null ? lastException.getMessage() : "unknown"), lastException);
+    }
+
+    /**
+     * Executes an object GET operation with leader routing and null-return retry.
+     * When getObject() returns null (NOT_FOUND), tries another server since the object
+     * might exist on the leader but the request hit a follower that hasn't received
+     * the data through replication yet.
+     */
+    private ObjectMetadataDTO executeWithLeaderRoutingForObjectGet(Operation<ObjectMetadataDTO> operation) throws IOException {
+        ensureNotClosed();
+
+        int attempts = 0;
+        IOException lastException = null;
+        int serverIndex = 0;
+
+        while (attempts < maxAttempts) {
+            attempts++;
+
+            try {
+                // Ensure connected - cycle through servers
+                if (currentClient == null || !currentClient.isConnected()) {
+                    connectToServer(serverIndex % servers.size());
+                    serverIndex++;
+                }
+
+                ObjectMetadataDTO result = operation.execute();
+
+                // If we got a non-null result, success!
+                if (result != null) {
+                    return result;
+                }
+
+                // Null result means NOT_FOUND - might be a follower that hasn't replicated yet
+                System.out.println("[CLIENT] Object not found (null return), trying another server");
+                cachedLeader = null;
+                closeCurrentClient();
+                serverIndex++;
+
+                // Brief backoff before retry
+                if (attempts < maxAttempts) {
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted during retry", ie);
+                    }
+                }
+
+            } catch (IOException e) {
+                lastException = e;
+                String message = e.getMessage() != null ? e.getMessage() : "";
+
+                // Check if it's a NOT_LEADER error with leader info
+                LeaderInfo leaderInfo = extractLeaderInfo(e);
+                if (leaderInfo != null && leaderInfo != LeaderInfo.UNKNOWN) {
+                    System.out.println("[CLIENT] Received NOT_LEADER, leader=" + leaderInfo);
+                    if (tryConnectToLeader(leaderInfo)) {
+                        continue;
+                    }
+                    cachedLeader = null;
+                    closeCurrentClient();
+                } else if (leaderInfo == LeaderInfo.UNKNOWN || isConnectionFailure(e)) {
+                    System.out.println("[CLIENT] " + (leaderInfo == LeaderInfo.UNKNOWN ? "Unknown leader" : "Connection failure") + ", trying another server");
+                    cachedLeader = null;
+                    closeCurrentClient();
+                    serverIndex++;
+                }
+
+                // Brief backoff before retry
+                if (attempts < maxAttempts) {
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted during retry", ie);
+                    }
+                }
+            }
+        }
+
+        if (lastException != null) {
+            throw new IOException("Operation failed after " + attempts + " attempts. Last error: " +
+                    lastException.getMessage(), lastException);
+        } else {
+            // All attempts returned null
+            return null;
+        }
     }
 
     /**

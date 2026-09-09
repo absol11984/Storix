@@ -1,0 +1,589 @@
+<title>Leader Failover Test Race Condition Analysis</title>
+<style>
+:root {
+    --surface-light: #ffffff;
+    --surface-light-secondary: #f8f9fa;
+    --surface-dark: #1e1e1e;
+    --surface-dark-secondary: #252526;
+    --text-light: #213547;
+    --text-dark: #e0e0e0;
+    --primary: #0066cc;
+    --warning: #ff8c00;
+    --error: #d32f2f;
+    --success: #2e7d32;
+    --border-light: #e0e0e0;
+    --border-dark: #404040;
+    --code-bg-light: #f5f5f5;
+    --code-bg-dark: #2d2d2d;
+    --gap-sm: 8px;
+    --gap-md: 16px;
+    --gap-lg: 24px;
+    --radius: 6px;
+    --font-mono: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+        --surface-light: var(--surface-dark);
+        --surface-light-secondary: var(--surface-dark-secondary);
+        --text-light: var(--text-dark);
+        --border-light: var(--border-dark);
+        --code-bg-light: var(--code-bg-dark);
+    }
+}
+
+:root[data-theme="dark"] {
+    --surface-light: var(--surface-dark);
+    --surface-light-secondary: var(--surface-dark-secondary);
+    --text-light: var(--text-dark);
+    --border-light: var(--border-dark);
+    --code-bg-light: var(--code-bg-dark);
+}
+
+body {
+    margin: 0;
+    padding: var(--gap-lg);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--text-light);
+    background: var(--surface-light);
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+h1 {
+    margin: 0 0 var(--gap-md);
+    font-size: 28px;
+    color: var(--text-light);
+    border-bottom: 2px solid var(--primary);
+    padding-bottom: var(--gap-sm);
+}
+
+h2 {
+    margin: var(--gap-lg) 0 var(--gap-md);
+    font-size: 20px;
+    color: var(--primary);
+}
+
+h3 {
+    margin: var(--gap-md) 0 var(--gap-sm);
+    font-size: 16px;
+    color: var(--text-light);
+}
+
+.section {
+    background: var(--surface-light-secondary);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+    padding: var(--gap-lg);
+    margin-bottom: var(--gap-lg);
+}
+
+.code-block {
+    background: var(--code-bg-light);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+    padding: var(--gap-md);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.4;
+    overflow-x: auto;
+    margin: var(--gap-md) 0;
+}
+
+.timeline {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap-md);
+}
+
+.timeline-item {
+    display: flex;
+    gap: var(--gap-md);
+    align-items: flex-start;
+}
+
+.timeline-time {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: #666;
+    min-width: 80px;
+    text-align: right;
+}
+
+.timeline-content {
+    flex: 1;
+    padding: var(--gap-sm) var(--gap-md);
+    background: white;
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+    position: relative;
+}
+
+.timeline-content::before {
+    content: '';
+    position: absolute;
+    left: -6px;
+    top: 12px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--primary);
+}
+
+.timeline-item.failure .timeline-content::before {
+    background: var(--error);
+}
+
+.timeline-item.success .timeline-content::before {
+    background: var(--success);
+}
+
+.timeline-item.warning .timeline-content::before {
+    background: var(--warning);
+}
+
+.race-diagram {
+    display: flex;
+    justify-content: space-between;
+    margin: var(--gap-lg) 0;
+    gap: var(--gap-md);
+}
+
+.race-thread {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap-md);
+}
+
+.thread-title {
+    text-align: center;
+    font-weight: bold;
+    padding: var(--gap-sm);
+    background: var(--primary);
+    color: white;
+    border-radius: var(--radius);
+}
+
+.thread-event {
+    padding: var(--gap-sm) var(--gap-md);
+    background: white;
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+    text-align: center;
+    font-size: 13px;
+    min-height: 60px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.race-connection {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-around;
+    align-items: center;
+    width: 100px;
+}
+
+.connection-line {
+    width: 2px;
+    height: 20px;
+    background: var(--border-light);
+}
+
+.connection-label {
+    writing-mode: vertical-lr;
+    transform: rotate(180deg);
+    font-size: 12px;
+    color: #666;
+}
+
+.fix-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.fix-item {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--gap-md);
+    padding: var(--gap-md);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+    margin-bottom: var(--gap-md);
+    background: white;
+}
+
+.fix-number {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--primary);
+    color: white;
+    font-weight: bold;
+    font-size: 12px;
+    flex-shrink: 0;
+}
+
+.fix-content {
+    flex: 1;
+}
+
+.fix-title {
+    font-weight: bold;
+    margin-bottom: 4px;
+}
+
+.fix-description {
+    color: #666;
+    font-size: 13px;
+}
+
+.status-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: bold;
+    text-transform: uppercase;
+    margin-left: 8px;
+}
+
+.status-failure {
+    background: var(--error);
+    color: white;
+}
+
+.status-warning {
+    background: var(--warning);
+    color: white;
+}
+
+.status-success {
+    background: var(--success);
+    color: white;
+}
+
+.impact {
+    background: #fff3e0;
+    border-left: 4px solid var(--warning);
+    padding: var(--gap-md);
+    margin: var(--gap-md) 0;
+    border-radius: var(--radius);
+}
+
+.impact h4 {
+    margin-top: 0;
+    color: var(--warning);
+}
+
+.test-log {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.4;
+    color: #444;
+    margin: 0;
+    white-space: pre-wrap;
+}
+
+.test-log-failure {
+    color: var(--error);
+    font-weight: bold;
+}
+</style>
+
+<h1>Raft Leader Failover Test Race Condition Analysis</h1>
+
+<div class="section">
+    <h2>Problem Summary</h2>
+    <p><strong>Test:</strong> <code>MetadataClientLeaderFailoverTest#testConnectionFailureTriggersFailover</code></p>
+    <p><strong>Symptoms:</strong> Intermittent failure where Object 2 returns null (expected: not <null>) after leader failover</p>
+    <p><strong>Failure Rate:</strong> ~40% (2 out of 5 runs)</p>
+    <p><strong>Error Message:</strong> <code>org.opentest4j.AssertionFailedError: Object 2 should be accessible ==> expected: not <null></code></p>
+</div>
+
+<div class="section">
+    <h2>Race Condition Analysis</h2>
+
+    <div class="race-diagram">
+        <div class="race-thread">
+            <div class="thread-title">Leader (Old)</div>
+            <div class="thread-event">Object 1 committed & applied</div>
+            <div class="thread-event">Node stopped</div>
+            <div class="thread-event">Election timeout</div>
+        </div>
+
+        <div class="race-connection">
+            <div class="connection-label">Raft Log</div>
+            <div class="connection-line"></div>
+            <div class="connection-label">Network</div>
+            <div class="connection-line"></div>
+            <div class="connection-label">Client</div>
+        </div>
+
+        <div class="race-thread">
+            <div class="thread-title">Leader (New)</div>
+            <div class="thread-event">Elected leader</div>
+            <div class="thread-event">Object 2 committed</div>
+            <div class="thread-event">Background apply runs</div>
+        </div>
+
+        <div class="race-connection">
+            <div class="connection-label">RPC</div>
+            <div class="connection-line"></div>
+            <div class="connection-label">Time</div>
+            <div class="connection-line"></div>
+            <div class="connection-label">Query</div>
+        </div>
+
+        <div class="race-thread">
+            <div class="thread-title">Client</div>
+            <div class="thread-event">Create Object 1</div>
+            <div class="thread-event">Stop leader detection</div>
+            <div class="thread-event">Create Object 2</div>
+            <div class="thread-event">GET Object 2 <span class="status-badge status-failure">RACE!</span></div>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Root Cause</h2>
+
+    <h3>Sequence of Events Leading to Failure:</h3>
+
+    <div class="timeline">
+        <div class="timeline-item">
+            <div class="timeline-time">T1</div>
+            <div class="timeline-content">
+                <strong>Object 2 CREATE:</strong> Client submits entry to new leader<br>
+                • Entry appended to Raft log<br>
+                • Committed by majority<br>
+                • Commit future completes <span class="status-badge status-warning">IMMEDIATELY</span>
+            </div>
+        </div>
+
+        <div class="timeline-item">
+            <div class="timeline-time">T2</div>
+            <div class="timeline-content">
+                <strong>Background apply loop:</strong> Runs every 10ms<br>
+                • Checks for entries where <code>commitIndex > lastApplied</code><br>
+                • Applies entries to state machine<br>
+                • Advances <code>lastApplied</code><br>
+                <span class="status-badge status-warning">RACE WINDOW</span>
+            </div>
+        </div>
+
+        <div class="timeline-item failure">
+            <div class="timeline-time">T3</div>
+            <div class="timeline-content">
+                <strong>Object 2 GET:</strong> Client immediately requests Object 2<br>
+                • GET arrives at new leader<br>
+                • <code>MetadataStore.getObject()</code> checks database<br>
+                • Entry NOT YET APPLIED (still in Raft log)<br>
+                • Returns <code>null</code> → <span class="status-badge status-failure">TEST FAILS</span>
+            </div>
+        </div>
+
+        <div class="timeline-item">
+            <div class="timeline-time">T4</div>
+            <div class="timeline-content">
+                <strong>Background apply runs:</strong> Finally applies Object 2 entry<br>
+                • Object 2 now in <code>MetadataStore</code><br>
+                • Subsequent GET would succeed<br>
+                <span class="status-badge status-warning">TOO LATE!</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="impact">
+        <h4>Key Issue: Asynchronous State Machine Application</h4>
+        <p>The commit future now completes <strong>after</strong> state machine application (moved from <code>updateCommitIndex()</code> to <code>applyCommittedEntries()</code>), but in multi-node clusters:</p>
+        <ul>
+            <li>Entries are applied by the <strong>background loop</strong> (every 10ms)</li>
+            <li>Client receives success when commit future completes</li>
+            <li>But entry may not be applied to state machine yet</li>
+            <li>GET request races with background apply loop</li>
+        </ul>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Previous Fix Attempt</h2>
+
+    <h3>Code Changes Made:</h3>
+
+    <div class="code-block">
+// OLD: Completed future immediately on commit
+if (replicationCount >= majority) {
+    raftLog.advanceCommitIndex(index);
+    CompletableFuture<Boolean> future = pendingCommits.get(index);
+    if (future != null) {
+        future.complete(true);  // <-- HERE: Immediate completion
+    }
+}
+
+// NEW: Wait for apply before completing future
+if (replicationCount >= majority) {
+    raftLog.advanceCommitIndex(index);
+    // Do NOT complete the commit future here
+    // Wait for applyCommittedEntries()
+}</div>
+
+    <div class="code-block">
+// In applyCommittedEntries():
+stateMachineApplier.accept(entry);
+raftLog.advanceLastAppliedTo(entry.index());
+
+// Complete future AFTER apply
+CompletableFuture<Boolean> future = pendingCommits.get(entry.index());
+if (future != null) {
+    future.complete(true);  // <-- HERE: After apply
+    System.out.println("[RAFT] ... after apply");
+}</div>
+
+    <p><strong>Why this didn't fully fix it:</strong> The background apply loop runs asynchronously every 10ms. When client immediately sends GET after CREATE returns, it might arrive before the background loop runs.</p>
+</div>
+
+<div class="section">
+    <h2>Proposed Solution</h2>
+
+    <h3>Option 1: Synchronous Apply for Multi-Node Too</h3>
+
+    <div class="fix-list">
+        <div class="fix-item">
+            <div class="fix-number">1</div>
+            <div class="fix-content">
+                <div class="fix-title">Modify RaftNode.submit() for multi-node</div>
+                <div class="fix-description">In the multi-node path, after replication to majority, synchronously apply the entry before returning success</div>
+            </div>
+        </div>
+
+        <div class="fix-item">
+            <div class="fix-number">2</div>
+            <div class="fix-content">
+                <div class="fix-title">Handle background loop conflict</div>
+                <div class="fix-description">Use the same applyLock mechanism to prevent double application of entries by both submit path and background loop</div>
+            </div>
+        </div>
+
+        <div class="fix-item">
+            <div class="fix-number">3</div>
+            <div class="fix-content">
+                <div class="fix-title">Update test expectations</div>
+                <div class="fix-description">Test already expects Object 2 to be immediately accessible - this fix makes that guarantee stronger</div>
+            </div>
+        </div>
+    </div>
+
+    <h3>Option 2: Add Retry Logic in Client</h3>
+
+    <div class="fix-list">
+        <div class="fix-item">
+            <div class="fix-number">1</div>
+            <div class="fix-content">
+                <div class="fix-title">Modify ClusterMetadataClient.getObject()</div>
+                <div class="fix-description">Add retry with exponential backoff when Object 2 returns null but CREATE succeeded</div>
+            </div>
+        </div>
+
+        <div class="fix-item">
+            <div class="fix-number">2</div>
+            <div class="fix-content">
+                <div class="fix-title">Track known committed objects</div>
+                <div class="fix-description">Maintain a set of object names that CREATE succeeded for, retry GET if object missing</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Recommended Implementation</h2>
+
+    <div class="code-block">
+// Add to RaftNode.submit() multi-node path:
+boolean committed = commitFuture.get(10, TimeUnit.SECONDS);
+if (committed) {
+    // NOW synchronous: apply before returning
+    synchronized (applyLock) {
+        // Check if entry was already applied by background loop
+        if (raftLog.getLastApplied() >= index) {
+            System.out.println("[RAFT] " + nodeId + " entry " + index + " already applied");
+        } else {
+            // Apply synchronously
+            stateMachineApplier.accept(indexedEntry);
+            raftLog.advanceLastAppliedTo(indexedEntry.index());
+            System.out.println("[RAFT] " + nodeId + " applied entry " + index + " synchronously");
+        }
+    }
+}
+return committed;</div>
+
+    <h3>Advantages:</h3>
+    <ul>
+        <li><strong>Strong consistency:</strong> CREATE returns success only after entry applied</li>
+        <li><strong>No test modification needed:</strong> Already expects Object 2 to be accessible</li>
+        <li><strong>Simpler:</strong> Single code path for both single and multi-node</li>
+        <li><strong>Correct Raft semantics:</strong> Entry is durably applied before client receives success</li>
+    </ul>
+
+    <h3>Considerations:</h3>
+    <ul>
+        <li><strong>Performance:</strong> Synchronous apply may add latency for multi-node operations</li>
+        <li><strong>Lock contention:</strong> applyLock may block background loop</li>
+        <li><strong>Need to check background loop:</strong> Ensure it doesn't double-apply entries</li>
+    </ul>
+</div>
+
+<div class="section">
+    <h2>Testing Strategy</h2>
+
+    <ol>
+        <li><strong>Run focused test 10 times:</strong> Verify fix eliminates intermittent failures</li>
+        <li><strong>Run all MetadataClientLeaderFailoverTests:</strong> Ensure no regression</li>
+        <li><strong>Run metadata-server tests:</strong> Verify Raft implementation correctness</li>
+        <li><strong>Full mvn clean test:</strong> Overall system validation</li>
+    </ol>
+
+    <div class="impact">
+        <h4>Success Criteria:</h4>
+        <ul>
+            <li>Test passes 100% of time (10/10 runs)</li>
+            <li>All Raft tests pass without modification</li>
+            <li>No performance regression in multi-node operations</li>
+            <li>Correct Raft semantics preserved: entry applied before success returned</li>
+        </ul>
+    </div>
+</div>
+
+<script>
+// Add interactive visualization of the race condition
+document.addEventListener('DOMContentLoaded', function() {
+    // Highlight the race condition timeline
+    const failureItem = document.querySelector('.timeline-item.failure .timeline-content');
+    if (failureItem) {
+        failureItem.style.animation = 'pulse 2s infinite';
+        failureItem.style.boxShadow = '0 0 0 2px rgba(211, 47, 47, 0.3)';
+    }
+
+    // Add CSS animation
+    const style = document.createElement('style');
+    style.textContent = `
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(211, 47, 47, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(211, 47, 47, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(211, 47, 47, 0); }
+        }
+    `;
+    document.head.appendChild(style);
+
+    // Log current time for reference
+    console.log('Analysis generated at:', new Date().toISOString());
+});
+</script>

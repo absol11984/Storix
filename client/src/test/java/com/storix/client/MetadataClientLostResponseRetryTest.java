@@ -200,6 +200,7 @@ public class MetadataClientLostResponseRetryTest {
 
     /**
      * Tests that different requestIds are NOT deduplicated.
+     * Each request creates a different object - deduplication only applies to same requestId.
      */
     @Test
     @Timeout(30)
@@ -212,19 +213,15 @@ public class MetadataClientLostResponseRetryTest {
             client.setClientId("test-client");
             client.connect();
 
-            String objectName = "idempotent-object-" + System.nanoTime();
-
-            // First request
+            // Different requestIds, different objects - all should succeed
             client.setCurrentRequestId("request-1");
-            client.createObject(new ObjectMetadataDTO(objectName, 1024, 3));
+            client.createObject(new ObjectMetadataDTO("object-a-" + System.nanoTime(), 1024, 3));
 
-            // Second request with different requestId - same object (idempotent by nature)
             client.setCurrentRequestId("request-2");
-            client.createObject(new ObjectMetadataDTO(objectName, 1024, 3));
+            client.createObject(new ObjectMetadataDTO("object-b-" + System.nanoTime(), 1024, 3));
 
-            // Different requestId, different object name - should both succeed
             client.setCurrentRequestId("request-3");
-            client.createObject(new ObjectMetadataDTO("another-object-" + System.nanoTime(), 1024, 3));
+            client.createObject(new ObjectMetadataDTO("object-c-" + System.nanoTime(), 1024, 3));
         }
     }
 
