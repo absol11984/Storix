@@ -3,6 +3,7 @@ package com.storix.metadata;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -25,7 +26,7 @@ class Phase3PlacementTest {
      * Test 1: Placement returns the requested replication factor.
      */
     @Test
-    void testPlacementReturnsRequestedReplicationFactor() {
+    void testPlacementReturnsRequestedReplicationFactor() throws IOException {
         // Register 5 healthy nodes
         for (int i = 1; i <= 5; i++) {
             registry.registerNode("node-" + i, "127.0.0.1", 9000 + i);
@@ -42,7 +43,7 @@ class Phase3PlacementTest {
      * Test 2: Placement never selects the same node twice.
      */
     @Test
-    void testPlacementNeverSelectsSameNodeTwice() {
+    void testPlacementNeverSelectsSameNodeTwice() throws IOException {
         // Register 4 nodes
         registry.registerNode("node-a", "127.0.0.1", 9001);
         registry.registerNode("node-b", "127.0.0.1", 9002);
@@ -66,7 +67,7 @@ class Phase3PlacementTest {
      * Test 3: Placement excludes unavailable (UNHEALTHY) nodes.
      */
     @Test
-    void testPlacementExcludesUnavailableNodes() {
+    void testPlacementExcludesUnavailableNodes() throws IOException {
         registry.registerNode("node-a", "127.0.0.1", 9001);
         registry.registerNode("node-b", "127.0.0.1", 9002);
         registry.registerNode("node-c", "127.0.0.1", 9003);
@@ -85,38 +86,25 @@ class Phase3PlacementTest {
     }
 
     /**
-     * Test 4: Insufficient nodes causes degraded replication (warning logged).
-     *
-     * Note: Current behavior is to return degraded replicas with a warning.
-     * This validates the existing behavior. If strict failure is required,
-     * PlacementManager.selectNodes() would need to throw an exception.
+     * Test 4: Insufficient nodes causes explicit failure.
      */
     @Test
-    void testInsufficientNodesReturnsDegradedReplication() {
+    void testInsufficientNodesFailsExplicitly() {
         // Only 2 nodes available but replication factor is 3
         registry.registerNode("node-a", "127.0.0.1", 9001);
         registry.registerNode("node-b", "127.0.0.1", 9002);
 
         PlacementManager pm = new PlacementManager(registry, 3);
-        List<NodeInfo> selected = pm.selectNodes(0);
 
-        // Current behavior: returns what's available (degraded)
-        assertEquals(2, selected.size(),
-                "When insufficient nodes, placement returns degraded replica count");
-
-        // All returned nodes should be distinct
-        long distinctCount = selected.stream()
-                .map(NodeInfo::getNodeId)
-                .distinct()
-                .count();
-        assertEquals(2, distinctCount);
+        assertThrows(IOException.class, () -> pm.selectNodes(0),
+                "When insufficient nodes, placement must fail explicitly");
     }
 
     /**
-     * Test 5: No healthy nodes returns empty list.
+     * Test 5: No healthy nodes throws IOException.
      */
     @Test
-    void testNoHealthyNodesReturnsEmptyList() {
+    void testNoHealthyNodesFails() {
         registry.registerNode("node-a", "127.0.0.1", 9001);
         registry.registerNode("node-b", "127.0.0.1", 9002);
 
@@ -125,17 +113,16 @@ class Phase3PlacementTest {
         registry.getNode("node-b").ifPresent(n -> n.setStatus(NodeStatus.UNHEALTHY));
 
         PlacementManager pm = new PlacementManager(registry, 2);
-        List<NodeInfo> selected = pm.selectNodes(0);
 
-        assertTrue(selected.isEmpty(),
-                "When no healthy nodes available, placement should return empty list");
+        assertThrows(IOException.class, () -> pm.selectNodes(0),
+                "When no healthy nodes available, placement must fail");
     }
 
     /**
      * Test 6: Round-robin distribution works across multiple chunks.
      */
     @Test
-    void testRoundRobinDistribution() {
+    void testRoundRobinDistribution() throws IOException {
         registry.registerNode("node-a", "127.0.0.1", 9001);
         registry.registerNode("node-b", "127.0.0.1", 9002);
         registry.registerNode("node-c", "127.0.0.1", 9003);

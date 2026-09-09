@@ -3,6 +3,7 @@ package com.storix.metadata;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -20,7 +21,7 @@ class PlacementManagerTest {
     }
 
     @Test
-    void testHealthyNodesOnly() {
+    void testHealthyNodesOnly() throws IOException {
         // Mark node-b unhealthy
         registry.getNode("node-b").ifPresent(n -> n.setStatus(NodeStatus.UNHEALTHY));
 
@@ -34,7 +35,7 @@ class PlacementManagerTest {
     }
 
     @Test
-    void testNoDuplicateReplicas() {
+    void testNoDuplicateReplicas() throws IOException {
         PlacementManager pm = new PlacementManager(registry, 3);
         List<NodeInfo> selected = pm.selectNodes(0);
         assertEquals(3, selected.size());
@@ -42,7 +43,7 @@ class PlacementManagerTest {
     }
 
     @Test
-    void testBalancedBasicPlacement() {
+    void testBalancedBasicPlacement() throws IOException {
         PlacementManager pm = new PlacementManager(registry, 2);
 
         // Given nodes are A, B, C (alphabetically sorted)
@@ -71,9 +72,6 @@ class PlacementManagerTest {
         registry.getNode("node-c").ifPresent(n -> n.setStatus(NodeStatus.UNHEALTHY));
 
         PlacementManager pm = new PlacementManager(registry, 3);
-        List<NodeInfo> selected = pm.selectNodes(0);
-
-        assertEquals(1, selected.size());
-        assertEquals("node-a", selected.get(0).getNodeId());
+        assertThrows(IOException.class, () -> pm.selectNodes(0));
     }
 }

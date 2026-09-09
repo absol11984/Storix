@@ -1,5 +1,6 @@
 package com.storix.metadata;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -26,38 +27,36 @@ public class PlacementManager {
 
     /**
      * Selects nodes for a chunk based on its index.
-     * Returns up to replicationFactor distinct healthy nodes.
-     * If fewer healthy nodes are available than the replication factor,
-     * returns only what is available (degraded replication).
+     * Returns exactly replicationFactor distinct healthy nodes.
+     * Throws IOException when insufficient healthy nodes are available.
      *
      * @param chunkIndex the index of the chunk being placed
      * @return list of NodeInfo targets for this chunk's replicas
+     * @throws IOException if healthy nodes < replication factor
      */
-    public List<NodeInfo> selectNodes(int chunkIndex) {
+    public List<NodeInfo> selectNodes(int chunkIndex) throws IOException {
         List<NodeInfo> healthy = nodeRegistry.getHealthyNodes();
         if (healthy.isEmpty()) {
-            return List.of();
+            throw new IOException("No healthy storage nodes available");
+        }
+
+        if (healthy.size() < replicationFactor) {
+            throw new IOException("Insufficient healthy storage nodes: " +
+                healthy.size() + " available, " + replicationFactor + " required");
         }
 
         // Sort by nodeId for deterministic ordering
         healthy = new ArrayList<>(healthy);
         healthy.sort((a, b) -> a.getNodeId().compareTo(b.getNodeId()));
 
-        int effectiveReplicas = Math.min(replicationFactor, healthy.size());
-        List<NodeInfo> selected = new ArrayList<>(effectiveReplicas);
+        List<NodeInfo> selected = new ArrayList<>(replicationFactor);
 
         // Round-robin starting position based on chunk index
         int startIdx = chunkIndex % healthy.size();
 
-        for (int i = 0; i < effectiveReplicas; i++) {
+        for (int i = 0; i < replicationFactor; i++) {
             int idx = (startIdx + i) % healthy.size();
             selected.add(healthy.get(idx));
-        }
-
-        if (effectiveReplicas < replicationFactor) {
-            System.out.println("[PLACEMENT] Replication degraded for chunk " + chunkIndex +
-                    ": wanted " + replicationFactor + " replicas, only " + effectiveReplicas +
-                    " healthy nodes available");
         }
 
         StringBuilder sb = new StringBuilder("[PLACEMENT] chunk-" + chunkIndex + " → ");
