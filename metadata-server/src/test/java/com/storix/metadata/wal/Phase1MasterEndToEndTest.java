@@ -33,7 +33,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class Phase1MasterEndToEndTest {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final int BASE_PORT = 58000;
+    private static final int BASE_PORT = 56000;
 
     @TempDir
     Path tempDir;
@@ -206,9 +206,12 @@ class Phase1MasterEndToEndTest {
         serverThread.setDaemon(true);
         serverThread.start();
 
-        // Wait for RaftNode to become leader
+        // Wait for RPC server to be ready before checking for leader
         RaftNode raftNode = server.getRaftNode();
         if (raftNode != null) {
+            raftNode.waitForRpcServerReady();
+
+            // Wait for RaftNode to become leader
             long deadline = System.currentTimeMillis() + 5000;
             while (!raftNode.isLeader() && System.currentTimeMillis() < deadline) {
                 System.out.println("[TEST] Waiting for leader... state=" + raftNode.getState() +

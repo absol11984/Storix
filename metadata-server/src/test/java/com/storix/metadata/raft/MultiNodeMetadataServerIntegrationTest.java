@@ -1648,11 +1648,50 @@ class MultiNodeMetadataServerIntegrationTest {
         waitForLastApplied(leader, midIndex, 3000);
         System.out.println("Submitted " + midEntries + " more entries, lastIndex=" + midIndex);
 
-        // Restart the slow follower
+        // Restart the slow follower - need to recreate the server to properly initialize WAL
         System.out.println("Restarting follower: " + slowFollower.getRaftNode().getNodeId());
-        slowFollower.getRaftNode().start();
-        slowFollower.getRaftNode().waitForRpcServerReady();
+
+        // Get the follower's data and config before stopping
+        String followerId = slowFollower.getRaftNode().getNodeId();
+        Path dataDir;
+        ClusterConfig config;
+        int port;
+
+        if (followerId.equals("meta-a")) {
+            dataDir = dataDirA;
+            config = configA;
+            port = portA;
+        } else if (followerId.equals("meta-b")) {
+            dataDir = dataDirB;
+            config = configB;
+            port = portB;
+        } else {
+            dataDir = dataDirC;
+            config = configC;
+            port = portC;
+        }
+
+        Path metaFile = dataDir.resolve("metadata.json");
+
+        // Create and start new server (with proper WAL initialization)
+        MetadataServer newFollower = createServerWithRetry(port, metaFile, config, dataDir, followerId, 3);
+
+        // Replace in our tracking variables
+        if (followerId.equals("meta-a")) {
+            serverA = newFollower;
+        } else if (followerId.equals("meta-b")) {
+            serverB = newFollower;
+        } else {
+            serverC = newFollower;
+        }
+
+        newFollower.getRaftNode().start();
+        newFollower.getRaftNode().waitForRpcServerReady();
+        wireApplier(newFollower);
         Thread.sleep(200);
+
+        // Update slowFollower reference
+        slowFollower = newFollower;
 
         // Wait for the follower to catch up via AppendEntries from the leader
         waitForLastApplied(slowFollower, midIndex, 10000);

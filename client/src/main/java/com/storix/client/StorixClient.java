@@ -7,7 +7,9 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * High-level client for Storix operations.
@@ -127,6 +129,7 @@ public class StorixClient implements AutoCloseable {
 
     /**
      * Downloads a file from Storix with replica failover and checksum verification.
+     * Implements robust failover across all replicas for each chunk.
      */
     public void getFile(String objectName, Path outputPath) throws IOException {
         System.out.println("Downloading " + objectName);
@@ -142,7 +145,11 @@ public class StorixClient implements AutoCloseable {
         List<ChunkInfoDTO> sortedChunks = new ArrayList<>(metadata.getChunks());
         sortedChunks.sort((a, b) -> Integer.compare(a.getChunkIndex(), b.getChunkIndex()));
 
-        NodeInfoDTO[] activeNodes = metadataClient.getNodes();
+        // Get all nodes (not just active - stale placement may list failed nodes)
+        NodeInfoDTO[] allNodes = metadataClient.getNodes();
+
+        // Track failures per chunk for logging
+        Map<String, List<String>> chunkFailures = new HashMap<>();
 
         try (var out = Files.newOutputStream(outputPath)) {
             int chunkNum = 1;
@@ -151,23 +158,36 @@ public class StorixClient implements AutoCloseable {
 
                 byte[] data = null;
                 boolean chunkSuccess = false;
+                List<String> failures = new ArrayList<>();
 
+                // Try each replica in order
                 for (String replicaNodeId : chunkInfo.getReplicaNodeIds()) {
-                    NodeInfoDTO targetNode = findNode(activeNodes, replicaNodeId);
+                    NodeInfoDTO targetNode = findNode(allNodes, replicaNodeId);
                     if (targetNode == null) {
-                        System.out.println("[GET] " + replicaNodeId + " unavailable (not in active nodes)");
+                        failures.add(replicaNodeId + ": not in node registry");
+                        System.out.println("[GET] " + replicaNodeId + " unavailable (not in node registry)");
                         continue;
                     }
 
                     try (StorageNodeClient sc = new StorageNodeClient(targetNode.getHost(), targetNode.getPort())) {
                         data = sc.getChunk(chunkInfo.getChunkId());
 
+                        // Validate chunk length matches expected
+                        if (chunkInfo.getChunkSize() > 0 && data.length != chunkInfo.getChunkSize()) {
+                            failures.add(replicaNodeId + ": length mismatch (expected=" + chunkInfo.getChunkSize() + ", got=" + data.length + ")");
+                            System.out.println("[GET] " + replicaNodeId + " chunk corrupted (length mismatch: expected " + chunkInfo.getChunkSize() + ", got " + data.length + ")");
+                            data = null;
+                            continue;
+                        }
+
                         // Verify checksum
                         if (chunkInfo.getChecksum() != null && !chunkInfo.getChecksum().isEmpty()) {
                             String expected = chunkInfo.getChecksum();
                             String actual = computeSha256(data);
                             if (!expected.equals(actual)) {
-                                System.out.println("[GET] " + replicaNodeId + " chunk corrupted (checksum mismatch)");
+                                failures.add(replicaNodeId + ": checksum mismatch");
+                                System.out.println("[GET] " + replicaNodeId + " chunk CORRUPTED (checksum mismatch)");
+                                data = null;
                                 continue;
                             }
                         }
@@ -175,21 +195,29 @@ public class StorixClient implements AutoCloseable {
                         chunkSuccess = true;
                         break;
                     } catch (IOException e) {
+                        failures.add(replicaNodeId + ": " + e.getMessage());
                         System.out.println("[GET] " + replicaNodeId + " unavailable: " + e.getMessage());
                         System.out.println("[GET] Falling back to next replica...");
                     }
                 }
 
                 if (!chunkSuccess) {
-                    throw new IOException("Failed to retrieve chunk " + chunkInfo.getChunkId() + " from any replica");
+                    System.err.println("[ERROR] All replicas failed for chunk " + chunkInfo.getChunkId());
+                    System.err.println("[ERROR] Failures: " + failures);
+                    throw new IOException("Failed to retrieve chunk " + chunkInfo.getChunkId() +
+                        " from any replica. Failures: " + failures);
                 }
 
                 out.write(data);
                 chunkNum++;
+                chunkFailures.put(chunkInfo.getChunkId(), failures);
             }
         }
 
         System.out.println("Download successful: " + outputPath);
+        if (!chunkFailures.isEmpty()) {
+            System.out.println("Chunks with fallback: " + chunkFailures.size());
+        }
     }
 
     /**

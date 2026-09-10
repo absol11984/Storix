@@ -822,61 +822,68 @@ public class WAL implements AutoCloseable {
 
             // Write to temp file, then atomic rename
             Path tempFile = walFile.resolveSibling(walFile.getFileName() + ".tmp");
-            try (FileChannel newChannel = FileChannel.open(tempFile,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.WRITE,
-                    StandardOpenOption.SYNC)) {
-
-                // Write header
-                writeHeaderTo(newChannel);
-
-                // Write state record with current term and votedFor
-                {
-                    byte[] votedForBytes = votedFor != null ? votedFor.getBytes() : new byte[0];
-                    ByteBuffer stateBuf = ByteBuffer.allocate(1 + 8 + 4 + votedForBytes.length + 8 + 8);
-                    stateBuf.put(STATE_RECORD_TYPE);
-                    stateBuf.putLong(term);
-                    stateBuf.putInt(votedForBytes.length);
-                    if (votedForBytes.length > 0) {
-                        stateBuf.put(votedForBytes);
-                    }
-                    stateBuf.putLong(commitIndex);
-                    stateBuf.putLong(recoveryResult.lastApplied);
-                    stateBuf.flip();
-                    newChannel.write(stateBuf);
-                }
-
-                // Write post-snapshot entries
-                for (LogEntry entry : postSnapshotEntries) {
-                    ByteBuffer entryBuf = serialize(entry);
-                    newChannel.write(entryBuf);
-                }
-                newChannel.force(true);
-            }
-
-            // Close old channel
             try {
-                if (oldChannel != null && oldChannel.isOpen()) {
-                    oldChannel.close();
+                try (FileChannel newChannel = FileChannel.open(tempFile,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.SYNC)) {
+
+                    // Write header
+                    writeHeaderTo(newChannel);
+
+                    // Write state record with current term and votedFor
+                    {
+                        byte[] votedForBytes = votedFor != null ? votedFor.getBytes() : new byte[0];
+                        ByteBuffer stateBuf = ByteBuffer.allocate(1 + 8 + 4 + votedForBytes.length + 8 + 8);
+                        stateBuf.put(STATE_RECORD_TYPE);
+                        stateBuf.putLong(term);
+                        stateBuf.putInt(votedForBytes.length);
+                        if (votedForBytes.length > 0) {
+                            stateBuf.put(votedForBytes);
+                        }
+                        stateBuf.putLong(commitIndex);
+                        stateBuf.putLong(recoveryResult.lastApplied);
+                        stateBuf.flip();
+                        newChannel.write(stateBuf);
+                    }
+
+                    // Write post-snapshot entries
+                    for (LogEntry entry : postSnapshotEntries) {
+                        ByteBuffer entryBuf = serialize(entry);
+                        newChannel.write(entryBuf);
+                    }
+                    newChannel.force(true);
                 }
+
+                // Close old channel
+                try {
+                    if (oldChannel != null && oldChannel.isOpen()) {
+                        oldChannel.close();
+                    }
+                } catch (IOException e) {
+                    // Ignore close errors
+                }
+
+                // Atomic move
+                Files.move(tempFile, walFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+
+                // Reopen channel and seek to end
+                this.channel = FileChannel.open(walFile,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.READ,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.SYNC);
+                this.channel.position(this.channel.size());
+
+                // Reset deduplication state after compaction (WAL was rewritten from scratch)
+                lastPersistedCommitIndex = commitIndex;
+                lastPersistedLastApplied = recoveryResult.lastApplied;
+
             } catch (IOException e) {
-                // Ignore close errors
+                // Restore old channel if rewrite failed
+                this.channel = oldChannel;
+                throw e;
             }
-
-            // Atomic move
-            Files.move(tempFile, walFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-
-            // Reopen channel and seek to end
-            this.channel = FileChannel.open(walFile,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.READ,
-                    StandardOpenOption.WRITE,
-                    StandardOpenOption.SYNC);
-            this.channel.position(this.channel.size());
-
-            // Reset deduplication state after compaction (WAL was rewritten from scratch)
-            lastPersistedCommitIndex = commitIndex;
-            lastPersistedLastApplied = recoveryResult.lastApplied;
 
         } finally {
             lock.unlock();
@@ -898,6 +905,7 @@ public class WAL implements AutoCloseable {
         try {
             closed = true;
             if (channel.isOpen()) {
+                channel.force(true);
                 channel.close();
             }
         } finally {
@@ -989,61 +997,68 @@ public class WAL implements AutoCloseable {
             Path tempFile = walFile.resolveSibling(walFile.getFileName() + ".tmp");
             boolean tempFileCreated = false;
             Path walFileRef = walFile; // For use in finally block
-            try (FileChannel newChannel = FileChannel.open(tempFile,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.WRITE,
-                    StandardOpenOption.SYNC)) {
-
-                // Write header
-                writeHeaderTo(newChannel);
-
-                // Write state record
-                byte[] votedForBytes = pendingVotedFor != null ? pendingVotedFor.getBytes() : new byte[0];
-                ByteBuffer stateBuf = ByteBuffer.allocate(1 + 8 + 4 + votedForBytes.length + 8 + 8);
-                stateBuf.put(STATE_RECORD_TYPE);
-                stateBuf.putLong(pendingTerm);
-                stateBuf.putInt(votedForBytes.length);
-                if (votedForBytes.length > 0) {
-                    stateBuf.put(votedForBytes);
-                }
-                stateBuf.putLong(recoveryResult.commitIndex);
-                stateBuf.putLong(recoveryResult.lastApplied);
-                stateBuf.flip();
-                newChannel.write(stateBuf);
-
-                // Write kept entries
-                for (LogEntry entry : keptEntries) {
-                    ByteBuffer entryBuf = serialize(entry);
-                    newChannel.write(entryBuf);
-                }
-                newChannel.force(true);
-                tempFileCreated = true;
-            }
-
-            // Close old channel
             try {
-                if (oldChannel != null && oldChannel.isOpen()) {
-                    oldChannel.close();
+                try (FileChannel newChannel = FileChannel.open(tempFile,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.SYNC)) {
+
+                    // Write header
+                    writeHeaderTo(newChannel);
+
+                    // Write state record
+                    byte[] votedForBytes = pendingVotedFor != null ? pendingVotedFor.getBytes() : new byte[0];
+                    ByteBuffer stateBuf = ByteBuffer.allocate(1 + 8 + 4 + votedForBytes.length + 8 + 8);
+                    stateBuf.put(STATE_RECORD_TYPE);
+                    stateBuf.putLong(pendingTerm);
+                    stateBuf.putInt(votedForBytes.length);
+                    if (votedForBytes.length > 0) {
+                        stateBuf.put(votedForBytes);
+                    }
+                    stateBuf.putLong(recoveryResult.commitIndex);
+                    stateBuf.putLong(recoveryResult.lastApplied);
+                    stateBuf.flip();
+                    newChannel.write(stateBuf);
+
+                    // Write kept entries
+                    for (LogEntry entry : keptEntries) {
+                        ByteBuffer entryBuf = serialize(entry);
+                        newChannel.write(entryBuf);
+                    }
+                    newChannel.force(true);
+                    tempFileCreated = true;
                 }
+
+                // Close old channel
+                try {
+                    if (oldChannel != null && oldChannel.isOpen()) {
+                        oldChannel.close();
+                    }
+                } catch (IOException e) {
+                    // Ignore close errors
+                }
+
+                // Atomically replace WAL with truncated version
+                if (tempFileCreated) {
+                    Files.move(tempFile, walFileRef, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+
+                // Reopen channel
+                this.channel = FileChannel.open(walFileRef,
+                        StandardOpenOption.READ,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.SYNC);
+                channel.position(channel.size());
+
+                // Reset deduplication state after truncation (WAL was rewritten)
+                lastPersistedCommitIndex = recoveryResult.commitIndex;
+                lastPersistedLastApplied = recoveryResult.lastApplied;
+
             } catch (IOException e) {
-                // Ignore close errors
+                // Restore old channel if rewrite failed
+                this.channel = oldChannel;
+                throw e;
             }
-
-            // Atomically replace WAL with truncated version
-            if (tempFileCreated) {
-                Files.move(tempFile, walFileRef, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            }
-
-            // Reopen channel
-            this.channel = FileChannel.open(walFileRef,
-                    StandardOpenOption.READ,
-                    StandardOpenOption.WRITE,
-                    StandardOpenOption.SYNC);
-            channel.position(channel.size());
-
-            // Reset deduplication state after truncation (WAL was rewritten)
-            lastPersistedCommitIndex = recoveryResult.commitIndex;
-            lastPersistedLastApplied = recoveryResult.lastApplied;
 
         } finally {
             lock.unlock();

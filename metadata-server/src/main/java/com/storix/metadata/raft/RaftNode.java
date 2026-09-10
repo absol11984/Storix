@@ -317,6 +317,11 @@ public class RaftNode implements AutoCloseable {
                     startRpcServer();
                 }
 
+                // If single node, become leader immediately.
+                if (singleNode) {
+                    becomeLeader();
+                }
+
                 // Start election timeout checker.
                 startElectionTimeoutLoop();
 
@@ -326,11 +331,6 @@ public class RaftNode implements AutoCloseable {
                 // conflicts (e.g., "Object already exists").
                 if (!singleNode && !peers.isEmpty()) {
                     startApplyLoop();
-                }
-
-                // If single node, become leader immediately.
-                if (singleNode) {
-                    becomeLeader();
                 }
             } catch (IOException | RuntimeException e) {
                 running = false;
@@ -382,6 +382,9 @@ public class RaftNode implements AutoCloseable {
             // every accepted/outgoing channel as well so handlers blocked in I/O
             // cannot keep the executor alive.
             closeRpcResources();
+
+            // Allow OS to release the port (mitigates TIME_WAIT issues in rapid test cycling)
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
 
             scheduler.shutdownNow();
             rpcExecutor.shutdownNow();

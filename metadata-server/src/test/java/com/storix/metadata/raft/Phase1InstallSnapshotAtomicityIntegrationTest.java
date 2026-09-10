@@ -1099,6 +1099,8 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
         long deadline = System.currentTimeMillis() + timeoutMs;
         // Allow single-node election to start before polling
         Thread.sleep(150);
+        // Ensure RPC server is ready before checking for leader
+        node.waitForRpcServerReady();
         while (!node.isLeader() && System.currentTimeMillis() < deadline) {
             Thread.sleep(50);
         }

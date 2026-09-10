@@ -21,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class InstallSnapshotPersistenceTest {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final int BASE_PORT = 60000;
+    private static final int BASE_PORT = 58000;
 
     @TempDir
     Path tempDir;

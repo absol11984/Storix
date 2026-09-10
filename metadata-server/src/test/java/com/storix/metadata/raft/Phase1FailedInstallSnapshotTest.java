@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class Phase1FailedInstallSnapshotTest {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final int BASE_PORT = 61000;
+    private static final int BASE_PORT = 54000;
 
     @TempDir
     Path tempDir;

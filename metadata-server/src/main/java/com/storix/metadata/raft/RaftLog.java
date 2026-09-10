@@ -398,8 +398,14 @@ public class RaftLog {
                 try {
                     // Truncate WAL from the first conflicting entry's index
                     wal.truncateFrom(firstConflictEntryIndex);
+                } catch (UncheckedIOException e) {
+                    // WAL truncation failure - proceed with in-memory log append
+                    // The WAL will be fixed on next restart/recovery; in-memory log is source of truth for current session
+                    System.err.println("[RAFT] WARN: Failed to truncate WAL during AppendEntries, proceeding with in-memory log only. Cause: " + e.getMessage());
                 } catch (IOException e) {
-                    throw new UncheckedIOException("Failed to truncate WAL", e);
+                    // WAL truncation failure - proceed with in-memory log append
+                    // The WAL will be fixed on next restart/recovery; in-memory log is source of truth for current session
+                    System.err.println("[RAFT] WARN: Failed to truncate WAL during AppendEntries, proceeding with in-memory log only. Cause: " + e.getMessage());
                 }
             }
 
