@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class Phase1MasterCrashTest {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final int BASE_PORT = 60000;
+    private static final int BASE_PORT = 59000;
     private static int testCounter = 0;
 
     @TempDir
