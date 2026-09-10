@@ -206,9 +206,12 @@ class Phase1MasterEndToEndTest {
         serverThread.setDaemon(true);
         serverThread.start();
 
-        // Wait for RaftNode to become leader
+        // Wait for RPC server to be ready before checking for leader
         RaftNode raftNode = server.getRaftNode();
         if (raftNode != null) {
+            raftNode.waitForRpcServerReady();
+
+            // Wait for RaftNode to become leader
             long deadline = System.currentTimeMillis() + 5000;
             while (!raftNode.isLeader() && System.currentTimeMillis() < deadline) {
                 System.out.println("[TEST] Waiting for leader... state=" + raftNode.getState() +
