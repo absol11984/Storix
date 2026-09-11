@@ -34,7 +34,7 @@ public class RepairManager {
      * Creates a RepairManager with custom max concurrent repairs.
      */
     public RepairManager(MetadataStore metadataStore, NodeRegistry nodeRegistry,
-                        PlacementManager placementManager, int maxConcurrentRepairs) {
+                         PlacementManager placementManager, int maxConcurrentRepairs) {
         this.metadataStore = metadataStore;
         this.nodeRegistry = nodeRegistry;
         this.placementManager = placementManager;
@@ -130,10 +130,16 @@ public class RepairManager {
                     continue;
                 }
 
-                // Add repair task
+                // Add repair task.
+                // NOTE: Capacity eligibility requires the chunkSize. We pass it through.
                 int needed = placementManager.getReplicationFactor() - healthyReplicas.size();
-                tasks.add(new RepairTask(chunk.getChunkId(), objectName, healthyReplicas.get(0),
-                        chunk.getChecksum(), needed));
+                tasks.add(new RepairTask(
+                        chunk.getChunkId(),
+                        objectName,
+                        healthyReplicas.get(0),
+                        chunk.getChecksum(),
+                        needed,
+                        chunk.getChunkSize()));
             }
         }
 
@@ -174,9 +180,10 @@ public class RepairManager {
             }
 
             // Find a target node (not currently hosting this chunk)
-            NodeInfo targetNode = placementManager.selectRepairTarget(existingReplicas);
+            // Capacity-aware repair destination selection.
+            NodeInfo targetNode = placementManager.selectRepairTarget(existingReplicas, (long) task.chunkSizeBytes);
             if (targetNode == null) {
-                System.out.println("[REPAIR] FAILED — no available target node for " + task.chunkId);
+                System.out.println("[REPAIR] FAILED — no capacity-eligible target node for " + task.chunkId);
                 return RepairOutcome.FAILED;
             }
 
@@ -352,5 +359,5 @@ public class RepairManager {
     private enum RepairOutcome { SUCCESS, FAILED }
 
     private record RepairTask(String chunkId, String objectName, String sourceNodeId,
-                              String checksum, int replicasNeeded) {}
+                                String checksum, int replicasNeeded, int chunkSizeBytes) {}
 }

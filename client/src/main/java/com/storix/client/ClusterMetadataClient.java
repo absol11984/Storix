@@ -135,7 +135,6 @@ public class ClusterMetadataClient implements AutoCloseable {
                 connect(cachedLeader);
                 return;
             } catch (IOException e) {
-                // Leader unavailable, will try other servers
                 cachedLeader = null;
             }
         }
@@ -148,21 +147,11 @@ public class ClusterMetadataClient implements AutoCloseable {
                 return;
             } catch (IOException e) {
                 lastException = e;
-                // Try next server
             }
         }
 
         throw new IOException("Failed to connect to any metadata server. Last error: " +
                 (lastException != null ? lastException.getMessage() : "unknown"), lastException);
-    }
-
-    /**
-     * Connects to a specific server by index.
-     */
-    private void connectToServer(int index) throws IOException {
-        closeCurrentClient();
-        InetSocketAddress server = servers.get(index % servers.size());
-        connect(server);
     }
 
     /**
@@ -287,18 +276,25 @@ public class ClusterMetadataClient implements AutoCloseable {
     }
 
     /**
-     * Gets chunk placement for a given index.
+     * Gets chunk placement for a given index and chunk size.
      */
-    public NodeInfoDTO[] getPlacement(int chunkIndex) throws IOException {
+    public NodeInfoDTO[] getPlacement(int chunkIndex, int chunkSizeBytes) throws IOException {
         beginRequest();
         try {
             return executeWithLeaderRouting(() -> {
                 setClientRequestId();
-                return currentClient.getPlacement(chunkIndex);
+                return currentClient.getPlacement(chunkIndex, chunkSizeBytes);
             });
         } finally {
             clearRequestId();
         }
+    }
+
+    /**
+     * Backward-compatible placement lookup (unknown capacity => unlimited eligibility).
+     */
+    public NodeInfoDTO[] getPlacement(int chunkIndex) throws IOException {
+        return getPlacement(chunkIndex, -1);
     }
 
     /**
@@ -333,14 +329,13 @@ public class ClusterMetadataClient implements AutoCloseable {
 
     /**
      * Executes an operation with leader routing and bounded retries.
-     * Cycles through all servers when leader info is unknown.
      */
     private <T> T executeWithLeaderRouting(Operation<T> operation) throws IOException {
         ensureNotClosed();
 
         int attempts = 0;
         IOException lastException = null;
-        int serverIndex = 0;  // Track which server to try next
+        int serverIndex = 0;
 
         while (attempts < maxAttempts) {
             attempts++;
@@ -348,7 +343,8 @@ public class ClusterMetadataClient implements AutoCloseable {
             try {
                 // Ensure connected - cycle through servers to find one that knows the leader
                 if (currentClient == null || !currentClient.isConnected()) {
-                    connectToServer(serverIndex % servers.size());
+                    InetSocketAddress server = servers.get(serverIndex % servers.size());
+                    connect(server);
                     serverIndex++;
                 }
 
@@ -358,27 +354,18 @@ public class ClusterMetadataClient implements AutoCloseable {
                 lastException = e;
                 String message = e.getMessage() != null ? e.getMessage() : "";
 
-                // Check if it's a NOT_LEADER error with leader info
                 LeaderInfo leaderInfo = extractLeaderInfo(e);
                 if (leaderInfo != null && leaderInfo != LeaderInfo.UNKNOWN) {
-                    // Got leader info - try to connect to leader
-                    System.out.println("[CLIENT] Received NOT_LEADER, leader=" + leaderInfo);
                     if (tryConnectToLeader(leaderInfo)) {
-                        continue; // Retry with new leader
+                        continue;
                     }
-                    // Leader connect failed, invalidate cache and try other servers
                     cachedLeader = null;
                     closeCurrentClient();
                 } else if (leaderInfo == LeaderInfo.UNKNOWN || isConnectionFailure(e)) {
-                    // Unknown leader or connection failed - try a different server
-                    System.out.println("[CLIENT] " + (leaderInfo == LeaderInfo.UNKNOWN ? "Unknown leader" : "Connection failure") + ", trying another server");
                     cachedLeader = null;
                     closeCurrentClient();
                     serverIndex++;
                 } else if (message.contains("Object not found") || message.contains("NOT_FOUND")) {
-                    // Object not found on this server - might be a follower that hasn't received
-                    // the data through replication yet. Try another server.
-                    System.out.println("[CLIENT] Object not found, trying another server");
                     cachedLeader = null;
                     closeCurrentClient();
                     serverIndex++;
@@ -402,9 +389,6 @@ public class ClusterMetadataClient implements AutoCloseable {
 
     /**
      * Executes an object GET operation with leader routing and null-return retry.
-     * When getObject() returns null (NOT_FOUND), tries another server since the object
-     * might exist on the leader but the request hit a follower that hasn't received
-     * the data through replication yet.
      */
     private ObjectMetadataDTO executeWithLeaderRoutingForObjectGet(Operation<ObjectMetadataDTO> operation) throws IOException {
         ensureNotClosed();
@@ -417,26 +401,21 @@ public class ClusterMetadataClient implements AutoCloseable {
             attempts++;
 
             try {
-                // Ensure connected - cycle through servers
                 if (currentClient == null || !currentClient.isConnected()) {
-                    connectToServer(serverIndex % servers.size());
+                    InetSocketAddress server = servers.get(serverIndex % servers.size());
+                    connect(server);
                     serverIndex++;
                 }
 
                 ObjectMetadataDTO result = operation.execute();
-
-                // If we got a non-null result, success!
                 if (result != null) {
                     return result;
                 }
 
-                // Null result means NOT_FOUND - might be a follower that hasn't replicated yet
-                System.out.println("[CLIENT] Object not found (null return), trying another server");
                 cachedLeader = null;
                 closeCurrentClient();
                 serverIndex++;
 
-                // Brief backoff before retry
                 if (attempts < maxAttempts) {
                     try {
                         Thread.sleep(50);
@@ -448,25 +427,20 @@ public class ClusterMetadataClient implements AutoCloseable {
 
             } catch (IOException e) {
                 lastException = e;
-                String message = e.getMessage() != null ? e.getMessage() : "";
 
-                // Check if it's a NOT_LEADER error with leader info
                 LeaderInfo leaderInfo = extractLeaderInfo(e);
                 if (leaderInfo != null && leaderInfo != LeaderInfo.UNKNOWN) {
-                    System.out.println("[CLIENT] Received NOT_LEADER, leader=" + leaderInfo);
                     if (tryConnectToLeader(leaderInfo)) {
                         continue;
                     }
                     cachedLeader = null;
                     closeCurrentClient();
                 } else if (leaderInfo == LeaderInfo.UNKNOWN || isConnectionFailure(e)) {
-                    System.out.println("[CLIENT] " + (leaderInfo == LeaderInfo.UNKNOWN ? "Unknown leader" : "Connection failure") + ", trying another server");
                     cachedLeader = null;
                     closeCurrentClient();
                     serverIndex++;
                 }
 
-                // Brief backoff before retry
                 if (attempts < maxAttempts) {
                     try {
                         Thread.sleep(50);
@@ -481,35 +455,23 @@ public class ClusterMetadataClient implements AutoCloseable {
         if (lastException != null) {
             throw new IOException("Operation failed after " + attempts + " attempts. Last error: " +
                     lastException.getMessage(), lastException);
-        } else {
-            // All attempts returned null
-            return null;
         }
+        return null;
     }
 
-    /**
-     * Executes a void operation with leader routing.
-     */
     private void executeVoidWithLeaderRouting(Operation<Void> operation) throws IOException {
         executeWithLeaderRouting(operation);
     }
 
-    /**
-     * Extracts leader info from NOT_LEADER exception.
-     */
-    @SuppressWarnings("unchecked")
     private LeaderInfo extractLeaderInfo(IOException e) {
         String message = e.getMessage();
         if (message == null) return null;
 
-        // Check for NOT_LEADER indication
         if (!message.contains("NOT_LEADER") && !message.contains("not the leader")) {
             return null;
         }
 
         try {
-            // Try to parse leader info from error message
-            // Format: "CREATE_OBJECT failed: {leaderHost:..., leaderPort:...}"
             int jsonStart = message.indexOf('{');
             if (jsonStart >= 0) {
                 String json = message.substring(jsonStart);
@@ -518,23 +480,16 @@ public class ClusterMetadataClient implements AutoCloseable {
 
                 String host = info.get("leaderHost");
                 String portStr = info.get("leaderPort");
-
                 if (host != null && portStr != null) {
                     int port = Integer.parseInt(portStr);
                     return new LeaderInfo(host, port, info.get("leaderId"));
                 }
             }
-        } catch (Exception ex) {
-            // Parsing failed, fall through
-        }
+        } catch (Exception ignored) {}
 
-        // Couldn't extract leader info, but it's still a NOT_LEADER error
         return LeaderInfo.UNKNOWN;
     }
 
-    /**
-     * Tries to connect to the leader.
-     */
     private boolean tryConnectToLeader(LeaderInfo leaderInfo) {
         if (leaderInfo == LeaderInfo.UNKNOWN) {
             return false;
@@ -553,53 +508,16 @@ public class ClusterMetadataClient implements AutoCloseable {
         }
     }
 
-    /**
-     * Checks if the exception indicates a connection failure.
-     */
     private boolean isConnectionFailure(IOException e) {
         String message = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
         return message.contains("connection refused") ||
-               message.contains("connection reset") ||
-               message.contains("connection closed") ||
-               message.contains("broken pipe") ||
-               message.contains("timeout") ||
-               message.contains("unreachable") ||
-               message.contains("no route") ||
-               message.contains("closed prematurely");
-    }
-
-    /**
-     * Invalidates the cached leader (e.g., when leader fails).
-     */
-    public void invalidateLeaderCache() {
-        cachedLeader = null;
-    }
-
-    /**
-     * Returns the current server we're connected to.
-     */
-    public InetSocketAddress getCurrentServer() {
-        return currentServer;
-    }
-
-    /**
-     * Returns the cached leader address, if known.
-     */
-    public InetSocketAddress getCachedLeader() {
-        return cachedLeader;
-    }
-
-    /**
-     * Returns the current request ID for testing.
-     */
-    public String getCurrentRequestId() {
-        return currentRequestId;
-    }
-
-    private void ensureNotClosed() throws IOException {
-        if (closed) {
-            throw new IOException("Client is closed");
-        }
+                message.contains("connection reset") ||
+                message.contains("connection closed") ||
+                message.contains("broken pipe") ||
+                message.contains("timeout") ||
+                message.contains("unreachable") ||
+                message.contains("no route") ||
+                message.contains("closed prematurely");
     }
 
     private void closeCurrentClient() {
@@ -617,14 +535,29 @@ public class ClusterMetadataClient implements AutoCloseable {
         closeCurrentClient();
     }
 
+    private void ensureNotClosed() throws IOException {
+        if (closed) {
+            throw new IOException("Client is closed");
+        }
+    }
+
+    public InetSocketAddress getCurrentServer() {
+        return currentServer;
+    }
+
+    public InetSocketAddress getCachedLeader() {
+        return cachedLeader;
+    }
+
+    public String getCurrentRequestId() {
+        return currentRequestId;
+    }
+
     @FunctionalInterface
     private interface Operation<T> {
         T execute() throws IOException;
     }
 
-    /**
-     * Leader information extracted from NOT_LEADER response.
-     */
     private static class LeaderInfo {
         static final LeaderInfo UNKNOWN = new LeaderInfo(null, 0, null);
 
@@ -643,5 +576,9 @@ public class ClusterMetadataClient implements AutoCloseable {
             if (this == UNKNOWN) return "UNKNOWN";
             return host + ":" + port + (id != null ? " (" + id + ")" : "");
         }
+    }
+
+    public void invalidateLeaderCache() {
+        cachedLeader = null;
     }
 }

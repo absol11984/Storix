@@ -154,15 +154,26 @@ public class MetadataClient implements AutoCloseable {
         return objectMapper.readValue(response.data(), NodeInfoDTO[].class);
     }
 
-    public NodeInfoDTO[] getPlacement(int chunkIndex) throws IOException {
+    public NodeInfoDTO[] getPlacement(int chunkIndex, int chunkSizeBytes) throws IOException {
         ensureConnected();
-        byte[] payload = objectMapper.writeValueAsBytes(Map.of("chunkIndex", chunkIndex));
+
+        Map<String, Object> payloadMap = new HashMap<>();
+        payloadMap.put("chunkIndex", chunkIndex);
+        if (chunkSizeBytes > 0) {
+            payloadMap.put("chunkSizeBytes", (long) chunkSizeBytes);
+        }
+
+        byte[] payload = objectMapper.writeValueAsBytes(payloadMap);
         sendRequest(MetadataProtocol.GET_PLACEMENT, payload, "GET_PLACEMENT");
         Response response = readResponse();
         if (response.status() != MetadataProtocol.OK) {
             throw createIOException("GET_PLACEMENT", response);
         }
         return objectMapper.readValue(response.data(), NodeInfoDTO[].class);
+    }
+
+    public NodeInfoDTO[] getPlacement(int chunkIndex) throws IOException {
+        return getPlacement(chunkIndex, -1);
     }
 
     @SuppressWarnings("unchecked")

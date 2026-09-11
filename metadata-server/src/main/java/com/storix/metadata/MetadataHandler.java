@@ -356,16 +356,30 @@ public class MetadataHandler {
     private ByteBuffer handleRegisterNode(RequestContext ctx) throws IOException {
         byte[] payload = ctx.innerPayload;
         NodeInfo nodeInfo = objectMapper.readValue(payload, NodeInfo.class);
-        nodeRegistry.registerNode(nodeInfo.getNodeId(), nodeInfo.getHost(), nodeInfo.getPort());
+        nodeRegistry.registerNode(
+            nodeInfo.getNodeId(),
+            nodeInfo.getHost(),
+            nodeInfo.getPort(),
+            nodeInfo.getTotalCapacityBytes(),
+            nodeInfo.getUsedCapacityBytes());
         return createSuccessResponse(new byte[0]);
     }
 
     private ByteBuffer handleHeartbeat(RequestContext ctx) throws IOException {
         byte[] payload = ctx.innerPayload;
-        Map<String, String> request = objectMapper.readValue(payload, Map.class);
-        String nodeId = request.get("nodeId");
+        Map<String, Object> request = objectMapper.readValue(payload, Map.class);
+        String nodeId = request.get("nodeId") != null ? String.valueOf(request.get("nodeId")) : null;
 
-        boolean found = nodeRegistry.heartbeat(nodeId);
+        if (nodeId == null || nodeId.isEmpty()) {
+            return createErrorResponse(MetadataProtocol.ERROR, "Missing nodeId in heartbeat request");
+        }
+
+        Object totalCapObj = request.get("totalCapacityBytes");
+        Object usedCapObj = request.get("usedCapacityBytes");
+        long totalCap = (totalCapObj instanceof Number) ? ((Number) totalCapObj).longValue() : -1;
+        long usedCap = (usedCapObj instanceof Number) ? ((Number) usedCapObj).longValue() : 0;
+
+        boolean found = nodeRegistry.heartbeat(nodeId, totalCap, usedCap);
         if (found) {
             return createSuccessResponse(new byte[0]);
         } else {
@@ -396,7 +410,19 @@ public class MetadataHandler {
             return createErrorResponse(MetadataProtocol.ERROR, "Missing chunkIndex. Received: " + request);
         }
 
-        List<NodeInfo> selectedNodes = placementManager.selectNodes(chunkIndex);
+        Object chunkSizeObj = request.get("chunkSizeBytes");
+        Long chunkSizeBytes = null;
+        if (chunkSizeObj instanceof Number) {
+            chunkSizeBytes = ((Number) chunkSizeObj).longValue();
+        } else if (chunkSizeObj instanceof String s) {
+            try {
+                chunkSizeBytes = Long.parseLong(s);
+            } catch (NumberFormatException ignored) {
+                // null means unknown, placement uses unlimited-capacity compatibility
+            }
+        }
+
+        List<NodeInfo> selectedNodes = placementManager.selectNodes(chunkIndex, chunkSizeBytes);
         byte[] data = objectMapper.writeValueAsBytes(selectedNodes);
         return createSuccessResponse(data);
     }

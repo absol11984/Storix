@@ -27,22 +27,55 @@ public class ChunkServer {
     private ScheduledExecutorService heartbeatScheduler;
     private ServerSocketChannel serverChannel;
 
+    private static final long DEFAULT_TOTAL_CAPACITY_BYTES = -1; // unlimited
     public static final long DEFAULT_HEARTBEAT_INTERVAL_MILLIS = 2000;
 
     public ChunkServer(String nodeId, String host, int port, Path storageDir,
                        String metadataHost, int metadataPort) throws IOException {
-        this(nodeId, host, port, storageDir, metadataHost, metadataPort, DEFAULT_HEARTBEAT_INTERVAL_MILLIS);
+        this(nodeId, host, port, storageDir, metadataHost, metadataPort,
+                DEFAULT_TOTAL_CAPACITY_BYTES, DEFAULT_HEARTBEAT_INTERVAL_MILLIS);
+    }
+
+    /**
+     * Creates a ChunkServer with an explicit heartbeat interval.
+     *
+     * Note: This constructor uses the default (unlimited) total capacity and treats the last
+     * {@code long} parameter as {@code heartbeatIntervalMillis}, matching the expectations of
+     * existing tests.
+     */
+    public ChunkServer(String nodeId, String host, int port, Path storageDir,
+                       String metadataHost, int metadataPort, long heartbeatIntervalMillis) throws IOException {
+        this(nodeId, host, port, storageDir, metadataHost, metadataPort,
+                DEFAULT_TOTAL_CAPACITY_BYTES, heartbeatIntervalMillis);
     }
 
     public ChunkServer(String nodeId, String host, int port, Path storageDir,
-                       String metadataHost, int metadataPort, long heartbeatIntervalMillis) throws IOException {
+                       String metadataHost, int metadataPort, long totalCapacityBytes,
+                       long heartbeatIntervalMillis) throws IOException {
         this.nodeId = nodeId;
         this.host = host;
         this.port = port;
-        this.storage = new ChunkStorage(storageDir);
+        this.storage = new ChunkStorage(storageDir, totalCapacityBytes);
         this.metadataHost = metadataHost;
         this.metadataPort = metadataPort;
-        this.heartbeatIntervalMillis = heartbeatIntervalMillis > 0 ? heartbeatIntervalMillis : DEFAULT_HEARTBEAT_INTERVAL_MILLIS;
+
+        // Treat non-positive intervals as invalid and fall back to default.
+        this.heartbeatIntervalMillis = heartbeatIntervalMillis > 0
+                ? heartbeatIntervalMillis : DEFAULT_HEARTBEAT_INTERVAL_MILLIS;
+    }
+
+    /**
+     * Returns the configured total capacity in bytes (<=0 means unlimited).
+     */
+    public long getTotalCapacityBytes() {
+        return storage.getTotalCapacityBytes();
+    }
+
+    /**
+     * Returns the current used capacity in bytes.
+     */
+    public long getUsedCapacityBytes() {
+        return storage.getUsedCapacityBytes();
     }
 
     /**
@@ -50,6 +83,20 @@ public class ChunkServer {
      */
     public long getHeartbeatIntervalMillis() {
         return heartbeatIntervalMillis;
+    }
+
+    /**
+     * Returns the current available capacity in bytes.
+     */
+    public long getAvailableCapacityBytes() {
+        return storage.getAvailableCapacityBytes();
+    }
+
+    /**
+     * Returns the ChunkStorage used by this server for test access.
+     */
+    public ChunkStorage getStorage() {
+        return storage;
     }
 
     /**
@@ -104,8 +151,14 @@ public class ChunkServer {
     }
 
     private void registerWithMetadataServer() {
-        String json = String.format("{\"nodeId\":\"%s\",\"host\":\"%s\",\"port\":%d}", nodeId, host, port);
         try {
+            // JSON: {nodeId, host, port, totalCapacityBytes, usedCapacityBytes}
+            String json = String.format(
+                    "{\"nodeId\":\"%s\",\"host\":\"%s\",\"port\":%d,\"totalCapacityBytes\":%d,\"usedCapacityBytes\":%d}",
+                    nodeId, host, port,
+                    storage.getTotalCapacityBytes(),
+                    storage.getUsedCapacityBytes());
+
             sendToMetadataServer((byte) 10, json); // REGISTER_NODE = 10
             System.out.println("Registered with metadata server at " + metadataHost + ":" + metadataPort);
         } catch (IOException e) {
@@ -120,7 +173,12 @@ public class ChunkServer {
             return t;
         });
 
-        String json = String.format("{\"nodeId\":\"%s\"}", nodeId);
+        // Heartbeat includes current used capacity so metadata server can track capacity over time.
+        String json = String.format(
+                "{\"nodeId\":\"%s\",\"totalCapacityBytes\":%d,\"usedCapacityBytes\":%d}",
+                nodeId,
+                storage.getTotalCapacityBytes(),
+                storage.getUsedCapacityBytes());
 
         heartbeatScheduler.scheduleAtFixedRate(() -> {
             try {
@@ -181,6 +239,7 @@ public class ChunkServer {
         Path storageDir = Path.of("chunks");
         String metadataHost = "127.0.0.1";
         int metadataPort = 9090;
+        long totalCapacityBytes = DEFAULT_TOTAL_CAPACITY_BYTES;
         long heartbeatInterval = DEFAULT_HEARTBEAT_INTERVAL_MILLIS;
 
         // Parse command line arguments
@@ -202,6 +261,8 @@ public class ChunkServer {
                 }
             } else if ("--heartbeat-interval".equals(args[i]) && i + 1 < args.length) {
                 heartbeatInterval = Long.parseLong(args[++i]);
+            } else if ("--capacity".equals(args[i]) && i + 1 < args.length) {
+                totalCapacityBytes = Long.parseLong(args[++i]);
             } else if (!args[i].startsWith("--")) {
                 // backward compatibility positional arguments
                 if (i == 0) port = Integer.parseInt(args[0]);
@@ -209,7 +270,8 @@ public class ChunkServer {
             }
         }
 
-        ChunkServer server = new ChunkServer(nodeId, host, port, storageDir, metadataHost, metadataPort, heartbeatInterval);
+        ChunkServer server = new ChunkServer(nodeId, host, port, storageDir,
+                metadataHost, metadataPort, totalCapacityBytes, heartbeatInterval);
 
         // Graceful shutdown on SIGINT/SIGTERM
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {

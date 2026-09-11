@@ -19,16 +19,32 @@ public class NodeRegistry {
      * Registers a node. If the node already exists, updates its host/port/status.
      */
     public void registerNode(String nodeId, String host, int port) {
+        registerNode(nodeId, host, port, -1, 0);
+    }
+
+    /**
+     * Registers a node with optional capacity telemetry.
+     *
+     * @param totalCapacityBytes total capacity in bytes, or <= 0 if unknown
+     * @param usedCapacityBytes used capacity in bytes
+     */
+    public void registerNode(String nodeId, String host, int port,
+                               long totalCapacityBytes, long usedCapacityBytes) {
         nodes.compute(nodeId, (id, existing) -> {
             if (existing != null) {
                 existing.setHost(host);
                 existing.setPort(port);
+                existing.setTotalCapacityBytes(totalCapacityBytes);
+                existing.setUsedCapacityBytes(usedCapacityBytes);
                 existing.recordHeartbeat();
                 System.out.println("[REGISTRY] Node re-registered: " + nodeId + " " + host + ":" + port);
                 return existing;
             } else {
                 System.out.println("[REGISTRY] Node registered: " + nodeId + " " + host + ":" + port);
-                return new NodeInfo(nodeId, host, port);
+                NodeInfo node = new NodeInfo(nodeId, host, port);
+                node.setTotalCapacityBytes(totalCapacityBytes);
+                node.setUsedCapacityBytes(usedCapacityBytes);
+                return node;
             }
         });
     }
@@ -37,12 +53,33 @@ public class NodeRegistry {
      * Records a heartbeat for a node.
      */
     public boolean heartbeat(String nodeId) {
+        return heartbeat(nodeId, -1, -1);
+    }
+
+    /**
+     * Records a heartbeat and optionally refreshes capacity telemetry.
+     *
+     * @param totalCapacityBytes total capacity in bytes, or <=0 if unknown
+     * @param usedCapacityBytes used capacity in bytes, ignored when total is unknown
+     */
+    public boolean heartbeat(String nodeId, long totalCapacityBytes, long usedCapacityBytes) {
         NodeInfo node = nodes.get(nodeId);
         if (node != null) {
             node.recordHeartbeat();
+            if (totalCapacityBytes > 0) {
+                node.setTotalCapacityBytes(totalCapacityBytes);
+                node.setUsedCapacityBytes(usedCapacityBytes);
+            }
             return true;
         }
         return false;
+    }
+
+    /**
+     * Returns the current capacity telemetry for a node.
+     */
+    public Optional<NodeInfo> getNodeCapacity(String nodeId) {
+        return getNode(nodeId);
     }
 
     /**

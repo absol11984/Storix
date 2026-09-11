@@ -61,7 +61,10 @@ public class StorixClient implements AutoCloseable {
 
                 try {
                     // Ask Metadata Server for placement nodes for this chunk (replicas)
-                    NodeInfoDTO[] replicaNodes = metadataClient.getPlacement(chunk.chunkIndex());
+                    // Capacity eligibility is based on the actual chunk size.
+                    NodeInfoDTO[] replicaNodes = metadataClient.getPlacement(
+                            chunk.chunkIndex(),
+                            chunk.data().length);
                     if (replicaNodes == null || replicaNodes.length == 0) {
                         throw new IOException("No healthy storage nodes available for placement");
                     }
