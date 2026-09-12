@@ -48,6 +48,8 @@ public class MetadataServer {
     private ServerSocketChannel serverChannel;
     private ExecutorService clientExecutor;
     private final Set<SocketChannel> activeClientChannels = ConcurrentHashMap.newKeySet();
+    private final ChunkOperationLock chunkOperationLock;
+    private final RebalanceManager rebalanceManager;
 
     /**
      * Creates a single-node metadata server (no Raft).
@@ -79,6 +81,7 @@ public class MetadataServer {
         this.raftPort = (clusterConfig != null) ? distinctPort(port) : port;
         this.nodeRegistry = new NodeRegistry();
         this.clusterConfig = clusterConfig;
+        this.chunkOperationLock = new ChunkOperationLock();
 
         // Initialize Raft if cluster config provided
         if (clusterConfig != null) {
@@ -119,7 +122,8 @@ public class MetadataServer {
             // MetadataStore will load from GenerationManager's current generation
             this.metadataStore = new MetadataStore(metadataFile, generationManager);
             this.placementManager = new PlacementManager(nodeRegistry, replicationFactor);
-            this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager);
+            this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager, 4, chunkOperationLock);
+            // rebalanceManager construction deferred until raftNode is assigned below
             this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager,
                     nodeTimeoutMillis, healthCheckIntervalMillis);
             this.stateMachine = new MetadataStateMachine(metadataStore);
@@ -239,11 +243,14 @@ public class MetadataServer {
             this.raftNode.setGenerationManager(generationManager);
             // Wire MetadataStore for InstallSnapshot state restoration
             this.raftNode.setMetadataStore(metadataStore);
+            // Now raftNode is initialized; construct RebalanceManager with it.
+            this.rebalanceManager = new RebalanceManager(metadataStore, nodeRegistry, placementManager, chunkOperationLock, raftNode);
         } else {
             // Non-cluster mode: create MetadataStore without GenerationManager
             this.metadataStore = new MetadataStore(metadataFile);
             this.placementManager = new PlacementManager(nodeRegistry, replicationFactor);
-            this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager);
+            this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager, 4, chunkOperationLock);
+            this.rebalanceManager = new RebalanceManager(metadataStore, nodeRegistry, placementManager, chunkOperationLock, /*raftNode=*/ null);
             this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager, nodeTimeoutMillis, healthCheckIntervalMillis);
             this.snapshotManager = null;
             this.generationManager = null;
@@ -274,6 +281,10 @@ public class MetadataServer {
 
     public RepairManager getRepairManager() {
         return repairManager;
+    }
+
+    public RebalanceManager getRebalanceManager() {
+        return rebalanceManager;
     }
 
     /**
@@ -357,6 +368,7 @@ public class MetadataServer {
         }
 
         healthMonitor.start();
+        rebalanceManager.start();
 
         // Always start the client-facing server to handle metadata requests.
         // In single-node mode, this is the only server needed.
@@ -409,6 +421,7 @@ public class MetadataServer {
             running = false;
             closeClientResources();
             healthMonitor.stop();
+            rebalanceManager.stop();
             if (raftNode != null) {
                 raftNode.stop();
             }

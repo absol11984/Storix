@@ -13,6 +13,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -667,6 +668,82 @@ public class MetadataStore {
 
         if (updated) {
             save();
+        }
+    }
+
+    /**
+     * Moves one replica from sourceNodeId -> destNodeId in-memory and persists atomically via one save().
+     *
+     * Rules:
+     * - Returns false if object or chunk is missing
+     * - Returns false if sourceNodeId is not currently present in replica set
+     * - Returns false if destNodeId is already present in replica set
+     * - Otherwise updates replica list by adding dest first and removing source (RF-preserving)
+     *
+     * @return true if a replica move was applied and persisted
+     */
+    public boolean moveChunkReplica(
+            String objectName,
+            String chunkId,
+            String sourceNodeId,
+            String destNodeId) throws IOException {
+
+        ObjectMetadata metadata = objects.get(objectName);
+        if (metadata == null) {
+            return false;
+        }
+
+        ChunkInfo targetChunk = null;
+        for (ChunkInfo chunk : metadata.getChunks()) {
+            if (chunk.getChunkId().equals(chunkId)) {
+                targetChunk = chunk;
+                break;
+            }
+        }
+
+        if (targetChunk == null) {
+            return false;
+        }
+
+        List<String> replicas = targetChunk.getReplicaNodeIds();
+        if (replicas == null) {
+            return false;
+        }
+
+        if (!replicas.contains(sourceNodeId)) {
+            return false;
+        }
+        if (replicas.contains(destNodeId)) {
+            return false;
+        }
+
+        boolean destAdded = false;
+        boolean sourceRemoved = false;
+
+        try {
+            // RF-preserving: add destination then remove source.
+            targetChunk.addReplicaNode(destNodeId);
+            destAdded = true;
+
+            sourceRemoved = targetChunk.removeReplicaNode(sourceNodeId);
+            if (!sourceRemoved) {
+                // Should not happen because we checked contains(sourceNodeId)
+                targetChunk.removeReplicaNode(destNodeId);
+                return false;
+            }
+
+            save();
+            return true;
+        } catch (IOException e) {
+            // Roll back in-memory mutation so metadata remains unchanged
+            // when persistence fails.
+            if (destAdded) {
+                targetChunk.removeReplicaNode(destNodeId);
+            }
+            if (sourceRemoved) {
+                targetChunk.addReplicaNode(sourceNodeId);
+            }
+            throw e;
         }
     }
 

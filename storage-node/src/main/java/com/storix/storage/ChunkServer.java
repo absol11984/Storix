@@ -173,14 +173,14 @@ public class ChunkServer {
             return t;
         });
 
-        // Heartbeat includes current used capacity so metadata server can track capacity over time.
-        String json = String.format(
-                "{\"nodeId\":\"%s\",\"totalCapacityBytes\":%d,\"usedCapacityBytes\":%d}",
-                nodeId,
-                storage.getTotalCapacityBytes(),
-                storage.getUsedCapacityBytes());
-
         heartbeatScheduler.scheduleAtFixedRate(() -> {
+            // Rebuild heartbeat payload each tick from live capacity so metadata
+            // server sees the current used/total ratio (updated by rebalance moves).
+            String json = String.format(
+                    "{\"nodeId\":\"%s\",\"totalCapacityBytes\":%d,\"usedCapacityBytes\":%d}",
+                    nodeId,
+                    storage.getTotalCapacityBytes(),
+                    storage.getUsedCapacityBytes());
             try {
                 sendToMetadataServer((byte) 11, json); // HEARTBEAT = 11
             } catch (IOException e) {

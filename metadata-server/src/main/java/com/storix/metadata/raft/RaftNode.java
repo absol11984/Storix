@@ -271,6 +271,7 @@ public class RaftNode implements AutoCloseable {
         return state == RaftState.LEADER;
     }
 
+
     public boolean isRunning() {
         return running;
     }

@@ -27,7 +27,7 @@ public class ChunkStorage {
      * Test hook: allows forcing failures at deterministic points inside putChunk.
      */
     @FunctionalInterface
-    interface PutFailureInjector {
+    public interface PutFailureInjector {
         void beforeCommit(String chunkId) throws IOException;
     }
 
@@ -40,7 +40,7 @@ public class ChunkStorage {
      * Sets a test-only failure injector. When non-null, it is invoked inside putChunk
      * after capacity has been reserved but before the filesystem write is committed.
      */
-    void setPutFailureInjector(PutFailureInjector injector) {
+    public void setPutFailureInjector(PutFailureInjector injector) {
         this.putFailureInjector = injector;
     }
 
