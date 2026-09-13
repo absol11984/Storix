@@ -41,6 +41,8 @@ public class Phase3AutomaticRepairIntegrationTest {
     private int metaPort;
     private int[] storagePorts;
     private ExecutorService executor;
+    private java.util.concurrent.Future<?> metadataFuture;
+    private java.util.concurrent.Future<?>[] storageFutures;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -63,7 +65,7 @@ public class Phase3AutomaticRepairIntegrationTest {
         // Use short timeout (2s) and fast check interval (500ms) for quick failure detection
         metadataServer = new MetadataServer(metaPort, metaFile, 3, 2000, 500, config, raftStateDir);
 
-        executor.submit(() -> {
+        metadataFuture = executor.submit(() -> {
             try {
                 metadataServer.start();
             } catch (IOException e) {
@@ -72,6 +74,8 @@ public class Phase3AutomaticRepairIntegrationTest {
         });
 
         Thread.sleep(500); // Let metadata server start
+
+        storageFutures = new java.util.concurrent.Future<?>[4];
 
         // Start 4 storage nodes
         for (int i = 0; i < 4; i++) {
@@ -89,7 +93,7 @@ public class Phase3AutomaticRepairIntegrationTest {
             );
 
             final int idx = i;
-            executor.submit(() -> {
+            storageFutures[i] = executor.submit(() -> {
                 try {
                     storageNodes[idx].start();
                 } catch (IOException e) {
@@ -104,11 +108,43 @@ public class Phase3AutomaticRepairIntegrationTest {
 
     @AfterEach
     void tearDown() {
+        // Stop servers first (closes server sockets + scheduled heartbeat tasks)
         for (ChunkServer node : storageNodes) {
             if (node != null) node.stop();
         }
         if (metadataServer != null) metadataServer.stop();
-        if (executor != null) executor.shutdownNow();
+
+        // Best-effort: cancel/join background start tasks so @TempDir can delete
+        // its directories without leftover open file handles.
+        if (storageFutures != null) {
+            for (java.util.concurrent.Future<?> f : storageFutures) {
+                if (f == null) continue;
+                f.cancel(true);
+                try {
+                    f.get(2, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                    // best-effort only
+                }
+            }
+        }
+
+        if (metadataFuture != null) {
+            metadataFuture.cancel(true);
+            try {
+                metadataFuture.get(2, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+                // best-effort only
+            }
+        }
+
+        if (executor != null) {
+            executor.shutdownNow();
+            try {
+                executor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /**

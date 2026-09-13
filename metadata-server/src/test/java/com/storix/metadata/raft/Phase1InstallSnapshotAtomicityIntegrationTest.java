@@ -7,6 +7,7 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.*;
+import java.net.ServerSocket;
 import java.nio.file.*;
 import java.util.*;
 import java.util.zip.CRC32;
@@ -96,7 +97,13 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
         System.out.println("TEST: Success Path Survives Restart");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 100;
+        int leaderPort;
+        int followerPort;
+        try (ServerSocket leaderSocket = new ServerSocket(0);
+             ServerSocket followerSocket = new ServerSocket(0)) {
+            leaderPort = leaderSocket.getLocalPort();
+            followerPort = followerSocket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-success");
         Path followerRaftDir = tempDir.resolve("follower-raft-success");
@@ -247,7 +254,13 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
         System.out.println("TEST: Failure After Candidate Restore Preserves Live State");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 200;
+        int leaderPort;
+        int followerPort;
+        try (ServerSocket leaderSocket = new ServerSocket(0);
+             ServerSocket followerSocket = new ServerSocket(0)) {
+            leaderPort = leaderSocket.getLocalPort();
+            followerPort = followerSocket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-restorefail");
         Path followerRaftDir = tempDir.resolve("follower-raft-restorefail");
@@ -389,7 +402,13 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
         // This test uses a custom SnapshotManager that throws during commitCandidateSnapshot
         // to simulate failure exactly between publishCandidate and commitCandidateSnapshot.
 
-        int leaderPort = BASE_PORT + 300;
+        int leaderPort;
+        int followerPort;
+        try (ServerSocket leaderSocket = new ServerSocket(0);
+             ServerSocket followerSocket = new ServerSocket(0)) {
+            leaderPort = leaderSocket.getLocalPort();
+            followerPort = followerSocket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-pubfail");
         Path followerRaftDir = tempDir.resolve("follower-raft-pubfail");
@@ -522,7 +541,13 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
         System.out.println("TEST: Failed Install Does Not Advance Boundary");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 400;
+        int leaderPort;
+        int followerPort;
+        try (ServerSocket leaderSocket = new ServerSocket(0);
+             ServerSocket followerSocket = new ServerSocket(0)) {
+            leaderPort = leaderSocket.getLocalPort();
+            followerPort = followerSocket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-boundary");
         Path followerRaftDir = tempDir.resolve("follower-raft-boundary");
@@ -652,7 +677,13 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
         System.out.println("TEST: Commit Marker Determines Authoritative Generation");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 600;
+        int leaderPort;
+        int followerPort;
+        try (ServerSocket leaderSocket = new ServerSocket(0);
+             ServerSocket followerSocket = new ServerSocket(0)) {
+            leaderPort = leaderSocket.getLocalPort();
+            followerPort = followerSocket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-commitmarker");
         Path followerRaftDir = tempDir.resolve("follower-raft-commitmarker");
@@ -825,7 +856,13 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
         System.out.println("TEST: Failure Before Commit Marker Recovers Old Generation");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 700;
+        int leaderPort;
+        int followerPort;
+        try (ServerSocket leaderSocket = new ServerSocket(0);
+             ServerSocket followerSocket = new ServerSocket(0)) {
+            leaderPort = leaderSocket.getLocalPort();
+            followerPort = followerSocket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-precommit");
         Path followerRaftDir = tempDir.resolve("follower-raft-precommit");
@@ -946,7 +983,13 @@ class Phase1InstallSnapshotAtomicityIntegrationTest {
         System.out.println("TEST: Second Restart Preserves Exact State");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 500;
+        int leaderPort;
+        int followerPort;
+        try (ServerSocket leaderSocket = new ServerSocket(0);
+             ServerSocket followerSocket = new ServerSocket(0)) {
+            leaderPort = leaderSocket.getLocalPort();
+            followerPort = followerSocket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft-double");
         Path followerRaftDir = tempDir.resolve("follower-raft-double");

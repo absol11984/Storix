@@ -7,6 +7,7 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.net.ServerSocket;
 import java.nio.file.*;
 import java.util.*;
 
@@ -80,6 +81,7 @@ class Phase12PersistenceIntegrationTest {
         // Wait for RaftNode to become leader (for single-node)
         RaftNode raftNode = server.getRaftNode();
         if (raftNode != null) {
+            raftNode.waitForRpcServerReady();
             long deadline = System.currentTimeMillis() + 5000;
             while (!raftNode.isLeader() && System.currentTimeMillis() < deadline) {
                 Thread.sleep(50);
@@ -118,7 +120,10 @@ class Phase12PersistenceIntegrationTest {
     void testRealServerPersistenceLifecycleWithRaftPath() throws Exception {
         System.out.println("=== Phase 1.2 Master Persistence Integration Test (Raft Write Path) ===");
 
-        int port = 54000 + (int)(System.currentTimeMillis() % 1000);
+        int port;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
 
         // ===== STEP 1: Start server and perform initial writes =====
         System.out.println("STEP 1: Start server and perform initial writes via Raft");
@@ -278,7 +283,10 @@ class Phase12PersistenceIntegrationTest {
     void testSimplePersistenceWithoutRaft() throws Exception {
         System.out.println("=== Test: Simple persistence without Raft ===");
 
-        int port = 55000 + (int)(System.currentTimeMillis() % 1000);
+        int port;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
 
         // ===== Setup: Create initial data =====
         Path metadataFile = dataDir.resolve("metadata.json");
@@ -318,7 +326,10 @@ class Phase12PersistenceIntegrationTest {
     void testNextIndexAfterRestart() throws Exception {
         System.out.println("=== Test: Next index after restart ===");
 
-        int port = 56000 + (int)(System.currentTimeMillis() % 1000);
+        int port;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
 
         // ===== Setup: Create initial state =====
         Path metadataFile = dataDir.resolve("metadata3.json");
@@ -406,7 +417,10 @@ class Phase12PersistenceIntegrationTest {
                          "COMPACT → SHUTDOWN → RESTART → AUTO RECOVER → VERIFY EXACT STATE → " +
                          "WRITE (Raft) → RESTART AGAIN → VERIFY");
 
-        int port = 57000 + (int)(System.currentTimeMillis() % 1000);
+        int port;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
 
         // ===== Setup: Create directories =====
         Path metadataFile = dataDir.resolve("metadata-complete.json");
