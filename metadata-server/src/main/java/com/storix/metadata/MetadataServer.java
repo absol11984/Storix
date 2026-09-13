@@ -50,6 +50,7 @@ public class MetadataServer {
     private final Set<SocketChannel> activeClientChannels = ConcurrentHashMap.newKeySet();
     private final ChunkOperationLock chunkOperationLock;
     private final RebalanceManager rebalanceManager;
+    private final NodeRecoveryManager nodeRecoveryManager;
 
     /**
      * Creates a single-node metadata server (no Raft).
@@ -123,6 +124,10 @@ public class MetadataServer {
             this.metadataStore = new MetadataStore(metadataFile, generationManager);
             this.placementManager = new PlacementManager(nodeRegistry, replicationFactor);
             this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager, 4, chunkOperationLock);
+            // Controlled storage-node recovery + safe reintegration (Phase 4 Prompt 3)
+            // Scan at the same cadence as the health monitor so restarts recover quickly.
+            this.nodeRecoveryManager = new NodeRecoveryManager(nodeRegistry, metadataStore, chunkOperationLock,
+                    healthCheckIntervalMillis);
             // rebalanceManager construction deferred until raftNode is assigned below
             this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager,
                     nodeTimeoutMillis, healthCheckIntervalMillis);
@@ -250,6 +255,10 @@ public class MetadataServer {
             this.metadataStore = new MetadataStore(metadataFile);
             this.placementManager = new PlacementManager(nodeRegistry, replicationFactor);
             this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager, 4, chunkOperationLock);
+            // Controlled storage-node recovery + safe reintegration (Phase 4 Prompt 3)
+            // Scan at the same cadence as the health monitor so restarts recover quickly.
+            this.nodeRecoveryManager = new NodeRecoveryManager(nodeRegistry, metadataStore, chunkOperationLock,
+                    healthCheckIntervalMillis);
             this.rebalanceManager = new RebalanceManager(metadataStore, nodeRegistry, placementManager, chunkOperationLock, /*raftNode=*/ null);
             this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager, nodeTimeoutMillis, healthCheckIntervalMillis);
             this.snapshotManager = null;
@@ -285,6 +294,13 @@ public class MetadataServer {
 
     public RebalanceManager getRebalanceManager() {
         return rebalanceManager;
+    }
+
+    /**
+     * Returns the node recovery manager for controlled storage-node reintegration.
+     */
+    public NodeRecoveryManager getNodeRecoveryManager() {
+        return nodeRecoveryManager;
     }
 
     /**
@@ -369,6 +385,7 @@ public class MetadataServer {
 
         healthMonitor.start();
         rebalanceManager.start();
+        nodeRecoveryManager.start();
 
         // Always start the client-facing server to handle metadata requests.
         // In single-node mode, this is the only server needed.
@@ -422,6 +439,10 @@ public class MetadataServer {
             closeClientResources();
             healthMonitor.stop();
             rebalanceManager.stop();
+            nodeRecoveryManager.stop();
+            // NodeRecoveryManager is stopped before Raft/clients shutdown to keep
+            // recovery from flipping node eligibility mid-test shutdown.
+
             if (raftNode != null) {
                 raftNode.stop();
             }

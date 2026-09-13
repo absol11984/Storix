@@ -14,6 +14,14 @@ public class NodeInfo {
     private NodeStatus status;
     private long lastHeartbeat;
 
+    // When true, heartbeats should refresh capacity/lastHeartbeat without re-enabling
+    // ordinary eligibility. Used during controlled node reintegration.
+    private volatile boolean recoveryHold = false;
+
+    // Set by recordHeartbeat so recovery can distinguish a heartbeat from a
+    // status change made by the health monitor.
+    private volatile boolean heartbeatArrived = false;
+
     // Capacity model (optional; unknown when totalCapacityBytes <= 0)
     // Used by capacity-aware placement/repair.
     private volatile long totalCapacityBytes = -1;
@@ -72,7 +80,17 @@ public class NodeInfo {
      */
     public void recordHeartbeat() {
         this.lastHeartbeat = System.currentTimeMillis();
-        this.status = NodeStatus.ACTIVE;
+        if (!recoveryHold) {
+            this.status = NodeStatus.ACTIVE;
+        }
+    }
+
+    public boolean isRecoveryHold() {
+        return recoveryHold;
+    }
+
+    public void setRecoveryHold(boolean recoveryHold) {
+        this.recoveryHold = recoveryHold;
     }
 
     /**

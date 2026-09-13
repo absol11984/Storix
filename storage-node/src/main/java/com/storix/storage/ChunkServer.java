@@ -142,7 +142,7 @@ public class ChunkServer {
     }
 
     private void handleClient(SocketChannel clientChannel) {
-        ChunkHandler handler = new ChunkHandler(storage);
+        ChunkHandler handler = new ChunkHandler(nodeId, storage);
         try (clientChannel) {
             handler.handle(clientChannel);
         } catch (IOException e) {

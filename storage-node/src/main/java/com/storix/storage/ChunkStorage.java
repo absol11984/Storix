@@ -6,6 +6,9 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -104,6 +107,29 @@ public class ChunkStorage {
             return Math.max(0, totalCapacityBytes - usedCapacityBytes);
         } finally {
             capacityLock.unlock();
+        }
+    }
+
+    /**
+     * Lists stored chunk IDs by scanning the storage directory.
+     *
+     * Returned IDs match the on-disk naming convention produced by resolveChunkPath:
+     * base filename without the ".chunk" suffix.
+     */
+    public List<String> listStoredChunkIds() {
+        try (var stream = Files.list(storageDir)) {
+            List<String> ids = new ArrayList<>();
+            stream.filter(p -> p.getFileName().toString().endsWith(".chunk"))
+                    .forEach(p -> {
+                        String fileName = p.getFileName().toString();
+                        String chunkId = fileName.substring(0, fileName.length() - ".chunk".length());
+                        ids.add(chunkId);
+                    });
+            Collections.sort(ids);
+            return ids;
+        } catch (IOException e) {
+            // Storage dir errors are treated as fatal for inventory; caller can mark node unhealthy.
+            throw new RuntimeException("Failed to list chunk inventory", e);
         }
     }
 

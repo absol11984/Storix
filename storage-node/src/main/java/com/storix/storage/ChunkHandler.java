@@ -3,6 +3,8 @@ package com.storix.storage;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 /**
  * Handles a single client connection.
@@ -10,9 +12,21 @@ import java.nio.channels.SocketChannel;
  */
 public class ChunkHandler {
 
+    private final String nodeId;
     private final ChunkStorage storage;
 
+    /**
+     * Legacy constructor (nodeId unknown). Used in existing code paths.
+     */
     public ChunkHandler(ChunkStorage storage) {
+        this(null, storage);
+    }
+
+    /**
+     * Creates handler with node identity.
+     */
+    public ChunkHandler(String nodeId, ChunkStorage storage) {
+        this.nodeId = nodeId;
         this.storage = storage;
     }
 
@@ -104,11 +118,49 @@ public class ChunkHandler {
                         yield ChunkResponse.error("CHUNK_CORRUPTED: " + request.chunkId());
                     }
                 }
+                case Protocol.LIST_NODE_STATE -> {
+                    byte[] payload = buildNodeStatePayload();
+                    yield ChunkResponse.ok(payload);
+                }
                 default -> ChunkResponse.error("Unknown opcode: " + request.opcode());
             };
         } catch (IOException e) {
             return ChunkResponse.error(e.getMessage());
         }
+    }
+
+    private byte[] buildNodeStatePayload() throws IOException {
+        // Binary payload layout:
+        // [nodeIdLen:4][nodeId:N]
+        // [totalCapacity:8][usedCapacity:8]
+        // [chunkCount:4]
+        // For each chunk: [chunkIdLen:4][chunkId:N]
+        String effectiveNodeId = (nodeId != null) ? nodeId : "unknown";
+
+        byte[] nodeIdBytes = effectiveNodeId.getBytes(StandardCharsets.UTF_8);
+        List<String> chunkIds = storage.listStoredChunkIds();
+
+        long total = storage.getTotalCapacityBytes();
+        long used = storage.getUsedCapacityBytes();
+
+        int totalLen = 4 + nodeIdBytes.length + 8 + 8 + 4;
+        for (String id : chunkIds) {
+            byte[] b = id.getBytes(StandardCharsets.UTF_8);
+            totalLen += 4 + b.length;
+        }
+
+        ByteBuffer buf = ByteBuffer.allocate(totalLen);
+        buf.putInt(nodeIdBytes.length);
+        buf.put(nodeIdBytes);
+        buf.putLong(total);
+        buf.putLong(used);
+        buf.putInt(chunkIds.size());
+        for (String id : chunkIds) {
+            byte[] b = id.getBytes(StandardCharsets.UTF_8);
+            buf.putInt(b.length);
+            buf.put(b);
+        }
+        return buf.array();
     }
 
     /**
