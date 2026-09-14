@@ -383,6 +383,7 @@ public class MetadataServer {
             });
         }
 
+        repairManager.start();
         healthMonitor.start();
         rebalanceManager.start();
         nodeRecoveryManager.start();
@@ -435,11 +436,14 @@ public class MetadataServer {
      */
     public void stop() {
         synchronized (lifecycleLock) {
+            // Stop is idempotent, but must still tear down Raft and manager resources
+            // when tests use the RaftNode directly without calling MetadataServer.start().
             running = false;
             closeClientResources();
             healthMonitor.stop();
             rebalanceManager.stop();
             nodeRecoveryManager.stop();
+            repairManager.stop();
             // NodeRecoveryManager is stopped before Raft/clients shutdown to keep
             // recovery from flipping node eligibility mid-test shutdown.
 
@@ -448,6 +452,35 @@ public class MetadataServer {
             }
             awaitClientExecutor();
         }
+    }
+
+    public void close() {
+        stop();
+    }
+
+    /**
+     * Bounded TCP-connect wait until the client-facing port is accepting connections.
+     * Used by lifecycle tests; does not sleep arbitrarily.
+     */
+    void waitForClientServerReady(long timeoutMs) {
+        if (timeoutMs <= 0) {
+            throw new IllegalArgumentException("timeoutMs must be positive");
+        }
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        java.net.InetSocketAddress address = new java.net.InetSocketAddress("127.0.0.1", port);
+        IOException last = null;
+        while (System.nanoTime() < deadlineNanos) {
+            try (java.net.Socket socket = new java.net.Socket()) {
+                int remainingMs = (int) Math.max(1L,
+                        TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
+                socket.connect(address, Math.min(200, remainingMs));
+                return;
+            } catch (IOException e) {
+                last = e;
+            }
+        }
+        throw new IllegalStateException("Metadata server client port " + port
+                + " was not ready within " + timeoutMs + "ms", last);
     }
 
     private void closeClientResources() {

@@ -17,6 +17,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -48,6 +50,7 @@ public class NodeRecoveryManager {
     private static final byte ERROR = 1;
 
     private static final long DEFAULT_SCAN_INTERVAL_MILLIS = 2000L;
+    private static final int IO_TIMEOUT_MILLIS = 5000;
 
     private final NodeRegistry nodeRegistry;
     private final MetadataStore metadataStore;
@@ -57,7 +60,10 @@ public class NodeRecoveryManager {
     private final Map<String, NodeRecoveryState> recoveryStates = new ConcurrentHashMap<>();
     private final Map<String, ReentrantLock> nodeLocks = new ConcurrentHashMap<>();
 
-    private final ScheduledExecutorService executor;
+    private final Object lifecycleLock = new Object();
+    private volatile ScheduledExecutorService executor;
+
+    private volatile boolean started = false;
 
     public NodeRecoveryManager(NodeRegistry nodeRegistry,
                                MetadataStore metadataStore,
@@ -73,7 +79,11 @@ public class NodeRecoveryManager {
         this.metadataStore = metadataStore;
         this.chunkOperationLock = chunkOperationLock;
         this.scanIntervalMillis = scanIntervalMillis;
-        this.executor = Executors.newSingleThreadScheduledExecutor(r -> {
+        this.executor = createExecutor();
+    }
+
+    private ScheduledExecutorService createExecutor() {
+        return Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "node-recovery");
             t.setDaemon(true);
             return t;
@@ -82,20 +92,83 @@ public class NodeRecoveryManager {
 
     /**
      * Starts the periodic recovery scan. Call once after construction.
+     * Idempotent: repeated start() calls won't create duplicate schedulers.
      */
     public void start() {
-        executor.scheduleAtFixedRate(this::recoverAll,
-                scanIntervalMillis, scanIntervalMillis, TimeUnit.MILLISECONDS);
+        ScheduledExecutorService execToSchedule;
+        boolean shouldSchedule;
+        synchronized (lifecycleLock) {
+            shouldSchedule = !started || executor == null || executor.isShutdown() || executor.isTerminated();
+            if (!shouldSchedule) {
+                return;
+            }
+            started = true;
+            if (executor == null || executor.isShutdown() || executor.isTerminated()) {
+                executor = createExecutor();
+            }
+            execToSchedule = executor;
+        }
+
+        try {
+            execToSchedule.scheduleAtFixedRate(this::recoverAll,
+                    scanIntervalMillis,
+                    scanIntervalMillis,
+                    TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            // If we were concurrently stopped during restart, ignore.
+            return;
+        }
+
         // Run an immediate first pass so the initial state stabilizes quickly.
         recoverAll();
     }
 
+    /**
+     * Stops the periodic recovery scan.
+     * Idempotent: safe to call stop() multiple times and to restart on the same instance.
+     */
     public void stop() {
-        executor.shutdownNow();
+        ScheduledExecutorService execToStop;
+        synchronized (lifecycleLock) {
+            started = false;
+            execToStop = executor;
+            executor = null;
+        }
+        if (execToStop == null) {
+            return;
+        }
+
+        execToStop.shutdownNow();
+        try {
+            execToStop.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
+    /**
+     * Submits an asynchronous full recovery scan.
+     * <p>
+     * Lifecycle semantics:
+     * <ul>
+     *   <li>If {@link #stop()} has been called (i.e., the manager is stopped), this method
+     *       throws {@link IllegalStateException} and will <b>not</b> recreate/start a new executor.</li>
+     *   <li>If the manager is (re)started via {@link #start()}, this method submits work
+     *       to the active executor.</li>
+     * </ul>
+     */
     public Future<Integer> recoverAllAsync() {
-        return executor.submit(this::recoverAll);
+        ScheduledExecutorService exec;
+        synchronized (lifecycleLock) {
+            exec = executor;
+            if (exec == null) {
+                throw new IllegalStateException("NodeRecoveryManager is stopped; call start() before recoverAllAsync()");
+            }
+            if (exec.isShutdown() || exec.isTerminated()) {
+                throw new IllegalStateException("NodeRecoveryManager executor is not running; call start() before recoverAllAsync()");
+            }
+        }
+        return exec.submit(this::recoverAll);
     }
 
     /**
@@ -126,6 +199,10 @@ public class NodeRecoveryManager {
      * @return number of nodes that reached READY in this scan
      */
     public int recoverAll() {
+        if (Thread.currentThread().isInterrupted()) {
+            return 0;
+        }
+
         List<String> nodeIds = new ArrayList<>();
         for (NodeInfo n : nodeRegistry.getAllNodes()) {
             nodeIds.add(n.getNodeId());
@@ -135,6 +212,10 @@ public class NodeRecoveryManager {
         int readyNow = 0;
 
         for (String nodeId : nodeIds) {
+            if (Thread.currentThread().isInterrupted()) {
+                return readyNow;
+            }
+
             NodeInfo node = nodeRegistry.getNode(nodeId).orElse(null);
             if (node == null) continue;
 
@@ -221,6 +302,10 @@ public class NodeRecoveryManager {
     }
 
     private boolean recoverNodeWithLock(NodeInfo node) {
+        if (Thread.currentThread().isInterrupted()) {
+            return false;
+        }
+
         String nodeId = node.getNodeId();
         ReentrantLock lock = lockFor(nodeId);
         if (!lock.tryLock()) {
@@ -289,7 +374,10 @@ public class NodeRecoveryManager {
     private record ChunkInventory(long totalCapacityBytes, long usedCapacityBytes, Set<String> chunkIds) {}
 
     private ChunkInventory chunkInventory(NodeInfo node) throws IOException {
-        try (SocketChannel channel = SocketChannel.open(new InetSocketAddress(node.getHost(), node.getPort()))) {
+        try (SocketChannel channel = SocketChannel.open()) {
+            channel.socket().connect(new InetSocketAddress(node.getHost(), node.getPort()), IO_TIMEOUT_MILLIS);
+            channel.socket().setSoTimeout(IO_TIMEOUT_MILLIS);
+
             byte[] emptyChunkId = new byte[0];
             int requestSize = 1 + 4 + emptyChunkId.length;
             ByteBuffer request = ByteBuffer.allocate(4 + requestSize);
@@ -355,6 +443,9 @@ public class NodeRecoveryManager {
 
     private void readFully(SocketChannel channel, ByteBuffer buffer) throws IOException {
         while (buffer.hasRemaining()) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IOException("Interrupted");
+            }
             int read = channel.read(buffer);
             if (read == -1) throw new IOException("Connection closed prematurely");
         }
@@ -370,6 +461,10 @@ public class NodeRecoveryManager {
      */
     private boolean reconcileNodeChunks(NodeInfo node) {
         try {
+            if (Thread.currentThread().isInterrupted()) {
+                return false;
+            }
+
             ChunkInventory inventory = chunkInventory(node);
             // Keep node excluded while reconciling; capacity refresh already happened in verifyHealth.
             node.setStatus(NodeStatus.UNHEALTHY);
@@ -377,6 +472,10 @@ public class NodeRecoveryManager {
             // Build expected-chunk map for this node from authoritative metadata.
             Map<String, String> expectedChecksums = new HashMap<>();
             for (String objectName : metadataStore.listObjects()) {
+                if (Thread.currentThread().isInterrupted()) {
+                    return false;
+                }
+
                 ObjectMetadata obj = metadataStore.getObject(objectName).orElse(null);
                 if (obj == null) continue;
                 for (ChunkInfo chunk : obj.getChunks()) {
@@ -387,6 +486,10 @@ public class NodeRecoveryManager {
             }
 
             for (Map.Entry<String, String> e : expectedChecksums.entrySet()) {
+                if (Thread.currentThread().isInterrupted()) {
+                    return false;
+                }
+
                 String chunkId = e.getKey();
                 String expectedChecksum = e.getValue();
 
@@ -427,7 +530,10 @@ public class NodeRecoveryManager {
     }
 
     private boolean verifyChunkOnNode(NodeInfo node, String chunkId, String checksum) {
-        try (SocketChannel channel = SocketChannel.open(new InetSocketAddress(node.getHost(), node.getPort()))) {
+        try (SocketChannel channel = SocketChannel.open()) {
+            channel.socket().connect(new InetSocketAddress(node.getHost(), node.getPort()), IO_TIMEOUT_MILLIS);
+            channel.socket().setSoTimeout(IO_TIMEOUT_MILLIS);
+
             byte[] cidBytes = chunkId.getBytes(StandardCharsets.UTF_8);
             byte[] checksumBytes = checksum.getBytes(StandardCharsets.UTF_8);
 
@@ -516,7 +622,10 @@ public class NodeRecoveryManager {
     }
 
     private byte[] getChunkFromNode(NodeInfo node, String chunkId) throws IOException {
-        try (SocketChannel channel = SocketChannel.open(new InetSocketAddress(node.getHost(), node.getPort()))) {
+        try (SocketChannel channel = SocketChannel.open()) {
+            channel.socket().connect(new InetSocketAddress(node.getHost(), node.getPort()), IO_TIMEOUT_MILLIS);
+            channel.socket().setSoTimeout(IO_TIMEOUT_MILLIS);
+
             byte[] cidBytes = chunkId.getBytes(StandardCharsets.UTF_8);
             int requestSize = 1 + 4 + cidBytes.length;
 
@@ -551,7 +660,10 @@ public class NodeRecoveryManager {
     }
 
     private void putChunkToNode(NodeInfo node, String chunkId, byte[] chunkData) throws IOException {
-        try (SocketChannel channel = SocketChannel.open(new InetSocketAddress(node.getHost(), node.getPort()))) {
+        try (SocketChannel channel = SocketChannel.open()) {
+            channel.socket().connect(new InetSocketAddress(node.getHost(), node.getPort()), IO_TIMEOUT_MILLIS);
+            channel.socket().setSoTimeout(IO_TIMEOUT_MILLIS);
+
             byte[] cidBytes = chunkId.getBytes(StandardCharsets.UTF_8);
             int requestSize = 1 + 4 + cidBytes.length + 4 + chunkData.length;
 

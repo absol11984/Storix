@@ -46,9 +46,15 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.2</version>
                 <configuration>
-                    <!-- Fork one JVM per test class to prevent port/state pollution between tests -->
+                    <!-- Fork one JVM per test class to prevent port/state pollution between tests.
+reuseForks=false ensures each test class runs in a separate JVM, preventing
+cross-test pollution from shared RaftNode/RPC state, dynamic ports, and
+background manager workers. The slower startup and higher JVM overhead are the
+tradeoffs for stronger test isolation; this is test-only isolation, not a
+production fix. Do not change election timeouts or Raft semantics to work around
+this. -->
                     <forkCount>1</forkCount>
-                    <reuseForks>true</reuseForks>
+                    <reuseForks>false</reuseForks>
                 </configuration>
             </plugin>
             <plugin>

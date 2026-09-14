@@ -15,4 +15,9 @@ target/
 
 # Logs
 *.log
-target/
+
+# Generated/runtime Raft artifacts
+raft-state-*/
+
+# Claude Code
+.claude/

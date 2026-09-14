@@ -67,8 +67,8 @@ public class Phase3DataPlaneIntegrationTest {
             }
         });
 
-        // Wait for metadata server to be ready
-        Thread.sleep(500);
+        // Wait for metadata server to be ready (avoid flaky connection refused)
+        waitForPortReady(metaPort, 5_000);
 
         // Start storage nodes
         Path storage1Dir = tempDir.resolve("storage-1");
@@ -120,6 +120,11 @@ public class Phase3DataPlaneIntegrationTest {
 
         if (executor != null) {
             executor.shutdownNow();
+            try {
+                executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -371,6 +376,23 @@ public class Phase3DataPlaneIntegrationTest {
         try (java.net.ServerSocket socket = new java.net.ServerSocket(0)) {
             return socket.getLocalPort();
         }
+    }
+
+    private void waitForPortReady(int port, long timeoutMs) throws Exception {
+        long deadlineNanos = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        java.net.InetSocketAddress address = new java.net.InetSocketAddress("127.0.0.1", port);
+        java.io.IOException last = null;
+        while (System.nanoTime() < deadlineNanos) {
+            try (java.net.Socket socket = new java.net.Socket()) {
+                int remainingMs = (int) Math.max(1L,
+                        java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
+                socket.connect(address, Math.min(200, remainingMs));
+                return;
+            } catch (java.io.IOException e) {
+                last = e;
+            }
+        }
+        throw new java.io.IOException("Port " + port + " not ready within " + timeoutMs + "ms", last);
     }
 
     private String computeSHA256(byte[] data) {

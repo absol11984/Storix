@@ -2,10 +2,13 @@ package com.storix.storage;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.file.Path;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -16,6 +19,10 @@ import java.util.concurrent.TimeUnit;
  */
 public class ChunkServer {
 
+    private final Object lifecycleLock = new Object();
+
+    private final Set<SocketChannel> activeClientChannels = ConcurrentHashMap.newKeySet();
+
     private final String nodeId;
     private final String host;
     private final int port;
@@ -23,7 +30,13 @@ public class ChunkServer {
     private final String metadataHost;
     private final int metadataPort;
     private final long heartbeatIntervalMillis;
-    private volatile boolean running = true;
+
+    private static final int CONNECT_TIMEOUT_MILLIS = 2000;
+    private static final int IO_TIMEOUT_MILLIS = 5000;
+
+    // Restart-safe lifecycle state.
+    private volatile boolean running = false;
+
     private ScheduledExecutorService heartbeatScheduler;
     private ServerSocketChannel serverChannel;
 
@@ -103,26 +116,50 @@ public class ChunkServer {
      * Starts the server and begins accepting connections.
      */
     public void start() throws IOException {
-        registerWithMetadataServer();
-        startHeartbeat();
+        synchronized (lifecycleLock) {
+            if (running) {
+                return;
+            }
+            running = true;
+        }
 
-        try (ServerSocketChannel sc = ServerSocketChannel.open();
-             var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+        try {
+            try (ServerSocketChannel sc = ServerSocketChannel.open();
+                 var executor = Executors.newVirtualThreadPerTaskExecutor()) {
 
-            this.serverChannel = sc;
-            serverChannel.bind(new InetSocketAddress(port));
-            System.out.println("Storage node " + nodeId + " listening on " + host + ":" + port);
+                this.serverChannel = sc;
+                serverChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
+                serverChannel.bind(new InetSocketAddress(port));
+                System.out.println("Storage node " + nodeId + " listening on " + host + ":" + port);
 
-            while (running) {
-                try {
-                    SocketChannel clientChannel = serverChannel.accept();
-                    executor.submit(() -> handleClient(clientChannel));
-                } catch (IOException e) {
-                    if (running) {
-                        System.err.println("Accept failed: " + e.getMessage());
+                // Do not advertise the node until its listener is bound. Otherwise
+                // placement can route a client to a registered node that cannot yet
+                // accept the request.
+                registerWithMetadataServer();
+                startHeartbeat();
+
+                while (running) {
+                    try {
+                        SocketChannel clientChannel = serverChannel.accept();
+                        activeClientChannels.add(clientChannel);
+                        executor.submit(() -> {
+                            try {
+                                handleClient(clientChannel);
+                            } finally {
+                                activeClientChannels.remove(clientChannel);
+                            }
+                        });
+                    } catch (IOException e) {
+                        if (running && serverChannel != null && serverChannel.isOpen()) {
+                            System.err.println("Accept failed: " + e.getMessage());
+                        }
                     }
                 }
             }
+        } catch (IOException e) {
+            // Ensure a failed start doesn't leave the instance stuck in "running".
+            stop();
+            throw e;
         }
     }
 
@@ -130,15 +167,60 @@ public class ChunkServer {
      * Stops the server gracefully.
      */
     public void stop() {
-        running = false;
-        if (heartbeatScheduler != null) {
-            heartbeatScheduler.shutdownNow();
+        ScheduledExecutorService schedulerToStop;
+        ServerSocketChannel channelToClose;
+
+        synchronized (lifecycleLock) {
+            running = false;
+            schedulerToStop = heartbeatScheduler;
+            heartbeatScheduler = null;
+            channelToClose = serverChannel;
+            serverChannel = null;
         }
-        if (serverChannel != null && serverChannel.isOpen()) {
+
+        if (schedulerToStop != null) {
+            schedulerToStop.shutdownNow();
+            long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             try {
-                serverChannel.close();
-            } catch (IOException ignored) {}
+                while (!schedulerToStop.isTerminated() && System.nanoTime() < deadlineNanos) {
+                    long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+                    if (remainingMs <= 0) {
+                        break;
+                    }
+                    schedulerToStop.awaitTermination(Math.min(200, remainingMs), TimeUnit.MILLISECONDS);
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
         }
+
+        if (channelToClose != null) {
+            if (channelToClose.isOpen()) {
+                try {
+                    channelToClose.close();
+                } catch (IOException ignored) {
+                    // best-effort
+                }
+            }
+        }
+
+        // Close active client channels so request handlers un-block.
+        for (SocketChannel client : activeClientChannels) {
+            try {
+                client.close();
+            } catch (IOException ignored) {
+                // best-effort
+            }
+        }
+        activeClientChannels.clear();
+
+    }
+
+    /**
+     * Compatibility alias.
+     */
+    public void close() {
+        stop();
     }
 
     private void handleClient(SocketChannel clientChannel) {
@@ -146,7 +228,12 @@ public class ChunkServer {
         try (clientChannel) {
             handler.handle(clientChannel);
         } catch (IOException e) {
-            System.err.println("Client handler error: " + e.getMessage());
+            // Expected during shutdown when sockets are closed.
+            if (running) {
+                System.err.println("Client handler error: " + e.getMessage());
+            }
+        } finally {
+            activeClientChannels.remove(clientChannel);
         }
     }
 
@@ -167,30 +254,56 @@ public class ChunkServer {
     }
 
     private void startHeartbeat() {
-        this.heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "heartbeat-thread");
-            t.setDaemon(true);
-            return t;
-        });
-
-        heartbeatScheduler.scheduleAtFixedRate(() -> {
-            // Rebuild heartbeat payload each tick from live capacity so metadata
-            // server sees the current used/total ratio (updated by rebalance moves).
-            String json = String.format(
-                    "{\"nodeId\":\"%s\",\"totalCapacityBytes\":%d,\"usedCapacityBytes\":%d}",
-                    nodeId,
-                    storage.getTotalCapacityBytes(),
-                    storage.getUsedCapacityBytes());
-            try {
-                sendToMetadataServer((byte) 11, json); // HEARTBEAT = 11
-            } catch (IOException e) {
-                System.err.println("Heartbeat failed: " + e.getMessage());
+        ScheduledExecutorService existing;
+        synchronized (lifecycleLock) {
+            if (!running) {
+                return;
             }
-        }, heartbeatIntervalMillis, heartbeatIntervalMillis, TimeUnit.MILLISECONDS);
+
+            existing = heartbeatScheduler;
+            if (existing != null && !existing.isShutdown()) {
+                return;
+            }
+
+            heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "heartbeat-thread");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+
+        // heartbeatScheduler is non-null after the lifecycleLock section.
+        try {
+            heartbeatScheduler.scheduleAtFixedRate(() -> {
+                if (!running || Thread.currentThread().isInterrupted()) {
+                    return;
+                }
+
+                // Rebuild heartbeat payload each tick from live capacity so metadata
+                // server sees the current used/total ratio (updated by rebalance moves).
+                String json = String.format(
+                        "{\"nodeId\":\"%s\",\"totalCapacityBytes\":%d,\"usedCapacityBytes\":%d}",
+                        nodeId,
+                        storage.getTotalCapacityBytes(),
+                        storage.getUsedCapacityBytes());
+                try {
+                    sendToMetadataServer((byte) 11, json); // HEARTBEAT = 11
+                } catch (IOException e) {
+                    if (running) {
+                        System.err.println("Heartbeat failed: " + e.getMessage());
+                    }
+                }
+            }, heartbeatIntervalMillis, heartbeatIntervalMillis, TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            // Concurrent stop() can shut the scheduler down before scheduleAtFixedRate.
+        }
     }
 
     private void sendToMetadataServer(byte opcode, String jsonPayload) throws IOException {
-        try (SocketChannel channel = SocketChannel.open(new InetSocketAddress(metadataHost, metadataPort))) {
+        try (SocketChannel channel = SocketChannel.open()) {
+            channel.socket().connect(new InetSocketAddress(metadataHost, metadataPort), CONNECT_TIMEOUT_MILLIS);
+            channel.socket().setSoTimeout(IO_TIMEOUT_MILLIS);
+
             byte[] payloadBytes = jsonPayload.getBytes();
             int requestSize = 1 + 4 + payloadBytes.length;
 
@@ -207,18 +320,20 @@ public class ChunkServer {
 
             // Read response
             ByteBuffer lengthBuf = ByteBuffer.allocate(4);
-            int read = 0;
             while (lengthBuf.hasRemaining()) {
                 int r = channel.read(lengthBuf);
-                if (r == -1) throw new IOException("Connection closed prematurely");
-                read += r;
+                if (r == -1) {
+                    throw new IOException("Connection closed prematurely");
+                }
             }
             lengthBuf.flip();
             int responseSize = lengthBuf.getInt();
 
             ByteBuffer responseBuf = ByteBuffer.allocate(responseSize);
             while (responseBuf.hasRemaining()) {
-                if (channel.read(responseBuf) == -1) break;
+                if (channel.read(responseBuf) == -1) {
+                    break;
+                }
             }
             responseBuf.flip();
 

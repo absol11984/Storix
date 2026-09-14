@@ -194,13 +194,39 @@ public class RebalanceManager {
      * Stops periodic rebalancing.
      */
     public void stop() {
+        ScheduledExecutorService execToStop;
         synchronized (lifecycleLock) {
             if (scheduler == null) {
                 return;
             }
-            ScheduledExecutorService exec = scheduler;
+            execToStop = scheduler;
             scheduler = null;
-            exec.shutdownNow();
+        }
+
+        execToStop.shutdownNow();
+
+        final long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        boolean interrupted = false;
+        try {
+            while (System.nanoTime() < deadlineNanos && !execToStop.isTerminated()) {
+                long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+                if (remainingMs <= 0) {
+                    break;
+                }
+
+                try {
+                    if (execToStop.awaitTermination(Math.min(2_000, remainingMs), TimeUnit.MILLISECONDS)) {
+                        break;
+                    }
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                    execToStop.shutdownNow();
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -700,10 +726,14 @@ public class RebalanceManager {
      */
     static class TcpChunkTransfer implements ChunkTransfer {
 
+        private static final int CONNECT_TIMEOUT_MILLIS = 2000;
+        private static final int IO_TIMEOUT_MILLIS = 5000;
+
         @Override
         public byte[] getChunk(NodeInfo node, String chunkId) throws IOException {
-            try (SocketChannel channel = SocketChannel.open(
-                    new InetSocketAddress(node.getHost(), node.getPort()))) {
+            try (SocketChannel channel = SocketChannel.open()) {
+                channel.socket().connect(new InetSocketAddress(node.getHost(), node.getPort()), CONNECT_TIMEOUT_MILLIS);
+                channel.socket().setSoTimeout(IO_TIMEOUT_MILLIS);
 
                 byte[] chunkIdBytes = chunkId.getBytes();
                 int requestSize = 1 + 4 + chunkIdBytes.length;
@@ -743,8 +773,9 @@ public class RebalanceManager {
 
         @Override
         public void putChunk(NodeInfo node, String chunkId, byte[] chunkData) throws IOException {
-            try (SocketChannel channel = SocketChannel.open(
-                    new InetSocketAddress(node.getHost(), node.getPort()))) {
+            try (SocketChannel channel = SocketChannel.open()) {
+                channel.socket().connect(new InetSocketAddress(node.getHost(), node.getPort()), CONNECT_TIMEOUT_MILLIS);
+                channel.socket().setSoTimeout(IO_TIMEOUT_MILLIS);
 
                 byte[] chunkIdBytes = chunkId.getBytes();
                 int requestSize = 1 + 4 + chunkIdBytes.length + 4 + chunkData.length;
@@ -784,8 +815,9 @@ public class RebalanceManager {
 
         @Override
         public void deleteChunk(NodeInfo node, String chunkId) throws IOException {
-            try (SocketChannel channel = SocketChannel.open(
-                    new InetSocketAddress(node.getHost(), node.getPort()))) {
+            try (SocketChannel channel = SocketChannel.open()) {
+                channel.socket().connect(new InetSocketAddress(node.getHost(), node.getPort()), CONNECT_TIMEOUT_MILLIS);
+                channel.socket().setSoTimeout(IO_TIMEOUT_MILLIS);
 
                 byte[] chunkIdBytes = chunkId.getBytes();
                 int requestSize = 1 + 4 + chunkIdBytes.length;

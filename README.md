@@ -333,6 +333,13 @@ Default chunk size: 1 MB
 mvn test
 ```
 
+### Test isolation
+`metadata-server/pom.xml` configures Maven Surefire with `forkCount=1` and
+`reuseForks=false`. Each metadata-server test class runs in its own JVM,
+preventing cross-test port and Raft state pollution. The tradeoff is slower
+startup and higher JVM overhead per test class. This is test-only isolation
+and does not change Raft election semantics or production timeouts.
+
 ## What Was Implemented
 
 ### Phase 1: Distributed Storage with Crash Safety
