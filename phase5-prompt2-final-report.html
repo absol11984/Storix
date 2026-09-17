@@ -283,7 +283,7 @@ th {
     <tr>
       <td>Comprehensive Tests</td>
       <td><span class="status passed">✅ PASSED</span></td>
-      <td>9 new test files covering all metric categories (62 tests); 468 total tests</td>
+      <td>15 new test files covering all metric categories (110 tests); 468 total tests</td>
     </tr>
     <tr>
       <td>Multi-Node Integration Test</td>
@@ -399,7 +399,7 @@ No more "all IOException → timeout" bug</pre>
     </tr>
     <tr>
       <td>New Test Files</td>
-      <td>9</td>
+      <td>15</td>
       <td>
         ActiveRequestCliIntegrationTest.java (3 tests)<br>
         ActiveRequestMetricsTest.java (5 tests)<br>
@@ -426,11 +426,7 @@ No more "all IOException → timeout" bug</pre>
 
   <h3>Maven Test Runs</h3>
   <div class="code">
-<pre>mvn -pl metadata-server -am test
-  → BUILD SUCCESS
-  → All observability tests pass (62 tests)
-
-mvn clean test
+<pre>mvn clean test
   → BUILD SUCCESS
   → Tests run: 468, Failures: 0, Errors: 0, Skipped: 0</pre>
   </div>
@@ -444,7 +440,7 @@ No generated artifacts staged (target/ removed from Git tracking)</pre>
 
   <h3>Test Coverage</h3>
   <div class="code">
-<pre>Phase 5 Observability Tests (62 new):
+<pre>Phase 5 Observability Tests (110 new):
   ✓ Request classification (7 tests)
   ✓ Manager metrics (20 tests)
   ✓ Lifecycle state (5 tests)
@@ -656,7 +652,7 @@ Total Test Suite: 468 tests (all pass)</pre>
     <tr>
       <td>Dedicated Observability Tests</td>
       <td>✅ PASSED</td>
-      <td>9 new test files, 62 tests across all metric categories</td>
+      <td>15 new test files covering all metric categories (110 tests)</td>
     </tr>
     <tr>
       <td>Phase 5 Prompt 1 Protections</td>
