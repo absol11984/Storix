@@ -7,6 +7,7 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.*;
+import java.net.ServerSocket;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -51,7 +52,10 @@ class InstallSnapshotPersistenceTest {
         System.out.println("TEST: InstallSnapshot Creates Durable Snapshot");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 100;
+        int leaderPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            leaderPort = socket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft");
         Path followerRaftDir = tempDir.resolve("follower-raft");
@@ -186,7 +190,10 @@ class InstallSnapshotPersistenceTest {
         System.out.println("TEST: InstallSnapshot Survives Restart");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 200;
+        int leaderPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            leaderPort = socket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft2");
         Path followerRaftDir = tempDir.resolve("follower-raft2");
@@ -344,7 +351,10 @@ class InstallSnapshotPersistenceTest {
         System.out.println("TEST: Multi-Chunk InstallSnapshot Persistence");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 300;
+        int leaderPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            leaderPort = socket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft3");
         Path followerRaftDir = tempDir.resolve("follower-raft3");
@@ -485,7 +495,10 @@ class InstallSnapshotPersistenceTest {
         System.out.println("TEST: Failed InstallSnapshot Leaves Old State Recoverable");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 400;
+        int leaderPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            leaderPort = socket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft4");
         Path followerRaftDir = tempDir.resolve("follower-raft4");
@@ -654,7 +667,10 @@ class InstallSnapshotPersistenceTest {
         System.out.println("TEST: Candidate Snapshot Not Visible During Installation");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 500;
+        int leaderPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            leaderPort = socket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft5");
         Path followerRaftDir = tempDir.resolve("follower-raft5");
@@ -791,7 +807,10 @@ class InstallSnapshotPersistenceTest {
         System.out.println("TEST: Corrupted Snapshot In Transfer Fails");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 600;
+        int leaderPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            leaderPort = socket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft6");
         Path followerRaftDir = tempDir.resolve("follower-raft6");
@@ -933,7 +952,10 @@ class InstallSnapshotPersistenceTest {
         System.out.println("TEST: InstallSnapshot From Stale Term Rejected");
         System.out.println("========================================\n");
 
-        int leaderPort = BASE_PORT + 700;
+        int leaderPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            leaderPort = socket.getLocalPort();
+        }
 
         Path leaderRaftDir = tempDir.resolve("leader-raft7");
         Path followerRaftDir = tempDir.resolve("follower-raft7");

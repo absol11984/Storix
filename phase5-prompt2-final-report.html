@@ -1,0 +1,688 @@
+<title>Phase 5 Prompt 2 Observability Implementation</title>
+<style>
+:root {
+  --bg: #f8f9fa;
+  --surface: #ffffff;
+  --text: #212529;
+  --accent: #0d6efd;
+  --secondary: #6c757d;
+  --border: #dee2e6;
+  --success: #198754;
+  --warning: #ffc107;
+  --danger: #dc3545;
+  --code-bg: #f1f3f4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1a1d21;
+    --surface: #212529;
+    --text: #e9ecef;
+    --accent: #3d8bfd;
+    --secondary: #adb5bd;
+    --border: #495057;
+    --success: #12b886;
+    --warning: #ffd43b;
+    --danger: #fa5252;
+    --code-bg: #2d3339;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #1a1d21;
+  --surface: #212529;
+  --text: #e9ecef;
+  --accent: #3d8bfd;
+  --secondary: #adb5bd;
+  --border: #495057;
+  --success: #12b886;
+  --warning: #ffd43b;
+  --danger: #fa5252;
+  --code-bg: #2d3339;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--bg);
+  margin: 0;
+  padding: 24px;
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+h1 {
+  color: var(--accent);
+  border-bottom: 2px solid var(--border);
+  padding-bottom: 12px;
+  margin-top: 32px;
+}
+
+h2 {
+  color: var(--text);
+  margin-top: 28px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+h3 {
+  color: var(--secondary);
+  margin-top: 24px;
+}
+
+.section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  margin: 24px 0;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+  margin: 24px 0;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+}
+
+.card.success {
+  border-left: 4px solid var(--success);
+}
+
+.card.warning {
+  border-left: 4px solid var(--warning);
+}
+
+.card.danger {
+  border-left: 4px solid var(--danger);
+}
+
+.code {
+  font-family: 'SF Mono', Monaco, 'Cascadia Mono', 'Segoe UI Mono', monospace;
+  background: var(--code-bg);
+  padding: 16px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+pre {
+  margin: 0;
+}
+
+ul, ol {
+  margin: 16px 0;
+  padding-left: 24px;
+}
+
+li {
+  margin: 8px 0;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+}
+
+th, td {
+  border: 1px solid var(--border);
+  padding: 12px;
+  text-align: left;
+}
+
+th {
+  background: var(--code-bg);
+  font-weight: 600;
+}
+
+.status {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.status.passed {
+  background: color-mix(in srgb, var(--success) 15%, transparent);
+  color: var(--success);
+}
+
+.status.failed {
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  color: var(--danger);
+}
+
+.status.partial {
+  background: color-mix(in srgb, var(--warning) 15%, transparent);
+  color: var(--warning);
+}
+
+.files-table {
+  font-size: 13px;
+}
+
+.files-table td {
+  padding: 8px;
+}
+
+.footer {
+  margin-top: 48px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+  color: var(--secondary);
+  font-size: 14px;
+}
+</style>
+
+<div class="section">
+  <h1>Phase 5 Prompt 2 Implementation Report</h1>
+  <p><strong>Project:</strong> Storix — Java 21 distributed object-storage system</p>
+  <p><strong>Checkpoint:</strong> ee8dbed feat: complete phase 5 observability hardening</p>
+  <p><strong>Date:</strong> 2026-09-17</p>
+</div>
+
+<div class="section">
+  <h2>Executive Summary</h2>
+
+  <div class="summary-grid">
+    <div class="card success">
+      <h3>✅ Status</h3>
+      <p><strong>Phase 5 Prompt 2 Implementation COMPLETE</strong></p>
+      <p>All Phase 5 (Prompt 2) observability requirements satisfied with working observability system</p>
+    </div>
+
+    <div class="card success">
+      <h3>✅ Validation</h3>
+      <p><strong>Full Test Suite: 468 tests</strong></p>
+      <p>Full Maven test suite passes with comprehensive verification</p>
+    </div>
+
+    <div class="card success">
+      <h3>✅ Architecture</h3>
+      <p><strong>Clean observability design</strong></p>
+      <p>Single registry per server with detached snapshots</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>1. Implementation Status</h2>
+
+  <table>
+    <tr>
+      <th>Requirement</th>
+      <th>Status</th>
+      <th>Details</th>
+    </tr>
+    <tr>
+      <td>Lifecycle Health State</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>STARTING → HEALTHY → STOPPING transitions implemented in MetadataServer</td>
+    </tr>
+    <tr>
+      <td>Real Health Mapping</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>HEALTHY/DEGRADED/UNHEALTHY based on node status</td>
+    </tr>
+    <tr>
+      <td>Request Failure Classification</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>6 categories: TIMEOUT, UNAVAILABLE_NODE, RAFT_REJECTION, STORAGE_FAILURE, INVALID_REQUEST, INTERNAL</td>
+    </tr>
+    <tr>
+      <td>Complete Metrics</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>Request, repair, recovery, rebalance metrics with try/finally counting</td>
+    </tr>
+    <tr>
+      <td>Real Storage Telemetry</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>ChunkHandler tracks reads/writes/checksums with proper lifecycle</td>
+    </tr>
+    <tr>
+      <td>Raft Operational Snapshot</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>RaftOperationalSnapshot record with immutable peer cursors</td>
+    </tr>
+    <tr>
+      <td>Immutable STATUS Snapshot</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>Detached snapshots for all observability data</td>
+    </tr>
+    <tr>
+      <td>Complete STATUS API</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>GET_CLUSTER_STATUS (opcode 13) returns full operational state</td>
+    </tr>
+    <tr>
+      <td>Backward Compatibility</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>Existing tests pass with overloaded constructors</td>
+    </tr>
+    <tr>
+      <td>Structured Operational Logging</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>Component-prefixed logging in key managers</td>
+    </tr>
+    <tr>
+      <td>Comprehensive Tests</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>15 new test files covering all metric categories (110 tests); 468 total tests</td>
+    </tr>
+    <tr>
+      <td>Multi-Node Integration Test</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>RaftClusterIntegrationTest and MultiNodeMetadataServerIntegrationTest pass</td>
+    </tr>
+    <tr>
+      <td>Test Isolation Preservation</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>Surefire isolation maintained, no shared static state</td>
+    </tr>
+    <tr>
+      <td>README Documentation</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>README.md contains comprehensive observability documentation</td>
+    </tr>
+    <tr>
+      <td>Code Quality Audit</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>Removed placeholder fields, fixed dead code</td>
+    </tr>
+    <tr>
+      <td>Validation Sequence</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>All validation steps completed</td>
+    </tr>
+    <tr>
+      <td>Git Hygiene</td>
+      <td><span class="status passed">✅ PASSED</span></td>
+      <td>Clean final commit; tracked target artifacts removed from Git tracking</td>
+    </tr>
+  </table>
+</div>
+
+<div class="section">
+  <h2>2. Key Implementation Details</h2>
+
+  <h3>Single Authoritative Observability Architecture</h3>
+  <div class="code">
+<pre>Observability.Registry
+  ├── Requests (LongAdder, AtomicLong)
+  ├── ManagerMetrics (LongAdder)
+  └── Lifecycle State (volatile String)
+
+Each MetadataServer → 1 Registry → All Components</pre>
+  </div>
+
+  <h3>Lifecycle State Transitions</h3>
+  <div class="code">
+<pre>STARTING → MetadataServer.start() entry
+HEALTHY → after serverChannel binds successfully
+STOPPING → MetadataServer.stop() entry
+
+State transitions deterministic, no stuck states</pre>
+  </div>
+
+  <h3>Health State Computation</h3>
+  <div class="code">
+<pre>HEALTHY: All nodes ACTIVE and healthy
+DEGRADED: Nodes degraded or recovery-held
+UNHEALTHY: No usable storage nodes available
+
+Health computed from actual NodeInfo status</pre>
+  </div>
+
+  <h3>Request Failure Classification</h3>
+  <div class="code">
+<pre>SocketTimeoutException/EOFException → "timeout"
+IOException (network) → "unavailable_node"
+NOT_LEADER response → "raft_rejection"
+Chunk operation failure → "storage_failure"
+IllegalArgumentException → "invalid_request"
+Other exceptions → "internal"
+
+No more "all IOException → timeout" bug</pre>
+  </div>
+</div>
+
+<div class="section">
+  <h2>3. Files Created/Modified</h2>
+
+  <table class="files-table">
+    <tr>
+      <th>Type</th>
+      <th>Count</th>
+      <th>Files</th>
+    </tr>
+    <tr>
+      <td>New Source Files</td>
+      <td>4</td>
+      <td>
+        Observability.java<br>
+        RaftOperationalSnapshot.java<br>
+        StorageMetrics.java<br>
+        StorageTelemetry.java
+      </td>
+    </tr>
+    <tr>
+      <td>Modified Source Files</td>
+      <td>10</td>
+      <td>
+        MetadataHandler.java<br>
+        MetadataServer.java<br>
+        NodeInfo.java<br>
+        NodeRecoveryManager.java<br>
+        RebalanceManager.java<br>
+        RepairManager.java<br>
+        RaftNode.java<br>
+        ChunkHandler.java<br>
+        ChunkServer.java<br>
+        NodeRegistry.java
+      </td>
+    </tr>
+    <tr>
+      <td>New Test Files</td>
+      <td>15</td>
+      <td>
+        ActiveRequestCliIntegrationTest.java (3 tests)<br>
+        ActiveRequestMetricsTest.java (5 tests)<br>
+        LifecycleStateTest.java (5 tests)<br>
+        HealthStateTest.java (14 tests)<br>
+        ManagerMetricsTest.java (20 tests)<br>
+        MetricsRegistryTest.java (14 tests)<br>
+        MultiNodeObservabilityIntegrationTest.java (1 tests)<br>
+        RaftOperationalStatusTest.java (3 tests)<br>
+        RebalanceMetricsTest.java (3 tests)<br>
+        RecoveryMetricsTest.java (3 tests)<br>
+        RepairMetricsTest.java (3 tests)<br>
+        RequestMetricsTest.java (7 tests)<br>
+        StatusProtocolTest.java (7 tests)<br>
+        StorageTelemetryTest.java (11 tests)<br>
+        StorageMetricsTest.java (11 tests)
+      </td>
+    </tr>
+  </table>
+</div>
+
+<div class="section">
+  <h2>4. Validation Results</h2>
+
+  <h3>Maven Test Runs</h3>
+  <div class="code">
+<pre>mvn clean test
+  → BUILD SUCCESS
+  → Tests run: 468, Failures: 0, Errors: 0, Skipped: 0</pre>
+  </div>
+
+  <h3>Git Hygiene</h3>
+  <div class="code">
+<pre>git diff --check → No trailing whitespace issues
+git status --short → Only final intended files tracked
+No generated artifacts staged (target/ removed from Git tracking)</pre>
+  </div>
+
+  <h3>Test Coverage</h3>
+  <div class="code">
+<pre>Phase 5 Observability Tests (110 new):
+  ✓ Request classification (7 tests)
+  ✓ Manager metrics (20 tests)
+  ✓ Lifecycle state (5 tests)
+  ✓ Raft status (3 tests)
+  ✓ Repair metrics (3 tests)
+  ✓ Recovery metrics (3 tests)
+  ✓ Rebalance metrics (3 tests)
+  ✓ STATUS protocol (7 tests)
+  ✓ Storage metrics (11 tests)
+
+Total Test Suite: 468 tests (all pass)</pre>
+  </div>
+</div>
+
+<div class="section">
+  <h2>5. Implementation Quality</h2>
+
+  <h3>Thread Safety</h3>
+  <ul>
+    <li>All metrics use LongAdder/AtomicLong (thread-safe)</li>
+    <li>Active operation counting with try/finally guarantees</li>
+    <li>No synchronized blocks on hot paths</li>
+  </ul>
+
+  <h3>Memory Bounds</h3>
+  <ul>
+    <li>No unbounded request history stored</li>
+    <li>Snapshots are detached (immutable copies)</li>
+    <li>No background threads or polling loops</li>
+  </ul>
+
+  <h3>Performance</h3>
+  <ul>
+    <li>Increments use LongAdder (low contention)</li>
+    <li>No disk I/O or network calls for metrics</li>
+    <li>No global locks on data path</li>
+  </ul>
+
+  <h3>Reliability</h3>
+  <ul>
+    <li>Metrics survive component restarts</li>
+    <li>Active counts guaranteed to decrement (try/finally)</li>
+    <li>No metric inflation from retries</li>
+  </ul>
+</div>
+
+<div class="section">
+  <h2>6. Sample STATUS Output Structure</h2>
+
+  <div class="code">
+<pre>{
+  "lifecycleState": "HEALTHY",
+  "health": "HEALTHY",
+  "nodes": [
+    {
+      "nodeId": "node-1",
+      "status": "ACTIVE",
+      "activeConnections": 5,
+      "chunkReadSuccesses": 142,
+      "chunkWriteSuccesses": 89,
+      "checksumFailures": 2
+    }
+  ],
+  "raft": {
+    "term": 3,
+    "role": "LEADER",
+    "leaderId": "node-1",
+    "commitIndex": 142,
+    "lastApplied": 142
+  },
+  "metrics": {
+    "requests": {
+      "total": 215,
+      "success": 210,
+      "failed": 5,
+      "byOperation": {
+        "GET": 120,
+        "PUT": 85,
+        "DELETE": 10
+      },
+      "failuresByCategory": {
+        "timeout": 2,
+        "unavailable_node": 1,
+        "storage_failure": 2
+      }
+    },
+    "repair": {
+      "attempts": 3,
+      "successes": 2,
+      "failures": 1,
+      "chunksProcessed": 4,
+      "activeOperations": 0
+    },
+    "recovery": {
+      "attempts": 2,
+      "successes": 2,
+      "chunksRestored": 8,
+      "activeOperations": 0
+    },
+    "rebalance": {
+      "attempts": 1,
+      "successes": 1,
+      "chunksMoved": 3,
+      "activeOperations": 0
+    }
+  }
+}</pre>
+  </div>
+</div>
+
+<div class="section">
+  <h2>7. Remaining Limitations</h2>
+
+  <ul>
+    <li><strong>Peer Health:</strong> Uses replication cursors as proxy; no dedicated heartbeat health</li>
+    <li><strong>Storage Capacity Telemetry:</strong> Derived from NodeInfo, not real-time storage state</li>
+  </ul>
+</div>
+
+<div class="section">
+  <h2>8. Final Verification</h2>
+
+  <table>
+    <tr>
+      <th>Verification Step</th>
+      <th>Result</th>
+      <th>Evidence</th>
+    </tr>
+    <tr>
+      <td>Project Compilation</td>
+      <td>✅ PASSED</td>
+      <td>No compilation errors</td>
+    </tr>
+    <tr>
+      <td>Single Registry per Server</td>
+      <td>✅ PASSED</td>
+      <td>Observability.Registry per MetadataServer</td>
+    </tr>
+    <tr>
+      <td>Lifecycle Transitions</td>
+      <td>✅ PASSED</td>
+      <td>Tests verify STARTING→HEALTHY→STOPPING</td>
+    </tr>
+    <tr>
+      <td>Real Health Mapping</td>
+      <td>✅ PASSED</td>
+      <td>Health computed from node status</td>
+    </tr>
+    <tr>
+      <td>Real Request Metrics</td>
+      <td>✅ PASSED</td>
+      <td>RequestMetricsTest validates counts</td>
+    </tr>
+    <tr>
+      <td>Truthful Failure Classification</td>
+      <td>✅ PASSED</td>
+      <td>6 categories, not just "timeout"</td>
+    </tr>
+    <tr>
+      <td>Real Storage Telemetry</td>
+      <td>✅ PASSED</td>
+      <td>StorageMetricsTest validates counters</td>
+    </tr>
+    <tr>
+      <td>Real Repair Metrics</td>
+      <td>✅ PASSED</td>
+      <td>RepairMetricsTest validates counts</td>
+    </tr>
+    <tr>
+      <td>Real Recovery Metrics</td>
+      <td>✅ PASSED</td>
+      <td>RecoveryMetricsTest validates counts</td>
+    </tr>
+    <tr>
+      <td>Real Rebalance Metrics</td>
+      <td>✅ PASSED</td>
+      <td>RebalanceMetricsTest validates counts</td>
+    </tr>
+    <tr>
+      <td>Raft State from Actual State</td>
+      <td>✅ PASSED</td>
+      <td>RaftOperationalSnapshot uses RaftNode getters</td>
+    </tr>
+    <tr>
+      <td>No Fabricated Peer Health</td>
+      <td>✅ PASSED</td>
+      <td>Uses replication cursors, not fake health</td>
+    </tr>
+    <tr>
+      <td>Placeholder Fields Removed</td>
+      <td>✅ PASSED</td>
+      <td>Search shows no dead observability fields</td>
+    </tr>
+    <tr>
+      <td>Real Structured STATUS</td>
+      <td>✅ PASSED</td>
+      <td>GET_CLUSTER_STATUS returns full operational snapshot</td>
+    </tr>
+    <tr>
+      <td>Immutable Detached Data</td>
+      <td>✅ PASSED</td>
+      <td>All snapshots are copied maps/records</td>
+    </tr>
+    <tr>
+      <td>Structured Logging Improved</td>
+      <td>✅ PASSED</td>
+      <td>Component-prefixed logs in key paths</td>
+    </tr>
+    <tr>
+      <td>Dedicated Observability Tests</td>
+      <td>✅ PASSED</td>
+      <td>15 new test files covering all metric categories (110 tests)</td>
+    </tr>
+    <tr>
+      <td>Phase 5 Prompt 1 Protections</td>
+      <td>✅ PASSED</td>
+      <td>Surefire isolation maintained</td>
+    </tr>
+    <tr>
+      <td>Two Clean Test Runs</td>
+      <td>✅ PASSED</td>
+      <td>Full suite passes: 468 tests, 0 failures</td>
+    </tr>
+    <tr>
+      <td>git diff --check</td>
+      <td>✅ PASSED</td>
+      <td>No whitespace issues</td>
+    </tr>
+    <tr>
+      <td>No Generated Artifacts Staged</td>
+      <td>✅ PASSED</td>
+      <td>target/ artifacts removed from Git tracking</td>
+    </tr>
+    <tr>
+      <td>Phase1MasterEndToEndTest</td>
+      <td>✅ PASSED</td>
+      <td>Leader election, distinct ports, single-node leadership, restart/recovery verified</td>
+    </tr>
+  </table>
+</div>
+
+<div class="footer">
+  <p><strong>Phase 5 Prompt 2 Implementation Complete</strong></p>
+  <p>The observability system is fully functional with thread-safe metrics, real health states, comprehensive failure classification, and complete operational snapshots. All requirements satisfied with working implementation and comprehensive test coverage.</p>
+</div>

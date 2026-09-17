@@ -1,34 +1,172 @@
 package com.storix.storage;
 
+import com.storix.storage.observability.LogHandler;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Handles chunk persistence using the filesystem.
- * Each chunk is stored as a separate file under the storage directory.
+ *
+ * Capacity model (optional):
+ * - If totalCapacityBytes <= 0, capacity is treated as unlimited.
+ * - If totalCapacityBytes > 0, put/delete/quarantine enforce and update usedCapacityBytes.
  */
 public class ChunkStorage {
 
     private final Path storageDir;
     private final Path quarantineDir;
 
+    private final long totalCapacityBytes;
+    private long usedCapacityBytes;
+
+    /**
+     * Test hook: allows forcing failures at deterministic points inside putChunk.
+     */
+    @FunctionalInterface
+    public interface PutFailureInjector {
+        void beforeCommit(String chunkId) throws IOException;
+    }
+
+    private volatile PutFailureInjector putFailureInjector;
+
+    // Global lock ensures capacity accounting is consistent under concurrent operations.
+    private final ReentrantLock capacityLock = new ReentrantLock();
+
+    /**
+     * Sets a test-only failure injector. When non-null, it is invoked inside putChunk
+     * after capacity has been reserved but before the filesystem write is committed.
+     */
+    public void setPutFailureInjector(PutFailureInjector injector) {
+        this.putFailureInjector = injector;
+    }
+
     public ChunkStorage(Path storageDir) throws IOException {
+        this(storageDir, -1);
+    }
+
+    public ChunkStorage(Path storageDir, long totalCapacityBytes) throws IOException {
         this.storageDir = storageDir;
         this.quarantineDir = storageDir.resolve("quarantine");
+        this.totalCapacityBytes = totalCapacityBytes;
         Files.createDirectories(storageDir);
         Files.createDirectories(quarantineDir);
+
+        // Initialize used capacity from any existing chunk files.
+        this.usedCapacityBytes = computeInitialUsedCapacityBytes();
+    }
+
+    private long computeInitialUsedCapacityBytes() throws IOException {
+        if (totalCapacityBytes <= 0) {
+            return 0;
+        }
+        long[] totalRef = new long[]{0};
+        try (var stream = Files.list(storageDir)) {
+            stream.filter(p -> p.getFileName().toString().endsWith(".chunk"))
+                    .forEach(p -> {
+                        try {
+                            totalRef[0] += Files.size(p);
+                        } catch (IOException ignored) {
+                            // Best-effort; capacity will be corrected by subsequent operations.
+                        }
+                    });
+        }
+        return totalRef[0];
+    }
+
+    public long getTotalCapacityBytes() {
+        return totalCapacityBytes;
+    }
+
+    public long getUsedCapacityBytes() {
+        capacityLock.lock();
+        try {
+            return usedCapacityBytes;
+        } finally {
+            capacityLock.unlock();
+        }
     }
 
     /**
-     * Stores a chunk to disk. Overwrites if exists.
+     * Available capacity in bytes.
+     *
+     * If total capacity is unknown (<=0), returns Long.MAX_VALUE.
+     */
+    public long getAvailableCapacityBytes() {
+        if (totalCapacityBytes <= 0) {
+            return Long.MAX_VALUE;
+        }
+        capacityLock.lock();
+        try {
+            return Math.max(0, totalCapacityBytes - usedCapacityBytes);
+        } finally {
+            capacityLock.unlock();
+        }
+    }
+
+    /**
+     * Lists stored chunk IDs by scanning the storage directory.
+     *
+     * Returned IDs match the on-disk naming convention produced by resolveChunkPath:
+     * base filename without the ".chunk" suffix.
+     */
+    public List<String> listStoredChunkIds() {
+        try (var stream = Files.list(storageDir)) {
+            List<String> ids = new ArrayList<>();
+            stream.filter(p -> p.getFileName().toString().endsWith(".chunk"))
+                    .forEach(p -> {
+                        String fileName = p.getFileName().toString();
+                        String chunkId = fileName.substring(0, fileName.length() - ".chunk".length());
+                        ids.add(chunkId);
+                    });
+            Collections.sort(ids);
+            return ids;
+        } catch (IOException e) {
+            // Storage dir errors are treated as fatal for inventory; caller can mark node unhealthy.
+            throw new RuntimeException("Failed to list chunk inventory", e);
+        }
+    }
+
+    /**
+     * Stores a chunk to disk. Enforces capacity and updates accounting.
+     * Overwrites if exists.
      */
     public void putChunk(String chunkId, byte[] data) throws IOException {
         Path chunkFile = resolveChunkPath(chunkId);
-        Files.write(chunkFile, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        long newSize = data != null ? data.length : 0;
+
+        capacityLock.lock();
+        try {
+            long oldSize = Files.exists(chunkFile) ? Files.size(chunkFile) : 0;
+            long newUsed = usedCapacityBytes - oldSize + newSize;
+
+            if (totalCapacityBytes > 0 && newUsed > totalCapacityBytes) {
+                throw new IOException("Insufficient capacity for chunk " + chunkId + ". " +
+                        "available=" + Math.max(0, totalCapacityBytes - usedCapacityBytes) +
+                        ", required=" + newSize);
+            }
+
+            // Reserve succeeded (capacity check passed). Test hook may now force a failure
+            // before the actual filesystem write/commit.
+            if (putFailureInjector != null) {
+                putFailureInjector.beforeCommit(chunkId);
+            }
+
+            // Write file (may throw); only update used capacity after success.
+            Files.write(chunkFile, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            usedCapacityBytes = newUsed;
+
+        } finally {
+            capacityLock.unlock();
+        }
     }
 
     /**
@@ -48,12 +186,27 @@ public class ChunkStorage {
     }
 
     /**
-     * Deletes a chunk from disk.
+     * Deletes a chunk from disk and updates accounting.
      * @return true if chunk was deleted, false if it didn't exist
      */
     public boolean deleteChunk(String chunkId) throws IOException {
         Path chunkFile = resolveChunkPath(chunkId);
-        return Files.deleteIfExists(chunkFile);
+
+        capacityLock.lock();
+        try {
+            if (!Files.exists(chunkFile)) {
+                return false;
+            }
+
+            long oldSize = Files.size(chunkFile);
+            boolean deleted = Files.deleteIfExists(chunkFile);
+            if (deleted) {
+                usedCapacityBytes = usedCapacityBytes - oldSize;
+            }
+            return deleted;
+        } finally {
+            capacityLock.unlock();
+        }
     }
 
     /**
@@ -75,8 +228,7 @@ public class ChunkStorage {
 
     /**
      * Quarantines a corrupted chunk by moving it to quarantine directory.
-     * @param chunkId the chunk ID to quarantine
-     * @throws IOException if quarantine fails
+     * Capacity accounting is updated when capacity is enabled.
      */
     public void quarantineCorruptChunk(String chunkId) throws IOException {
         Path chunkFile = resolveChunkPath(chunkId);
@@ -84,11 +236,20 @@ public class ChunkStorage {
             return; // Already gone
         }
 
-        String timestampedFileName = chunkId + "_" + System.currentTimeMillis() + ".corrupt";
-        Path quarantineFile = quarantineDir.resolve(timestampedFileName);
+        capacityLock.lock();
+        try {
+            long oldSize = Files.size(chunkFile);
+            String timestampedFileName = chunkId + "_" + System.currentTimeMillis() + ".corrupt";
+            Path quarantineFile = quarantineDir.resolve(timestampedFileName);
 
-        Files.move(chunkFile, quarantineFile);
-        System.err.println("[CORRUPT] Quarantined chunk " + chunkId + " to " + quarantineFile);
+            Files.move(chunkFile, quarantineFile);
+            if (totalCapacityBytes > 0) {
+                usedCapacityBytes = Math.max(0, usedCapacityBytes - oldSize);
+            }
+            LogHandler.error("[CORRUPT] Quarantined chunk " + chunkId + " to " + quarantineFile);
+        } finally {
+            capacityLock.unlock();
+        }
     }
 
     /**

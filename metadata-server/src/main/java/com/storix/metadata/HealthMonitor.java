@@ -56,7 +56,7 @@ public class HealthMonitor {
             scheduler.scheduleAtFixedRate(this::checkAndRepair,
                     checkIntervalMillis, checkIntervalMillis, TimeUnit.MILLISECONDS);
 
-            System.out.println("[HEALTH] Monitor started (timeout=" + nodeTimeoutMillis + "ms, " +
+            LogHandler.info("[HEALTH] Monitor started (timeout=" + nodeTimeoutMillis + "ms, " +
                     "interval=" + checkIntervalMillis + "ms)");
         }
     }
@@ -100,17 +100,17 @@ public class HealthMonitor {
         try {
             List<String> newlyUnhealthy = nodeRegistry.checkHealth(nodeTimeoutMillis);
             if (!newlyUnhealthy.isEmpty()) {
-                System.out.println("[HEALTH] Detected " + newlyUnhealthy.size() +
+                LogHandler.info("[HEALTH] Detected " + newlyUnhealthy.size() +
                         " newly unhealthy node(s): " + String.join(", ", newlyUnhealthy));
-                System.out.println("[REPAIR] Triggering automatic repair...");
+                LogHandler.info("[REPAIR] Triggering automatic repair...");
                 RepairManager.RepairResult result = repairManager.repairAll();
-                System.out.println("[REPAIR] Complete: scanned=" + result.chunksScanned() +
+                LogHandler.info("[REPAIR] Complete: scanned=" + result.chunksScanned() +
                         " repaired=" + result.chunksRepaired() +
                         " failed=" + result.chunksFailed() +
                         " healthy=" + result.chunksAlreadyHealthy());
             }
         } catch (Exception e) {
-            System.err.println("[HEALTH] Error during health check: " + e.getMessage());
+            LogHandler.error("[HEALTH] Error during health check: " + e.getMessage());
         }
     }
 }

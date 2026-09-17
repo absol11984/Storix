@@ -17,10 +17,13 @@ public final class Protocol {
     public static final byte DELETE_CHUNK = 3;
     public static final byte VERIFY_CHUNK = 4;
 
+    // Node-level requests
+    // LIST_NODE_STATE returns: nodeId + capacity metrics + local chunk inventory.
+    public static final byte LIST_NODE_STATE = 5;
+
     // Status codes
     public static final byte OK = 0;
     public static final byte ERROR = 1;
-    public static final byte CHUNK_CORRUPTED = 2;
 
     private Protocol() {}
 

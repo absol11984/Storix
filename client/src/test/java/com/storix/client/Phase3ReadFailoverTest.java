@@ -98,7 +98,17 @@ class Phase3ReadFailoverTest {
             if (node != null) node.stop();
         }
         if (metadataServer != null) metadataServer.stop();
-        if (executor != null) executor.shutdownNow();
+
+        // Ensure all background start() threads have stopped before JUnit deletes TempDir.
+        // Otherwise, raft-state (WAL/snapshot writers) may still be creating files during cleanup.
+        if (executor != null) {
+            executor.shutdownNow();
+            try {
+                executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /**

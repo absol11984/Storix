@@ -16,88 +16,253 @@ import java.util.concurrent.*;
 public class RepairManager {
 
     private static final int DEFAULT_MAX_CONCURRENT_REPAIRS = 4;
+    private static final int IO_TIMEOUT_MILLIS = 5000;
 
     private final MetadataStore metadataStore;
     private final NodeRegistry nodeRegistry;
     private final PlacementManager placementManager;
-    private final Semaphore repairSemaphore;
-    private final ExecutorService repairExecutor;
+    private final int maxConcurrentRepairs;
+    private final ChunkOperationLock chunkOperationLock;
+    private final Observability.Registry observability;
+
+    private final Object lifecycleLock = new Object();
+    private volatile boolean stopped = false;
+
+    private volatile Semaphore repairSemaphore;
+    private volatile ExecutorService repairExecutor;
 
     /**
      * Creates a RepairManager with default max concurrent repairs (4).
      */
-    public RepairManager(MetadataStore metadataStore, NodeRegistry nodeRegistry, PlacementManager placementManager) {
-        this(metadataStore, nodeRegistry, placementManager, DEFAULT_MAX_CONCURRENT_REPAIRS);
+    public RepairManager(MetadataStore metadataStore,
+                         NodeRegistry nodeRegistry,
+                         PlacementManager placementManager) {
+        this(metadataStore, nodeRegistry, placementManager, DEFAULT_MAX_CONCURRENT_REPAIRS, new ChunkOperationLock(), null);
     }
 
     /**
      * Creates a RepairManager with custom max concurrent repairs.
      */
-    public RepairManager(MetadataStore metadataStore, NodeRegistry nodeRegistry,
-                        PlacementManager placementManager, int maxConcurrentRepairs) {
-        this.metadataStore = metadataStore;
-        this.nodeRegistry = nodeRegistry;
-        this.placementManager = placementManager;
-        this.repairSemaphore = new Semaphore(maxConcurrentRepairs);
-        this.repairExecutor = Executors.newFixedThreadPool(maxConcurrentRepairs,
-                r -> {
-                    Thread t = new Thread(r, "repair-worker");
-                    t.setDaemon(true);
-                    return t;
-                });
+    public RepairManager(MetadataStore metadataStore,
+                         NodeRegistry nodeRegistry,
+                         PlacementManager placementManager,
+                         int maxConcurrentRepairs) {
+        this(metadataStore, nodeRegistry, placementManager, maxConcurrentRepairs, new ChunkOperationLock(), null);
     }
 
     /**
-     * Returns the max concurrent repairs limit.
+     * Creates a RepairManager with explicit chunk operation lock.
+     */
+    public RepairManager(MetadataStore metadataStore,
+                         NodeRegistry nodeRegistry,
+                         PlacementManager placementManager,
+                         int maxConcurrentRepairs,
+                         ChunkOperationLock chunkOperationLock) {
+        this(metadataStore, nodeRegistry, placementManager, maxConcurrentRepairs, chunkOperationLock, null);
+    }
+
+    /**
+     * Creates a RepairManager with observability registry.
+     */
+    public RepairManager(MetadataStore metadataStore,
+                         NodeRegistry nodeRegistry,
+                         PlacementManager placementManager,
+                         int maxConcurrentRepairs,
+                         ChunkOperationLock chunkOperationLock,
+                         Observability.Registry observability) {
+        this.metadataStore = metadataStore;
+        this.nodeRegistry = nodeRegistry;
+        this.placementManager = placementManager;
+        this.maxConcurrentRepairs = maxConcurrentRepairs;
+        this.chunkOperationLock = chunkOperationLock;
+        this.observability = observability != null ? observability : new Observability.Registry();
+
+        // Default is “started” so existing call sites that never call start() still work.
+        this.repairSemaphore = new Semaphore(maxConcurrentRepairs);
+        this.repairExecutor = createRepairExecutor(maxConcurrentRepairs);
+    }
+
+    private ExecutorService createRepairExecutor(int threads) {
+        return Executors.newFixedThreadPool(threads, r -> {
+            Thread t = new Thread(r, "repair-worker");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    /**
+     * Starts the repair executor if it was stopped.
+     * This method is idempotent.
+     */
+    public void start() {
+        synchronized (lifecycleLock) {
+            if (!stopped && repairExecutor != null && !repairExecutor.isShutdown()) {
+                return;
+            }
+            stopped = false;
+            repairSemaphore = new Semaphore(maxConcurrentRepairs);
+            repairExecutor = createRepairExecutor(maxConcurrentRepairs);
+        }
+    }
+
+    /**
+     * Stops the repair executor.
+     * Idempotent; safe to call multiple times.
+     */
+    public void stop() {
+        ExecutorService execToStop;
+        synchronized (lifecycleLock) {
+            if (stopped) {
+                return;
+            }
+            stopped = true;
+            execToStop = repairExecutor;
+            repairExecutor = null;
+            repairSemaphore = null;
+        }
+
+        if (execToStop == null) {
+            return;
+        }
+
+        execToStop.shutdownNow();
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        boolean interrupted = false;
+        try {
+            while (!execToStop.isTerminated() && System.nanoTime() < deadlineNanos) {
+                long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+                if (remainingMs <= 0) {
+                    break;
+                }
+                try {
+                    execToStop.awaitTermination(Math.min(2_000, remainingMs), TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                    execToStop.shutdownNow();
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * Compatibility alias.
+     */
+    public void close() {
+        stop();
+    }
+
+    /**
+     * Returns the max concurrent repairs limit (bounded concurrency).
      */
     public int getMaxConcurrentRepairs() {
-        return repairSemaphore.availablePermits();
+        return maxConcurrentRepairs;
     }
 
     /**
      * Scans all objects for under-replicated chunks and repairs them.
      * Uses bounded concurrency to limit simultaneous repairs.
-     * @return summary of repair actions
      */
     public RepairResult repairAll() {
+        ExecutorService exec;
+        Semaphore sem;
+        synchronized (lifecycleLock) {
+            if (stopped) {
+                return new RepairResult(0, 0, 0, 0);
+            }
+            exec = repairExecutor;
+            sem = repairSemaphore;
+            if (exec == null || sem == null || exec.isShutdown()) {
+                return new RepairResult(0, 0, 0, 0);
+            }
+        }
+
         // First, collect all repair tasks
         List<RepairTask> tasks = collectRepairTasks();
-
         if (tasks.isEmpty()) {
             return new RepairResult(0, 0, 0, 0);
         }
 
-        // Execute repairs with bounded concurrency
         int chunksScanned = tasks.size();
         int chunksRepaired = 0;
         int chunksFailed = 0;
+        int chunksSkipped = 0;
 
         List<Future<RepairOutcome>> futures = new ArrayList<>();
+
+        // Record one repair attempt per task submitted, not per skipped/cancelled future.
+        observability.managers().repairAttempt();
+
         for (RepairTask task : tasks) {
-            Future<RepairOutcome> future = repairExecutor.submit(() -> repairChunk(task));
+            final RepairTask taskRef = task;
+            Future<RepairOutcome> future = exec.submit(() -> {
+                if (stopped || Thread.currentThread().isInterrupted()) {
+                    return RepairOutcome.SKIPPED;
+                }
+                observability.managers().repairActiveStart();
+                try {
+                    return repairChunk(taskRef, sem);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return RepairOutcome.SKIPPED;
+                } finally {
+                    observability.managers().repairActiveEnd();
+                }
+            });
             futures.add(future);
         }
 
         // Wait for all repairs to complete
+        long repairDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
         for (Future<RepairOutcome> future : futures) {
+            if (stopped || Thread.currentThread().isInterrupted()) {
+                for (Future<RepairOutcome> f : futures) {
+                    f.cancel(true);
+                }
+                break;
+            }
+
+            long remainingNanos = repairDeadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0) {
+                for (Future<RepairOutcome> f : futures) {
+                    f.cancel(true);
+                }
+                break;
+            }
+
             try {
-                RepairOutcome outcome = future.get(30, TimeUnit.SECONDS);
+                RepairOutcome outcome = future.get(
+                        Math.max(1, TimeUnit.NANOSECONDS.toMillis(remainingNanos)),
+                        TimeUnit.MILLISECONDS);
                 if (outcome == RepairOutcome.SUCCESS) {
                     chunksRepaired++;
+                    observability.managers().repairSuccess();
+                    observability.managers().repairChunks(1);
                 } else if (outcome == RepairOutcome.FAILED) {
                     chunksFailed++;
+                    observability.managers().repairFailure();
+                } else {
+                    chunksSkipped++;
                 }
+            } catch (CancellationException e) {
+                chunksFailed++;
+                observability.managers().repairFailure();
             } catch (ExecutionException e) {
                 chunksFailed++;
+                observability.managers().repairFailure();
             } catch (TimeoutException e) {
                 chunksFailed++;
+                observability.managers().repairFailure();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             }
         }
 
-        return new RepairResult(chunksScanned, chunksRepaired, chunksFailed, 0);
+        return new RepairResult(chunksScanned, chunksRepaired, chunksFailed, chunksSkipped);
     }
 
     /**
@@ -130,10 +295,14 @@ public class RepairManager {
                     continue;
                 }
 
-                // Add repair task
                 int needed = placementManager.getReplicationFactor() - healthyReplicas.size();
-                tasks.add(new RepairTask(chunk.getChunkId(), objectName, healthyReplicas.get(0),
-                        chunk.getChecksum(), needed));
+                tasks.add(new RepairTask(
+                        chunk.getChunkId(),
+                        objectName,
+                        healthyReplicas.get(0),
+                        chunk.getChecksum(),
+                        needed,
+                        chunk.getChunkSize()));
             }
         }
 
@@ -143,23 +312,34 @@ public class RepairManager {
     /**
      * Repairs a single chunk with semaphore-based concurrency control.
      */
-    private RepairOutcome repairChunk(RepairTask task) {
-        // Acquire semaphore permit
-        try {
-            repairSemaphore.acquire();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return RepairOutcome.FAILED;
+    private RepairOutcome repairChunk(RepairTask task, Semaphore repairSemaphore) throws InterruptedException {
+        if (stopped || Thread.currentThread().isInterrupted()) {
+            return RepairOutcome.SKIPPED;
         }
 
+        if (!chunkOperationLock.tryAcquire(task.chunkId)) {
+            return RepairOutcome.SKIPPED;
+        }
+
+        boolean permitAcquired = false;
         try {
-            // Get source and target nodes
+            try {
+                repairSemaphore.acquire();
+                permitAcquired = true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return RepairOutcome.FAILED;
+            }
+
+            if (stopped || Thread.currentThread().isInterrupted()) {
+                return RepairOutcome.SKIPPED;
+            }
+
             NodeInfo sourceNode = nodeRegistry.getNode(task.sourceNodeId).orElse(null);
             if (sourceNode == null) {
                 return RepairOutcome.FAILED;
             }
 
-            // Find the chunk metadata to get existing replicas
             ObjectMetadata metadata = metadataStore.getObject(task.objectName).orElse(null);
             if (metadata == null) {
                 return RepairOutcome.FAILED;
@@ -173,47 +353,45 @@ public class RepairManager {
                 }
             }
 
-            // Find a target node (not currently hosting this chunk)
-            NodeInfo targetNode = placementManager.selectRepairTarget(existingReplicas);
+            NodeInfo targetNode = placementManager.selectRepairTarget(existingReplicas, (long) task.chunkSizeBytes);
             if (targetNode == null) {
-                System.out.println("[REPAIR] FAILED — no available target node for " + task.chunkId);
                 return RepairOutcome.FAILED;
             }
 
-            System.out.println("[REPAIR] chunk " + task.chunkId +
-                    " source=" + task.sourceNodeId +
-                    " destination=" + targetNode.getNodeId());
+            byte[] data;
+            try {
+                data = getChunkFromNode(sourceNode, task.chunkId);
+            } catch (IOException e) {
+                return RepairOutcome.FAILED;
+            }
 
-            // GET from source
-            byte[] data = getChunkFromNode(sourceNode, task.chunkId);
-
-            // Verify checksum if present
             if (task.checksum != null && !task.checksum.isEmpty()) {
                 String actualChecksum = computeSha256(data);
                 if (!actualChecksum.equals(task.checksum)) {
-                    System.out.println("[REPAIR] FAILED — source data checksum mismatch for " +
-                            task.chunkId);
                     return RepairOutcome.FAILED;
                 }
             }
 
-            // PUT to destination
-            putChunkToNode(targetNode, task.chunkId, data);
+            try {
+                putChunkToNode(targetNode, task.chunkId, data);
+            } catch (IOException e) {
+                return RepairOutcome.FAILED;
+            }
 
-            System.out.println("[REPAIR] chunk " + task.chunkId +
-                    " SUCCESS — replicated to " + targetNode.getNodeId());
-
-            // Update metadata to include the new replica
-            metadataStore.updateChunkReplica(task.objectName, task.chunkId, targetNode.getNodeId());
+            try {
+                metadataStore.updateChunkReplica(task.objectName, task.chunkId, targetNode.getNodeId());
+            } catch (IOException e) {
+                return RepairOutcome.FAILED;
+            }
 
             return RepairOutcome.SUCCESS;
-
-        } catch (IOException e) {
-            System.out.println("[REPAIR] FAILED — chunk " + task.chunkId +
-                    " error: " + e.getMessage());
+        } catch (RuntimeException e) {
             return RepairOutcome.FAILED;
         } finally {
-            repairSemaphore.release();
+            if (permitAcquired) {
+                repairSemaphore.release();
+            }
+            chunkOperationLock.release(task.chunkId);
         }
     }
 
@@ -240,7 +418,8 @@ public class RepairManager {
     private byte[] getChunkFromNode(NodeInfo node, String chunkId) throws IOException {
         try (SocketChannel channel = SocketChannel.open(
                 new InetSocketAddress(node.getHost(), node.getPort()))) {
-            // Build GET_CHUNK request
+            channel.socket().setSoTimeout(IO_TIMEOUT_MILLIS);
+
             byte[] chunkIdBytes = chunkId.getBytes();
             int requestSize = 1 + 4 + chunkIdBytes.length;
 
@@ -252,7 +431,6 @@ public class RepairManager {
             request.flip();
             writeFully(channel, request);
 
-            // Read response
             ByteBuffer lengthBuf = ByteBuffer.allocate(4);
             readFully(channel, lengthBuf);
             lengthBuf.flip();
@@ -279,6 +457,8 @@ public class RepairManager {
     private void putChunkToNode(NodeInfo node, String chunkId, byte[] chunkData) throws IOException {
         try (SocketChannel channel = SocketChannel.open(
                 new InetSocketAddress(node.getHost(), node.getPort()))) {
+            channel.socket().setSoTimeout(IO_TIMEOUT_MILLIS);
+
             byte[] chunkIdBytes = chunkId.getBytes();
             int requestSize = 1 + 4 + chunkIdBytes.length + 4 + chunkData.length;
 
@@ -292,7 +472,6 @@ public class RepairManager {
             request.flip();
             writeFully(channel, request);
 
-            // Read response
             ByteBuffer lengthBuf = ByteBuffer.allocate(4);
             readFully(channel, lengthBuf);
             lengthBuf.flip();
@@ -349,8 +528,8 @@ public class RepairManager {
      */
     public record RepairResult(int chunksScanned, int chunksRepaired, int chunksFailed, int chunksAlreadyHealthy) {}
 
-    private enum RepairOutcome { SUCCESS, FAILED }
+    private enum RepairOutcome { SUCCESS, FAILED, SKIPPED }
 
     private record RepairTask(String chunkId, String objectName, String sourceNodeId,
-                              String checksum, int replicasNeeded) {}
+                                String checksum, int replicasNeeded, int chunkSizeBytes) {}
 }

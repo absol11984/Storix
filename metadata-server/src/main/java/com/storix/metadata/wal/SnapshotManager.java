@@ -1,5 +1,7 @@
 package com.storix.metadata.wal;
 
+import com.storix.metadata.LogHandler;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.storix.metadata.MetadataStore;
@@ -82,9 +84,9 @@ public class SnapshotManager {
                     String filename = p.getFileName().toString();
                     try {
                         Files.delete(p);
-                        System.out.println("[SNAPSHOT] Cleaned up stale candidate: " + filename);
+                        LogHandler.info("[SNAPSHOT] Cleaned up stale candidate: " + filename);
                     } catch (IOException e) {
-                        System.err.println("[SNAPSHOT] Failed to delete candidate: " + filename);
+                        LogHandler.error("[SNAPSHOT] Failed to delete candidate: " + filename);
                     }
                 });
 
@@ -96,13 +98,13 @@ public class SnapshotManager {
                     String filename = p.getFileName().toString();
                     try {
                         Files.delete(p);
-                        System.out.println("[SNAPSHOT] Cleaned up stale install file: " + filename);
+                        LogHandler.info("[SNAPSHOT] Cleaned up stale install file: " + filename);
                     } catch (IOException e) {
-                        System.err.println("[SNAPSHOT] Failed to delete install file: " + filename);
+                        LogHandler.error("[SNAPSHOT] Failed to delete install file: " + filename);
                     }
                 });
         } catch (IOException e) {
-            System.err.println("[SNAPSHOT] Failed to list directory for candidate cleanup: " + e.getMessage());
+            LogHandler.error("[SNAPSHOT] Failed to list directory for candidate cleanup: " + e.getMessage());
         }
     }
 
@@ -160,7 +162,7 @@ public class SnapshotManager {
         // Atomic rename
         Files.move(tempFile, snapshotFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 
-        System.out.println("[SNAPSHOT] Created snapshot at index " + lastIncludedIndex + ", term " + lastIncludedTerm);
+        LogHandler.info("[SNAPSHOT] Created snapshot at index " + lastIncludedIndex + ", term " + lastIncludedTerm);
 
         // Cleanup old snapshots
         cleanupOldSnapshots();
@@ -223,7 +225,7 @@ public class SnapshotManager {
                             latestValid = p;
                         }
                     } else {
-                        System.err.println("[SNAPSHOT] Invalid snapshot " + filename +
+                        LogHandler.error("[SNAPSHOT] Invalid snapshot " + filename +
                                 ": index mismatch (file=" + index +
                                 ", actual=" + snap.get().lastIncludedIndex() +
                                 ", term=" + snap.get().lastIncludedTerm() + ")");
@@ -231,21 +233,21 @@ public class SnapshotManager {
                 }
             } catch (IOException e) {
                 // Corrupted snapshot - skip it
-                System.err.println("[SNAPSHOT] Corrupted/invalid snapshot " + filename + ": " + e.getMessage());
+                LogHandler.error("[SNAPSHOT] Corrupted/invalid snapshot " + filename + ": " + e.getMessage());
             } catch (NumberFormatException e) {
                 // Skip files with invalid names
-                System.err.println("[SNAPSHOT] Skipping invalid snapshot filename: " + filename);
+                LogHandler.error("[SNAPSHOT] Skipping invalid snapshot filename: " + filename);
             }
         }
 
         if (latestValid != null) {
-            System.out.println("[SNAPSHOT] Found latest snapshot for log boundary: " + latestValid.getFileName() +
+            LogHandler.info("[SNAPSHOT] Found latest snapshot for log boundary: " + latestValid.getFileName() +
                     " (index=" + highestIndex + ")");
             return loadSnapshot(latestValid);
         }
 
         // No valid snapshot found
-        System.out.println("[SNAPSHOT] No valid snapshots found");
+        LogHandler.info("[SNAPSHOT] No valid snapshots found");
         return Optional.empty();
     }
 
@@ -362,7 +364,7 @@ public class SnapshotManager {
                 long index = Long.parseLong(indexStr);
                 indexedSnapshots.add(new SnapshotIndex(p, index));
             } catch (NumberFormatException e) {
-                System.err.println("[SNAPSHOT] Skipping invalid snapshot filename during cleanup: " + filename);
+                LogHandler.error("[SNAPSHOT] Skipping invalid snapshot filename during cleanup: " + filename);
             }
         }
 
@@ -378,9 +380,9 @@ public class SnapshotManager {
             Path toDelete = indexedSnapshots.get(i).path;
             try {
                 Files.delete(toDelete);
-                System.out.println("[SNAPSHOT] Deleted old snapshot: " + toDelete.getFileName());
+                LogHandler.info("[SNAPSHOT] Deleted old snapshot: " + toDelete.getFileName());
             } catch (IOException e) {
-                System.err.println("[SNAPSHOT] Failed to delete old snapshot: " + toDelete);
+                LogHandler.error("[SNAPSHOT] Failed to delete old snapshot: " + toDelete);
             }
         }
     }
@@ -469,7 +471,7 @@ public class SnapshotManager {
         // Save once after all objects are restored
         targetStore.save();
 
-        System.out.println("[SNAPSHOT] Restored " + snapshotData.size() + " objects from snapshot at index " + snapshot.lastIncludedIndex());
+        LogHandler.info("[SNAPSHOT] Restored " + snapshotData.size() + " objects from snapshot at index " + snapshot.lastIncludedIndex());
     }
 
     /**

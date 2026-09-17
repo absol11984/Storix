@@ -96,6 +96,17 @@ public class ChunkInfo {
         }
     }
 
+    /**
+     * Removes a replica node from this chunk.
+     * @return true if the replica set changed
+     */
+    public boolean removeReplicaNode(String nodeId) {
+        if (replicaNodeIds == null) {
+            return false;
+        }
+        return replicaNodeIds.remove(nodeId);
+    }
+
     // Backward compatibility getters/setters for Prompt 1 metadata
     public String getStorageNodeId() { return storageNodeId; }
     public void setStorageNodeId(String storageNodeId) { this.storageNodeId = storageNodeId; }

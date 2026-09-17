@@ -177,30 +177,101 @@ public class StorixCLI {
         try (StorixClient client = createClient(DEFAULT_CHUNK_SIZE)) {
             Map<String, Object> status = client.getMetadataClient().getClusterStatus();
 
-            System.out.println("Storix Cluster\n");
-            System.out.println("Metadata Server:\nACTIVE\n");
+            System.out.println("Storix Cluster Status\n");
+
+            Object healthState = status.getOrDefault("healthState", "UNKNOWN");
+            Object lifecycleState = status.getOrDefault("lifecycleState", "UNKNOWN");
+            System.out.printf("Health: %s (Lifecycle: %s)\n\n", healthState, lifecycleState);
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> raftSnapshot = (Map<String, Object>) status.get("raftSnapshot");
+            if (raftSnapshot != null) {
+                System.out.println("Raft Consensus:");
+                System.out.printf("  Role: %s | Term: %s | Leader: %s | CommitIndex: %s | LastApplied: %s\n\n",
+                        raftSnapshot.getOrDefault("role", status.get("raftState")),
+                        raftSnapshot.getOrDefault("term", "0"),
+                        raftSnapshot.getOrDefault("leaderId", "unknown"),
+                        raftSnapshot.getOrDefault("commitIndex", "0"),
+                        raftSnapshot.getOrDefault("lastApplied", "0"));
+            } else {
+                System.out.printf("Raft State: %s (Leader: %s)\n\n",
+                        status.getOrDefault("raftState", "UNKNOWN"),
+                        status.getOrDefault("isLeader", "false"));
+            }
 
             System.out.println("Storage Nodes:");
-            System.out.println("---------------------------------------");
+            System.out.println("--------------------------------------------------------------------------------");
+            System.out.printf("%-10s %-16s %-10s %-10s %-8s %-10s\n", "Node ID", "Address", "Status", "Health", "Chunks", "Used/Total");
+            System.out.println("--------------------------------------------------------------------------------");
 
             @SuppressWarnings("unchecked")
             List<Map<String, Object>> nodes = (List<Map<String, Object>>) status.get("nodes");
             if (nodes != null) {
                 for (Map<String, Object> node : nodes) {
                     String addr = String.format("%s:%d", node.get("host"), node.get("port"));
-                    System.out.printf("%-10s %-16s %s\n", node.get("nodeId"), addr, node.get("status"));
+                    String nodeStatus = String.valueOf(node.getOrDefault("status", "UNKNOWN"));
+                    String nodeHealth = String.valueOf(node.getOrDefault("healthState", "UNKNOWN"));
+                    Object chunkCount = node.getOrDefault("chunkCount", 0);
+                    long usedBytes = node.get("usedCapacityBytes") instanceof Number n ? n.longValue() : 0L;
+                    long totalBytes = node.get("totalCapacityBytes") instanceof Number n ? n.longValue() : 0L;
+                    String capacityStr = totalBytes > 0
+                            ? String.format("%dMB/%dMB", usedBytes / (1024 * 1024), totalBytes / (1024 * 1024))
+                            : "-";
+                    System.out.printf("%-10s %-16s %-10s %-10s %-8s %-10s\n",
+                            node.get("nodeId"), addr, nodeStatus, nodeHealth, chunkCount, capacityStr);
                 }
             }
-            System.out.println("---------------------------------------\n");
+            System.out.println("--------------------------------------------------------------------------------\n");
 
-            System.out.println("Objects: " + status.get("objects"));
-            System.out.println("Chunks: " + status.get("chunks"));
-            System.out.println("Healthy nodes: " + status.get("healthyNodes") + "/" + status.get("totalNodes"));
+            System.out.println("Cluster Data:");
+            System.out.println("  Objects: " + status.getOrDefault("objects", 0));
+            System.out.println("  Chunks: " + status.getOrDefault("chunks", 0));
+            System.out.println("  Healthy nodes: " + status.getOrDefault("healthyNodes", 0) + "/" + status.getOrDefault("totalNodes", 0));
+            System.out.println("  Replication: Healthy=" + status.getOrDefault("healthyChunks", 0) + ", Degraded=" + status.getOrDefault("degradedChunks", 0));
             System.out.println();
 
-            System.out.println("Replication:");
-            System.out.println("Healthy: " + status.get("healthyChunks"));
-            System.out.println("Degraded: " + status.get("degradedChunks"));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> metrics = (Map<String, Object>) status.get("metrics");
+            if (metrics != null) {
+                System.out.println("Metrics Summary:");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> reqMetrics = (Map<String, Object>) metrics.get("requests");
+                if (reqMetrics != null) {
+                    System.out.printf("  Requests: Total=%s, Success=%s, Failed=%s, Active=%s\n",
+                            reqMetrics.getOrDefault("totalRequests", 0),
+                            reqMetrics.getOrDefault("successfulRequests", 0),
+                            reqMetrics.getOrDefault("failedRequests", 0),
+                            reqMetrics.get("activeRequests"));
+                }
+                @SuppressWarnings("unchecked")
+                Map<String, Object> mgrMetrics = (Map<String, Object>) metrics.get("managers");
+                if (mgrMetrics != null) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> repair = (Map<String, Object>) mgrMetrics.get("repair");
+                    if (repair != null) {
+                        System.out.printf("  Repair: Active=%s, Repaired=%s, Failed=%s\n",
+                                repair.getOrDefault("activeRepairs", 0),
+                                repair.getOrDefault("chunksRepaired", 0),
+                                repair.getOrDefault("failedRepairs", 0));
+                    }
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> recovery = (Map<String, Object>) mgrMetrics.get("recovery");
+                    if (recovery != null) {
+                        System.out.printf("  Recovery: Active=%s, Restored=%s, Failed=%s\n",
+                                recovery.getOrDefault("activeRecoveries", 0),
+                                recovery.getOrDefault("chunksRestored", 0),
+                                recovery.getOrDefault("failedRecoveries", 0));
+                    }
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> rebalance = (Map<String, Object>) mgrMetrics.get("rebalance");
+                    if (rebalance != null) {
+                        System.out.printf("  Rebalance: Active=%s, Moved=%s, Failed=%s\n",
+                                rebalance.getOrDefault("activeMoves", 0),
+                                rebalance.getOrDefault("chunksMoved", 0),
+                                rebalance.getOrDefault("failedMoves", 0));
+                    }
+                }
+            }
         }
     }
 

@@ -1,5 +1,7 @@
 package com.storix.metadata.raft;
 
+import com.storix.metadata.LogHandler;
+
 import com.storix.metadata.wal.WAL;
 
 import java.io.IOException;
@@ -401,11 +403,11 @@ public class RaftLog {
                 } catch (UncheckedIOException e) {
                     // WAL truncation failure - proceed with in-memory log append
                     // The WAL will be fixed on next restart/recovery; in-memory log is source of truth for current session
-                    System.err.println("[RAFT] WARN: Failed to truncate WAL during AppendEntries, proceeding with in-memory log only. Cause: " + e.getMessage());
+                    LogHandler.error("[RAFT] WARN: Failed to truncate WAL during AppendEntries, proceeding with in-memory log only. Cause: " + e.getMessage());
                 } catch (IOException e) {
                     // WAL truncation failure - proceed with in-memory log append
                     // The WAL will be fixed on next restart/recovery; in-memory log is source of truth for current session
-                    System.err.println("[RAFT] WARN: Failed to truncate WAL during AppendEntries, proceeding with in-memory log only. Cause: " + e.getMessage());
+                    LogHandler.error("[RAFT] WARN: Failed to truncate WAL during AppendEntries, proceeding with in-memory log only. Cause: " + e.getMessage());
                 }
             }
 

@@ -13,6 +13,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -202,7 +203,7 @@ public class MetadataStore {
                 Files.deleteIfExists(backupFile);
             } catch (IOException e) {
                 // Best effort cleanup
-                System.err.println("[METADATA] Warning: failed to delete backup file: " + e.getMessage());
+                LogHandler.error("[METADATA] Warning: failed to delete backup file: " + e.getMessage());
             }
         }
     }
@@ -272,7 +273,7 @@ public class MetadataStore {
             }
         } catch (IOException e) {
             // Non-fatal: the atomic move succeeded. Directory sync is best-effort.
-            System.err.println("[METADATA] Warning: failed to fsync directory: " + e.getMessage());
+            LogHandler.error("[METADATA] Warning: failed to fsync directory: " + e.getMessage());
         }
     }
 
@@ -285,7 +286,7 @@ public class MetadataStore {
             String content = Files.readString(generationFile);
             currentGeneration = Long.parseLong(content.trim());
         } catch (IOException | NumberFormatException e) {
-            System.err.println("[METADATA] Failed to load generation: " + e.getMessage());
+            LogHandler.error("[METADATA] Failed to load generation: " + e.getMessage());
             currentGeneration = -1;
         }
     }
@@ -671,6 +672,82 @@ public class MetadataStore {
     }
 
     /**
+     * Moves one replica from sourceNodeId -> destNodeId in-memory and persists atomically via one save().
+     *
+     * Rules:
+     * - Returns false if object or chunk is missing
+     * - Returns false if sourceNodeId is not currently present in replica set
+     * - Returns false if destNodeId is already present in replica set
+     * - Otherwise updates replica list by adding dest first and removing source (RF-preserving)
+     *
+     * @return true if a replica move was applied and persisted
+     */
+    public boolean moveChunkReplica(
+            String objectName,
+            String chunkId,
+            String sourceNodeId,
+            String destNodeId) throws IOException {
+
+        ObjectMetadata metadata = objects.get(objectName);
+        if (metadata == null) {
+            return false;
+        }
+
+        ChunkInfo targetChunk = null;
+        for (ChunkInfo chunk : metadata.getChunks()) {
+            if (chunk.getChunkId().equals(chunkId)) {
+                targetChunk = chunk;
+                break;
+            }
+        }
+
+        if (targetChunk == null) {
+            return false;
+        }
+
+        List<String> replicas = targetChunk.getReplicaNodeIds();
+        if (replicas == null) {
+            return false;
+        }
+
+        if (!replicas.contains(sourceNodeId)) {
+            return false;
+        }
+        if (replicas.contains(destNodeId)) {
+            return false;
+        }
+
+        boolean destAdded = false;
+        boolean sourceRemoved = false;
+
+        try {
+            // RF-preserving: add destination then remove source.
+            targetChunk.addReplicaNode(destNodeId);
+            destAdded = true;
+
+            sourceRemoved = targetChunk.removeReplicaNode(sourceNodeId);
+            if (!sourceRemoved) {
+                // Should not happen because we checked contains(sourceNodeId)
+                targetChunk.removeReplicaNode(destNodeId);
+                return false;
+            }
+
+            save();
+            return true;
+        } catch (IOException e) {
+            // Roll back in-memory mutation so metadata remains unchanged
+            // when persistence fails.
+            if (destAdded) {
+                targetChunk.removeReplicaNode(destNodeId);
+            }
+            if (sourceRemoved) {
+                targetChunk.addReplicaNode(sourceNodeId);
+            }
+            throw e;
+        }
+    }
+
+    /**
      * Loads metadata from authoritative sources.
      *
      * AUTHORITY HIERARCHY:
@@ -689,7 +766,7 @@ public class MetadataStore {
             try {
                 long currentGen = generationManager.getCurrentGeneration();
                 if (currentGen >= 0) {
-                    System.out.println("[METADATA] Loading baseline from GenerationManager, generation=" + currentGen);
+                    LogHandler.info("[METADATA] Loading baseline from GenerationManager, generation=" + currentGen);
                     GenerationManager.GenerationState state = generationManager.loadAuthoritativeState();
                     if (state != null) {
                         objects.clear();
@@ -698,9 +775,9 @@ public class MetadataStore {
                         // Do NOT call loadGeneration() - it would read legacy .generation file
                         this.currentGeneration = state.generation();
                         loadedFromGeneration = true;
-                        System.out.println("[METADATA] Baseline loaded: " + objects.size() + " objects");
-                        System.out.println("[METADATA]   lastIncludedIndex=" + state.lastIncludedIndex());
-                        System.out.println("[METADATA]   WAL replay needed from index " + (state.lastIncludedIndex() + 1));
+                        LogHandler.info("[METADATA] Baseline loaded: " + objects.size() + " objects");
+                        LogHandler.info("[METADATA]   lastIncludedIndex=" + state.lastIncludedIndex());
+                        LogHandler.info("[METADATA]   WAL replay needed from index " + (state.lastIncludedIndex() + 1));
                         return;
                     }
                 }
@@ -712,14 +789,14 @@ public class MetadataStore {
         // Authority 2: Flat file (MIGRATION ONLY - not authoritative)
         // Legacy path for backward compatibility when no GenerationManager exists
         if (Files.exists(storageFile)) {
-            System.out.println("[METADATA] Loading from flat file (migration/non-cluster mode)");
+            LogHandler.info("[METADATA] Loading from flat file (migration/non-cluster mode)");
             loadFromFlatFile();
             loadedFromGeneration = false;
             return;
         }
 
         // No state found - fresh start
-        System.out.println("[METADATA] No existing state found, starting fresh");
+        LogHandler.info("[METADATA] No existing state found, starting fresh");
         loadGeneration();
     }
 

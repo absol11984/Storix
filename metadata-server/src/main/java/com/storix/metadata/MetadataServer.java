@@ -44,10 +44,14 @@ public class MetadataServer {
     private final ClusterConfig clusterConfig;
     private volatile boolean running = false;
     private volatile long runningThreadId = -1;
+    private final Observability.Registry observabilityRegistry = new Observability.Registry();
     private final Object lifecycleLock = new Object();
     private ServerSocketChannel serverChannel;
     private ExecutorService clientExecutor;
     private final Set<SocketChannel> activeClientChannels = ConcurrentHashMap.newKeySet();
+    private final ChunkOperationLock chunkOperationLock;
+    private final RebalanceManager rebalanceManager;
+    private final NodeRecoveryManager nodeRecoveryManager;
 
     /**
      * Creates a single-node metadata server (no Raft).
@@ -79,6 +83,7 @@ public class MetadataServer {
         this.raftPort = (clusterConfig != null) ? distinctPort(port) : port;
         this.nodeRegistry = new NodeRegistry();
         this.clusterConfig = clusterConfig;
+        this.chunkOperationLock = new ChunkOperationLock();
 
         // Initialize Raft if cluster config provided
         if (clusterConfig != null) {
@@ -96,12 +101,12 @@ public class MetadataServer {
             try {
                 currentGen = generationManager.getCurrentGeneration();
                 if (currentGen >= 0) {
-                    System.out.println("[SERVER] Found current generation: " + currentGen);
+                    LogHandler.info("[SERVER] Found current generation: " + currentGen);
                     // Validate generation integrity - this will throw if corrupt
                     generationManager.loadAuthoritativeState();
-                    System.out.println("[SERVER] Generation " + currentGen + " validated successfully");
+                    LogHandler.info("[SERVER] Generation " + currentGen + " validated successfully");
                 } else {
-                    System.out.println("[SERVER] No current generation (fresh start)");
+                    LogHandler.info("[SERVER] No current generation (fresh start)");
                 }
             } catch (IOException e) {
                 throw new RuntimeException(
@@ -119,9 +124,7 @@ public class MetadataServer {
             // MetadataStore will load from GenerationManager's current generation
             this.metadataStore = new MetadataStore(metadataFile, generationManager);
             this.placementManager = new PlacementManager(nodeRegistry, replicationFactor);
-            this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager);
-            this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager,
-                    nodeTimeoutMillis, healthCheckIntervalMillis);
+            // Managers will be constructed after raftNode is assigned below
             this.stateMachine = new MetadataStateMachine(metadataStore);
 
             // Create SnapshotManager for log compaction
@@ -145,10 +148,10 @@ public class MetadataServer {
             long snapshotBoundaryTerm = (boundary != null) ? boundary.lastIncludedTerm() : 0L;
 
             if (boundary != null) {
-                System.out.println("[SERVER] GenerationManager snapshot boundary: index=" + snapshotBoundaryIndex +
+                LogHandler.info("[SERVER] GenerationManager snapshot boundary: index=" + snapshotBoundaryIndex +
                         ", term=" + snapshotBoundaryTerm);
             } else {
-                System.out.println("[SERVER] No generation snapshot boundary (fresh start or empty)");
+                LogHandler.info("[SERVER] No generation snapshot boundary (fresh start or empty)");
             }
 
             // State is already loaded from GenerationManager via MetadataStore constructor.
@@ -170,7 +173,7 @@ public class MetadataServer {
                 Math.min(recoveryData.lastApplied, recoveryData.commitIndex)
             );
 
-            System.out.println("[SERVER] Loaded from generation, applying " + postSnapshotEntries.size() + " post-snapshot WAL entries");
+            LogHandler.info("[SERVER] Loaded from generation, applying " + postSnapshotEntries.size() + " post-snapshot WAL entries");
 
             // Apply post-snapshot entries to state machine to reconstruct
             // complete state.
@@ -217,7 +220,7 @@ public class MetadataServer {
                 appliedCount++;
             }
 
-            System.out.println("[SERVER] Applied " + appliedCount + " WAL entries during recovery");
+            LogHandler.info("[SERVER] Applied " + appliedCount + " WAL entries during recovery");
 
             // Note: we do not attempt to update metadataStore directly here; it is
             // updated inside MetadataStateMachine.apply(entry) during successful replays.
@@ -239,11 +242,21 @@ public class MetadataServer {
             this.raftNode.setGenerationManager(generationManager);
             // Wire MetadataStore for InstallSnapshot state restoration
             this.raftNode.setMetadataStore(metadataStore);
+            // Now raftNode is initialized; construct managers with observability registry.
+            this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager, 4, chunkOperationLock, observabilityRegistry);
+            this.nodeRecoveryManager = new NodeRecoveryManager(nodeRegistry, metadataStore, chunkOperationLock, healthCheckIntervalMillis, observabilityRegistry);
+            this.rebalanceManager = new RebalanceManager(metadataStore, nodeRegistry, placementManager, chunkOperationLock, raftNode, 0.80, 0.30, 30_000, new RebalanceManager.TcpChunkTransfer(), RebalanceManager.FailureInjector.noop(), observabilityRegistry);
+            this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager, nodeTimeoutMillis, healthCheckIntervalMillis);
         } else {
             // Non-cluster mode: create MetadataStore without GenerationManager
             this.metadataStore = new MetadataStore(metadataFile);
             this.placementManager = new PlacementManager(nodeRegistry, replicationFactor);
-            this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager);
+            this.repairManager = new RepairManager(metadataStore, nodeRegistry, placementManager, 4, chunkOperationLock, observabilityRegistry);
+            // Controlled storage-node recovery + safe reintegration (Phase 4 Prompt 3)
+            // Scan at the same cadence as the health monitor so restarts recover quickly.
+            this.nodeRecoveryManager = new NodeRecoveryManager(nodeRegistry, metadataStore, chunkOperationLock,
+                    healthCheckIntervalMillis, observabilityRegistry);
+            this.rebalanceManager = new RebalanceManager(metadataStore, nodeRegistry, placementManager, chunkOperationLock, /*raftNode=*/ null, 0.80, 0.30, 30_000, new RebalanceManager.TcpChunkTransfer(), RebalanceManager.FailureInjector.noop(), observabilityRegistry);
             this.healthMonitor = new HealthMonitor(nodeRegistry, repairManager, nodeTimeoutMillis, healthCheckIntervalMillis);
             this.snapshotManager = null;
             this.generationManager = null;
@@ -264,6 +277,10 @@ public class MetadataServer {
         return nodeRegistry;
     }
 
+    public Observability.Registry getObservabilityRegistry() {
+        return observabilityRegistry;
+    }
+
     public MetadataStore getMetadataStore() {
         return metadataStore;
     }
@@ -274,6 +291,17 @@ public class MetadataServer {
 
     public RepairManager getRepairManager() {
         return repairManager;
+    }
+
+    public RebalanceManager getRebalanceManager() {
+        return rebalanceManager;
+    }
+
+    /**
+     * Returns the node recovery manager for controlled storage-node reintegration.
+     */
+    public NodeRecoveryManager getNodeRecoveryManager() {
+        return nodeRecoveryManager;
     }
 
     /**
@@ -326,6 +354,8 @@ public class MetadataServer {
             running = true;
         }
 
+        observabilityRegistry.setLifecycleState("STARTING");
+
         try {
         // Start Raft if configured
         if (raftNode != null) {
@@ -336,7 +366,7 @@ public class MetadataServer {
                         stateMachine.apply(entry);
                     } catch (Exception e) {
                         // Log full stack trace safely
-                        System.err.println("[RAFT] Failed to apply entry " + entry.index()
+                        LogHandler.error("[RAFT] Failed to apply entry " + entry.index()
                             + ", term=" + entry.term()
                             + ", opType=" + entry.opType()
                             + ", exceptionClass=" + e.getClass().getName()
@@ -352,11 +382,14 @@ public class MetadataServer {
 
             raftNode.start();
             raftNode.addLeadershipListener(() -> {
-                System.out.println("[SERVER] Leadership changed, isLeader=" + isLeader());
+                LogHandler.info("[SERVER] Leadership changed, isLeader=" + isLeader());
             });
         }
 
+        repairManager.start();
         healthMonitor.start();
+        rebalanceManager.start();
+        nodeRecoveryManager.start();
 
         // Always start the client-facing server to handle metadata requests.
         // In single-node mode, this is the only server needed.
@@ -370,8 +403,12 @@ public class MetadataServer {
         try {
             serverChannel.setOption(java.net.StandardSocketOptions.SO_REUSEADDR, true);
             serverChannel.bind(new InetSocketAddress(port));
-            System.out.println("Metadata server listening on port " + port);
+            LogHandler.info("Metadata server listening on port " + port);
             runningThreadId = Thread.currentThread().getId();
+
+            // Server is fully started and accepting connections — transition to RUNNING.
+            // healthState remains a separate, independently computed operational concern.
+            observabilityRegistry.setLifecycleState("RUNNING");
 
             while (running) {
                 try {
@@ -388,7 +425,7 @@ public class MetadataServer {
                     }
                 } catch (IOException e) {
                     if (running) {
-                        System.err.println("Accept failed: " + e.getMessage());
+                        LogHandler.error("Accept failed: " + e.getMessage());
                     }
                 }
             }
@@ -406,14 +443,58 @@ public class MetadataServer {
      */
     public void stop() {
         synchronized (lifecycleLock) {
+            // Stop is idempotent, but must still tear down Raft and manager resources
+            // when tests use the RaftNode directly without calling MetadataServer.start().
             running = false;
+
+            // Signal shutdown has begun
+            observabilityRegistry.setLifecycleState("STOPPING");
+
             closeClientResources();
             healthMonitor.stop();
+            rebalanceManager.stop();
+            nodeRecoveryManager.stop();
+            repairManager.stop();
+            // NodeRecoveryManager is stopped before Raft/clients shutdown to keep
+            // recovery from flipping node eligibility mid-test shutdown.
+
             if (raftNode != null) {
                 raftNode.stop();
             }
             awaitClientExecutor();
+
+            // Fully shut down — transition to STOPPED.
+            observabilityRegistry.setLifecycleState("STOPPED");
         }
+    }
+
+    public void close() {
+        stop();
+    }
+
+    /**
+     * Bounded TCP-connect wait until the client-facing port is accepting connections.
+     * Used by lifecycle tests; does not sleep arbitrarily.
+     */
+    void waitForClientServerReady(long timeoutMs) {
+        if (timeoutMs <= 0) {
+            throw new IllegalArgumentException("timeoutMs must be positive");
+        }
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        java.net.InetSocketAddress address = new java.net.InetSocketAddress("127.0.0.1", port);
+        IOException last = null;
+        while (System.nanoTime() < deadlineNanos) {
+            try (java.net.Socket socket = new java.net.Socket()) {
+                int remainingMs = (int) Math.max(1L,
+                        TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
+                socket.connect(address, Math.min(200, remainingMs));
+                return;
+            } catch (IOException e) {
+                last = e;
+            }
+        }
+        throw new IllegalStateException("Metadata server client port " + port
+                + " was not ready within " + timeoutMs + "ms", last);
     }
 
     private void closeClientResources() {
@@ -464,12 +545,12 @@ public class MetadataServer {
      */
     private void handleClient(SocketChannel clientChannel) {
         MetadataHandler handler = new MetadataHandler(metadataStore, nodeRegistry,
-                placementManager, repairManager, raftNode, stateMachine, port);
+                placementManager, repairManager, raftNode, stateMachine, port, observabilityRegistry);
         try (clientChannel) {
             handler.handle(clientChannel);
         } catch (IOException e) {
             if (running) {
-                System.err.println("Client handler error: " + e.getMessage());
+                LogHandler.error("Client handler error: " + e.getMessage());
             }
         } finally {
             activeClientChannels.remove(clientChannel);
@@ -512,7 +593,7 @@ public class MetadataServer {
 
         // Graceful shutdown on SIGINT/SIGTERM
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Shutting down metadata server...");
+            LogHandler.info("Shutting down metadata server...");
             server.stop();
         }));
 
