@@ -23,6 +23,7 @@ public class RepairManager {
     private final PlacementManager placementManager;
     private final int maxConcurrentRepairs;
     private final ChunkOperationLock chunkOperationLock;
+    private final Observability.Registry observability;
 
     private final Object lifecycleLock = new Object();
     private volatile boolean stopped = false;
@@ -36,7 +37,7 @@ public class RepairManager {
     public RepairManager(MetadataStore metadataStore,
                          NodeRegistry nodeRegistry,
                          PlacementManager placementManager) {
-        this(metadataStore, nodeRegistry, placementManager, DEFAULT_MAX_CONCURRENT_REPAIRS, new ChunkOperationLock());
+        this(metadataStore, nodeRegistry, placementManager, DEFAULT_MAX_CONCURRENT_REPAIRS, new ChunkOperationLock(), null);
     }
 
     /**
@@ -46,7 +47,7 @@ public class RepairManager {
                          NodeRegistry nodeRegistry,
                          PlacementManager placementManager,
                          int maxConcurrentRepairs) {
-        this(metadataStore, nodeRegistry, placementManager, maxConcurrentRepairs, new ChunkOperationLock());
+        this(metadataStore, nodeRegistry, placementManager, maxConcurrentRepairs, new ChunkOperationLock(), null);
     }
 
     /**
@@ -57,11 +58,24 @@ public class RepairManager {
                          PlacementManager placementManager,
                          int maxConcurrentRepairs,
                          ChunkOperationLock chunkOperationLock) {
+        this(metadataStore, nodeRegistry, placementManager, maxConcurrentRepairs, chunkOperationLock, null);
+    }
+
+    /**
+     * Creates a RepairManager with observability registry.
+     */
+    public RepairManager(MetadataStore metadataStore,
+                         NodeRegistry nodeRegistry,
+                         PlacementManager placementManager,
+                         int maxConcurrentRepairs,
+                         ChunkOperationLock chunkOperationLock,
+                         Observability.Registry observability) {
         this.metadataStore = metadataStore;
         this.nodeRegistry = nodeRegistry;
         this.placementManager = placementManager;
         this.maxConcurrentRepairs = maxConcurrentRepairs;
         this.chunkOperationLock = chunkOperationLock;
+        this.observability = observability != null ? observability : new Observability.Registry();
 
         // Default is “started” so existing call sites that never call start() still work.
         this.repairSemaphore = new Semaphore(maxConcurrentRepairs);
@@ -179,16 +193,23 @@ public class RepairManager {
 
         List<Future<RepairOutcome>> futures = new ArrayList<>();
 
+        // Record one repair attempt per task submitted, not per skipped/cancelled future.
+        observability.managers().repairAttempt();
+
         for (RepairTask task : tasks) {
+            final RepairTask taskRef = task;
             Future<RepairOutcome> future = exec.submit(() -> {
                 if (stopped || Thread.currentThread().isInterrupted()) {
                     return RepairOutcome.SKIPPED;
                 }
+                observability.managers().repairActiveStart();
                 try {
-                    return repairChunk(task, sem);
+                    return repairChunk(taskRef, sem);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return RepairOutcome.SKIPPED;
+                } finally {
+                    observability.managers().repairActiveEnd();
                 }
             });
             futures.add(future);
@@ -218,17 +239,23 @@ public class RepairManager {
                         TimeUnit.MILLISECONDS);
                 if (outcome == RepairOutcome.SUCCESS) {
                     chunksRepaired++;
+                    observability.managers().repairSuccess();
+                    observability.managers().repairChunks(1);
                 } else if (outcome == RepairOutcome.FAILED) {
                     chunksFailed++;
+                    observability.managers().repairFailure();
                 } else {
                     chunksSkipped++;
                 }
             } catch (CancellationException e) {
                 chunksFailed++;
+                observability.managers().repairFailure();
             } catch (ExecutionException e) {
                 chunksFailed++;
+                observability.managers().repairFailure();
             } catch (TimeoutException e) {
                 chunksFailed++;
+                observability.managers().repairFailure();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;

@@ -79,7 +79,7 @@ public class PlacementManager {
             if (i > 0) sb.append(",");
             sb.append(selected.get(i).getNodeId());
         }
-        System.out.println(sb);
+        LogHandler.info(sb.toString());
 
         return selected;
     }

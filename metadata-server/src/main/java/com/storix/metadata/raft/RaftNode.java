@@ -1,5 +1,7 @@
 package com.storix.metadata.raft;
 
+import com.storix.metadata.LogHandler;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.storix.metadata.wal.SnapshotManager;
 import com.storix.metadata.wal.WAL;
@@ -209,7 +211,7 @@ public class RaftNode implements AutoCloseable {
             matchIndex.put(peer.nodeId(), 0L);
         }
 
-        System.out.println("[RAFT] Recovered state: term=" + currentTerm + ", votedFor=" + votedFor +
+        LogHandler.info("[RAFT] Recovered state: term=" + currentTerm + ", votedFor=" + votedFor +
                 ", lastLogIndex=" + highestIndex + ", nextIndex=" + (highestIndex + 1));
     }
 
@@ -288,6 +290,36 @@ public class RaftNode implements AutoCloseable {
             .findFirst();
     }
 
+    /**
+     * Returns a detached, immutable snapshot of operational Raft state suitable
+     * for serialization (STATUS).
+     */
+    public RaftOperationalSnapshot getOperationalSnapshot() {
+        List<RaftOperationalSnapshot.PeerCursor> cursors = peers.stream()
+                .sorted(Comparator.comparing(RaftPeer::nodeId))
+                .map(p -> new RaftOperationalSnapshot.PeerCursor(
+                        p.nodeId(),
+                        getNextIndex(p.nodeId()),
+                        getMatchIndex(p.nodeId())))
+                .toList();
+
+        return new RaftOperationalSnapshot(
+                nodeId,
+                currentTerm,
+                state.name(),
+                leaderId,
+                raftLog.getCommitIndex(),
+                raftLog.getLastApplied(),
+                raftLog.getLastLogIndex(),
+                raftLog.getLastLogTerm(),
+                raftLog.size(),
+                lastHeartbeat,
+                electionDeadline,
+                rpcServerReady,
+                cursors
+        );
+    }
+
     public void start() throws IOException {
         synchronized (lifecycleLock) {
             if (running) {
@@ -310,7 +342,7 @@ public class RaftNode implements AutoCloseable {
                 if (state == RaftState.LEADER) {
                     state = RaftState.FOLLOWER;
                     leaderId = null;
-                    System.out.println("[RAFT] Node " + nodeId + " reset to FOLLOWER on restart");
+                    LogHandler.info("[RAFT] Node " + nodeId + " reset to FOLLOWER on restart");
                 }
 
                 // Start RPC server for peer communication (skip if already bound).
@@ -438,7 +470,7 @@ public class RaftNode implements AutoCloseable {
             }
         }
         if (!executor.isTerminated()) {
-            System.err.println("[RAFT] " + nodeId + " " + name + " did not terminate");
+            LogHandler.error("[RAFT] " + nodeId + " " + name + " did not terminate");
         }
     }
 
@@ -507,7 +539,7 @@ public class RaftNode implements AutoCloseable {
         try {
             indexedEntry = reserveAndAppend(entry);
         } catch (RuntimeException e) {
-            System.err.println("[RAFT] Submit append failed: " + e.getMessage());
+            LogHandler.error("[RAFT] Submit append failed: " + e.getMessage());
             return false;
         }
         long index = indexedEntry.index();
@@ -544,7 +576,7 @@ public class RaftNode implements AutoCloseable {
                             commitFuture.complete(true);
                         } catch (Exception e) {
                             terminalApplyFailure = new ApplyFailure(indexedEntry.index(), indexedEntry, e);
-                            System.err.println("[RAFT] Terminal apply failure (submit path) index=" + indexedEntry.index()
+                            LogHandler.error("[RAFT] Terminal apply failure (submit path) index=" + indexedEntry.index()
                                 + ", term=" + indexedEntry.term()
                                 + ", opType=" + indexedEntry.opType()
                                 + ", clientId=" + indexedEntry.clientId()
@@ -572,7 +604,7 @@ public class RaftNode implements AutoCloseable {
             // Wait for majority commit with timeout
             // Use 10 seconds to allow for network latency and slow followers in test environments.
             // The commit index advances when majority acknowledges, which may take multiple heartbeats.
-            System.out.println("[RAFT] " + nodeId + " waiting for commit future for index=" + index +
+            LogHandler.info("[RAFT] " + nodeId + " waiting for commit future for index=" + index +
                 " (commitIndex=" + raftLog.getCommitIndex() + ", lastApplied=" + raftLog.getLastApplied() + ")");
             boolean committed = commitFuture.get(10, TimeUnit.SECONDS);
 
@@ -586,17 +618,17 @@ public class RaftNode implements AutoCloseable {
                         }
                         // Check if already applied by background loop
                         if (raftLog.getLastApplied() >= index) {
-                            System.out.println("[RAFT] " + nodeId + " entry " + index + " already applied by background loop");
+                            LogHandler.info("[RAFT] " + nodeId + " entry " + index + " already applied by background loop");
                         } else {
                             // Apply synchronously
                             try {
-                                System.out.println("[RAFT] " + nodeId + " applying entry " + index + " synchronously (multi-node)");
+                                LogHandler.info("[RAFT] " + nodeId + " applying entry " + index + " synchronously (multi-node)");
                                 stateMachineApplier.accept(indexedEntry);
                                 raftLog.advanceLastAppliedTo(indexedEntry.index());
-                                System.out.println("[RAFT] " + nodeId + " successfully applied entry " + index + " synchronously");
+                                LogHandler.info("[RAFT] " + nodeId + " successfully applied entry " + index + " synchronously");
                             } catch (Exception e) {
                                 terminalApplyFailure = new ApplyFailure(indexedEntry.index(), indexedEntry, e);
-                                System.err.println("[RAFT] Terminal apply failure (multi-node sync path) index=" + indexedEntry.index()
+                                LogHandler.error("[RAFT] Terminal apply failure (multi-node sync path) index=" + indexedEntry.index()
                                     + ", term=" + indexedEntry.term()
                                     + ", opType=" + indexedEntry.opType()
                                     + ", clientId=" + indexedEntry.clientId()
@@ -616,16 +648,16 @@ public class RaftNode implements AutoCloseable {
                 }
             }
 
-            System.out.println("[RAFT] " + nodeId + " commit future completed for index=" + index +
+            LogHandler.info("[RAFT] " + nodeId + " commit future completed for index=" + index +
                 ", result=" + committed +
                 " (commitIndex=" + raftLog.getCommitIndex() + ", lastApplied=" + raftLog.getLastApplied() + ")");
             return committed;
         } catch (TimeoutException e) {
             // Timeout - entry may still be pending
-            System.err.println("[RAFT] Submit timeout for index " + index);
+            LogHandler.error("[RAFT] Submit timeout for index " + index);
             return false;
         } catch (InterruptedException | ExecutionException | UncheckedIOException e) {
-            System.err.println("[RAFT] Submit failed for index " + index + ": " + e.getMessage());
+            LogHandler.error("[RAFT] Submit failed for index " + index + ": " + e.getMessage());
             return false;
         } finally {
             pendingCommits.remove(index);
@@ -713,7 +745,7 @@ public class RaftNode implements AutoCloseable {
         // Initialize election deadline when starting
         resetElectionDeadline();
 
-        System.out.println("[RAFT] Node " + nodeId + " starting election timeout loop, deadline=" + electionDeadline);
+        LogHandler.info("[RAFT] Node " + nodeId + " starting election timeout loop, deadline=" + electionDeadline);
 
         scheduler.scheduleWithFixedDelay(() -> {
             try {
@@ -727,12 +759,12 @@ public class RaftNode implements AutoCloseable {
                 // Check if election timeout has expired
                 long now = System.currentTimeMillis();
                 if (now > electionDeadline) {
-                    System.out.println("[RAFT] Node " + nodeId + " election timeout expired (now=" + now + " > deadline=" + electionDeadline + "), starting election");
+                    LogHandler.info("[RAFT] Node " + nodeId + " election timeout expired (now=" + now + " > deadline=" + electionDeadline + "), starting election");
                     startElection();
                     resetElectionDeadline(); // Set next deadline after election starts
                 }
             } catch (Exception e) {
-                System.err.println("[RAFT] Node " + nodeId + " election loop error: " + e.getMessage());
+                LogHandler.error("[RAFT] Node " + nodeId + " election loop error: " + e.getMessage());
             }
         }, 100, 100, TimeUnit.MILLISECONDS);
     }
@@ -771,7 +803,7 @@ public class RaftNode implements AutoCloseable {
             try {
                 saveStateOrThrow();
             } catch (IOException e) {
-                System.err.println("[RAFT] Node " + nodeId + " failed to persist term " + currentTerm +
+                LogHandler.error("[RAFT] Node " + nodeId + " failed to persist term " + currentTerm +
                     " during election start: " + e.getMessage() + " — rolling back to FOLLOWER");
                 // Rollback: revert to follower state without the term/votedFor change
                 currentTerm--;
@@ -786,7 +818,7 @@ public class RaftNode implements AutoCloseable {
                 return; // Election aborted — will retry after backoff
             }
 
-            System.out.println("[RAFT] Node " + nodeId + " starting election for term " + currentTerm);
+            LogHandler.info("[RAFT] Node " + nodeId + " starting election for term " + currentTerm);
 
             // Send RequestVote to all peers
             long lastLogIndex = raftLog.getLastLogIndex();
@@ -804,7 +836,7 @@ public class RaftNode implements AutoCloseable {
             else {
                 int votes = countVotes();
                 int majority = calculateMajority();
-                System.out.println("[RAFT] Node " + nodeId + " votes=" + votes + "/" + majority +
+                LogHandler.info("[RAFT] Node " + nodeId + " votes=" + votes + "/" + majority +
                     " after sending requests; peers=" + peers.size());
                 if (votes >= majority) {
                     becomeLeader();
@@ -833,7 +865,7 @@ public class RaftNode implements AutoCloseable {
             matchIndex.put(peer.nodeId(), 0L);
         }
 
-        System.out.println("[RAFT] Node " + nodeId + " became leader for term " + currentTerm);
+        LogHandler.info("[RAFT] Node " + nodeId + " became leader for term " + currentTerm);
 
         // Reset election deadline so it doesn't fire while we're leader.
         // (The election timeout loop will skip election since state==LEADER,
@@ -860,7 +892,7 @@ public class RaftNode implements AutoCloseable {
         try {
             saveStateOrThrow();
         } catch (IOException e) {
-            System.err.println("[RAFT] Node " + nodeId + " failed to persist becomeFollower(" +
+            LogHandler.error("[RAFT] Node " + nodeId + " failed to persist becomeFollower(" +
                 term + "): " + e.getMessage());
             // Don't throw — becoming follower without persistence is recoverable.
             // On crash, we'll be at the previous term and re-receive the AppendEntries.
@@ -873,7 +905,7 @@ public class RaftNode implements AutoCloseable {
             try {
                 listener.run();
             } catch (Exception e) {
-                System.err.println("[RAFT] Leadership listener error: " + e.getMessage());
+                LogHandler.error("[RAFT] Leadership listener error: " + e.getMessage());
             }
         }
     }
@@ -899,7 +931,7 @@ public class RaftNode implements AutoCloseable {
             try {
                 saveStateOrThrow();
             } catch (IOException e) {
-                System.err.println("[RAFT] Node " + nodeId + " failed to persist higher term " +
+                LogHandler.error("[RAFT] Node " + nodeId + " failed to persist higher term " +
                     candidateTerm + " in RequestVote: " + e.getMessage());
                 // votedFor is already null (set before failing save), which is consistent.
                 // Revert in-memory currentTerm to old value so we're in a consistent state.
@@ -927,14 +959,14 @@ public class RaftNode implements AutoCloseable {
                 try {
                     saveStateOrThrow();
                 } catch (IOException e) {
-                    System.err.println("[RAFT] Node " + nodeId + " failed to persist vote for " + candidateId + ": " + e.getMessage());
+                    LogHandler.error("[RAFT] Node " + nodeId + " failed to persist vote for " + candidateId + ": " + e.getMessage());
                     votedFor = null; // Rollback: don't claim to have voted
                     return new RaftMessage.RequestVoteResponse(currentTerm, false);
                 }
             }
         }
 
-        System.out.println("[RAFT] Node " + nodeId + " vote for " + candidateId + ": " + voteGranted +
+        LogHandler.info("[RAFT] Node " + nodeId + " vote for " + candidateId + ": " + voteGranted +
                 " (term=" + currentTerm + ")");
 
         return new RaftMessage.RequestVoteResponse(currentTerm, voteGranted);
@@ -958,7 +990,7 @@ public class RaftNode implements AutoCloseable {
             try {
                 saveStateOrThrow();
             } catch (IOException e) {
-                System.err.println("[RAFT] Node " + nodeId + " failed to persist higher term " +
+                LogHandler.error("[RAFT] Node " + nodeId + " failed to persist higher term " +
                     term + " in AppendEntries: " + e.getMessage());
                 currentTerm = term - 1; // revert to consistent state
                 return new RaftMessage.AppendEntriesResponse(currentTerm, false, 0);
@@ -970,8 +1002,10 @@ public class RaftNode implements AutoCloseable {
         resetElectionDeadline(); // Reset timeout when receiving heartbeat
         this.leaderId = leaderId;
 
-        // If we're a candidate, become follower
-        if (state == RaftState.CANDIDATE) {
+        // If we receive valid AppendEntries for our current term (or higher),
+        // we must not keep advertising ourselves as leader. Any node other
+        // than a follower must step down to avoid dual-leader states.
+        if (state != RaftState.FOLLOWER) {
             becomeFollower(term, leaderId);
         }
 
@@ -1001,7 +1035,7 @@ public class RaftNode implements AutoCloseable {
                     return new RaftMessage.AppendEntriesResponse(currentTerm, false, 0);
                 }
             } catch (UncheckedIOException | IllegalArgumentException e) {
-                System.err.println("[RAFT] Failed to append entries to WAL: " + e.getMessage());
+                LogHandler.error("[RAFT] Failed to append entries to WAL: " + e.getMessage());
                 return new RaftMessage.AppendEntriesResponse(currentTerm, false, 0);
             }
         }
@@ -1073,7 +1107,7 @@ public class RaftNode implements AutoCloseable {
             try {
                 saveStateOrThrow();
             } catch (IOException e) {
-                System.err.println("[RAFT] Node " + nodeId + " failed to persist higher term " +
+                LogHandler.error("[RAFT] Node " + nodeId + " failed to persist higher term " +
                     term + " in InstallSnapshot: " + e.getMessage());
                 currentTerm = term - 1; // revert to consistent state
                 return new RaftMessage.InstallSnapshotResponse(currentTerm, false, 0);
@@ -1132,11 +1166,11 @@ public class RaftNode implements AutoCloseable {
                 transferInProgress = true;
                 installationState = InstallationState.RECEIVING;
 
-                System.out.println("[RAFT] Starting snapshot transfer: index=" + lastIncludedIndex +
+                LogHandler.info("[RAFT] Starting snapshot transfer: index=" + lastIncludedIndex +
                         ", term=" + lastIncludedTerm + ", expectedChecksum=" + expectedChecksum +
                         ", previousSnapshotIndex=" + previousSnapshotIndex);
             } catch (IOException e) {
-                System.err.println("[RAFT] Failed to create snapshot transfer file: " + e.getMessage());
+                LogHandler.error("[RAFT] Failed to create snapshot transfer file: " + e.getMessage());
                 return new RaftMessage.InstallSnapshotResponse(currentTerm, false, 0);
             }
         }
@@ -1169,11 +1203,11 @@ public class RaftNode implements AutoCloseable {
                 }
 
                 pendingSnapshotOffset = offset + data.length;
-                System.out.println("[RAFT] Received snapshot chunk: offset=" + offset +
+                LogHandler.info("[RAFT] Received snapshot chunk: offset=" + offset +
                         ", len=" + data.length + ", total=" + pendingSnapshotOffset);
 
             } catch (IOException e) {
-                System.err.println("[RAFT] Failed to write snapshot chunk: " + e.getMessage());
+                LogHandler.error("[RAFT] Failed to write snapshot chunk: " + e.getMessage());
                 cleanupPendingSnapshot();
                 installationState = InstallationState.NONE;
                 return new RaftMessage.InstallSnapshotResponse(currentTerm, false, 0);
@@ -1189,16 +1223,16 @@ public class RaftNode implements AutoCloseable {
                     oldCurrentGen = generationManager.getCurrentGeneration();
                 } catch (IOException e) {
                     // If we can't read the current generation, default to -1
-                    System.err.println("[RAFT] Warning: could not read current generation: " + e.getMessage());
+                    LogHandler.error("[RAFT] Warning: could not read current generation: " + e.getMessage());
                 }
             }
 
             try {
-                System.out.println("[RAFT] All chunks received, beginning crash-safe installation: index=" +
+                LogHandler.info("[RAFT] All chunks received, beginning crash-safe installation: index=" +
                         pendingSnapshotIndex + ", term=" + pendingSnapshotTerm);
 
                 // ===== PHASE 1: VALIDATE =====
-                System.out.println("[RAFT] [STATE: VALIDATING]");
+                LogHandler.info("[RAFT] [STATE: VALIDATING]");
 
                 // Read complete snapshot data from temp file
                 byte[] completeData = Files.readAllBytes(pendingSnapshotFile);
@@ -1215,7 +1249,7 @@ public class RaftNode implements AutoCloseable {
                         throw new IOException("Snapshot checksum mismatch: expected " +
                                 pendingChecksum + ", computed " + computedChecksum);
                     }
-                    System.out.println("[RAFT] Snapshot checksum validated: " + computedChecksum);
+                    LogHandler.info("[RAFT] Snapshot checksum validated: " + computedChecksum);
                 }
 
                 // ===== PHASE 2: VALIDATE SNAPSHOT DATA =====
@@ -1225,10 +1259,10 @@ public class RaftNode implements AutoCloseable {
                 } catch (Exception e) {
                     throw new IOException("Failed to parse snapshot data as JSON: " + e.getMessage(), e);
                 }
-                System.out.println("[RAFT] Snapshot data validated");
+                LogHandler.info("[RAFT] Snapshot data validated");
 
                 // ===== PHASE 4: COMMIT USING GENERATION MANAGER =====
-                System.out.println("[RAFT] [STATE: COMMITTING]");
+                LogHandler.info("[RAFT] [STATE: COMMITTING]");
 
                 // CRITICAL: GenerationManager.switchCurrent() is the ONLY authoritative commit point.
                 // The entire generation is prepared atomically, then CURRENT is switched.
@@ -1258,7 +1292,7 @@ public class RaftNode implements AutoCloseable {
 
                 // Step 1: Prepare new generation (gets sequential generation ID, separate from snapshot index)
                 long genIndex = generationManager.prepareNextGeneration(pendingSnapshotIndex);
-                System.out.println("[RAFT] Created generation " + genIndex + " for snapshot at index " + pendingSnapshotIndex);
+                LogHandler.info("[RAFT] Created generation " + genIndex + " for snapshot at index " + pendingSnapshotIndex);
 
                 // Step 2: Write all generation files
                 long genTerm = pendingSnapshotTerm;
@@ -1273,10 +1307,10 @@ public class RaftNode implements AutoCloseable {
                 // Write manifest.json (stores both generation ID and snapshot index/term)
                 generationManager.writeManifest(genIndex, pendingSnapshotIndex, genTerm, genChecksum);
 
-                System.out.println("[RAFT] Generation " + genIndex + " files written and fsynced (snapshot index=" + pendingSnapshotIndex + ")");
+                LogHandler.info("[RAFT] Generation " + genIndex + " files written and fsynced (snapshot index=" + pendingSnapshotIndex + ")");
 
                 // Step 3: Atomic CURRENT switch - THIS IS THE COMMIT POINT
-                System.out.println("[RAFT] Switching CURRENT to generation " + genIndex);
+                LogHandler.info("[RAFT] Switching CURRENT to generation " + genIndex);
                 generationManager.switchCurrent(genIndex);
 
                 // Step 4: Restore state to live MetadataStore for operational use
@@ -1284,7 +1318,7 @@ public class RaftNode implements AutoCloseable {
                 if (metadataStore != null) {
                     try {
                         metadataStore.restoreFromSnapshot(metadataObjects);
-                        System.out.println("[RAFT] MetadataStore restored with " + metadataObjects.size() + " objects");
+                        LogHandler.info("[RAFT] MetadataStore restored with " + metadataObjects.size() + " objects");
                     } catch (Exception e) {
                         throw new IOException("Failed to restore MetadataStore: " + e.getMessage(), e);
                     }
@@ -1306,15 +1340,15 @@ public class RaftNode implements AutoCloseable {
                     try {
                         wal.compact(pendingSnapshotIndex, raftLog.getCommitIndex(), currentTerm, votedFor);
                         walCompacted = true;
-                        System.out.println("[RAFT] WAL compacted successfully");
+                        LogHandler.info("[RAFT] WAL compacted successfully");
                     } catch (Exception e) {
-                        System.err.println("[RAFT] WAL compaction failed (non-fatal): " + e.getMessage());
+                        LogHandler.error("[RAFT] WAL compaction failed (non-fatal): " + e.getMessage());
                     }
                 }
 
                 installationState = InstallationState.COMMITTED;
-                System.out.println("[RAFT] [STATE: COMMITTED] - Snapshot installed successfully");
-                System.out.println("[RAFT]   generation=" + genIndex +
+                LogHandler.info("[RAFT] [STATE: COMMITTED] - Snapshot installed successfully");
+                LogHandler.info("[RAFT]   generation=" + genIndex +
                         ", snapshotIndex=" + pendingSnapshotIndex +
                         ", logStartIndex=" + raftLog.getLogStartIndex() +
                         ", commitIndex=" + raftLog.getCommitIndex() +
@@ -1324,7 +1358,7 @@ public class RaftNode implements AutoCloseable {
                 return new RaftMessage.InstallSnapshotResponse(currentTerm, true, completeData.length);
 
             } catch (Exception e) {
-                System.err.println("[RAFT] Failed to install snapshot: " + e.getMessage());
+                LogHandler.error("[RAFT] Failed to install snapshot: " + e.getMessage());
                 e.printStackTrace();
 
                 // Rollback: Discard candidate generations created during this failed attempt.
@@ -1341,19 +1375,19 @@ public class RaftNode implements AutoCloseable {
                             if (gen > oldCurrentGen && gen != currentGenAfter) {
                                 try {
                                     generationManager.deleteCandidateGeneration(gen);
-                                    System.out.println("[RAFT] Deleted uncommitted candidate generation " + gen);
+                                    LogHandler.info("[RAFT] Deleted uncommitted candidate generation " + gen);
                                 } catch (IOException ex) {
-                                    System.err.println("[RAFT] Failed to delete candidate generation " + gen + ": " + ex.getMessage());
+                                    LogHandler.error("[RAFT] Failed to delete candidate generation " + gen + ": " + ex.getMessage());
                                 }
                             }
                         }
                         if (currentGenAfter > oldCurrentGen) {
-                            System.out.println("[RAFT] Generation " + currentGenAfter + " is now authoritative (CURRENT switched during failure)");
+                            LogHandler.info("[RAFT] Generation " + currentGenAfter + " is now authoritative (CURRENT switched during failure)");
                         } else {
-                            System.out.println("[RAFT] No generation was committed - old generation remains authoritative");
+                            LogHandler.info("[RAFT] No generation was committed - old generation remains authoritative");
                         }
                     } catch (IOException ex) {
-                        System.err.println("[RAFT] Rollback failed: " + ex.getMessage());
+                        LogHandler.error("[RAFT] Rollback failed: " + ex.getMessage());
                     }
                 }
 
@@ -1428,7 +1462,7 @@ public class RaftNode implements AutoCloseable {
                         try {
                             saveStateOrThrow();
                         } catch (IOException e) {
-                            System.err.println("[RAFT] Node " + nodeId + " failed to persist higher term " +
+                            LogHandler.error("[RAFT] Node " + nodeId + " failed to persist higher term " +
                                 response.term() + " from vote response: " + e.getMessage());
                             state = RaftState.CANDIDATE;
                             currentTerm = response.term() - 1;
@@ -1443,19 +1477,19 @@ public class RaftNode implements AutoCloseable {
                         int votes = countVotes();
                         int majority = calculateMajority();
 
-                        System.out.println("[RAFT] Node " + nodeId + " received vote from " + peer.nodeId() +
+                        LogHandler.info("[RAFT] Node " + nodeId + " received vote from " + peer.nodeId() +
                                 " (votes=" + votes + "/" + majority + ")");
 
                         if (votes >= majority) {
-                            System.out.println("[RAFT] Node " + nodeId + " has majority! Becoming leader.");
+                            LogHandler.info("[RAFT] Node " + nodeId + " has majority! Becoming leader.");
                             becomeLeader();
                         } else {
-                            System.out.println("[RAFT] Node " + nodeId + " still waiting for more votes.");
+                            LogHandler.info("[RAFT] Node " + nodeId + " still waiting for more votes.");
                         }
                     }
                 } catch (Exception e) {
                     if (running) {
-                        System.err.println("[RAFT] RequestVote to " + peer + " failed: " + e.getMessage());
+                        LogHandler.error("[RAFT] RequestVote to " + peer + " failed: " + e.getMessage());
                     }
                 }
             });
@@ -1495,17 +1529,17 @@ public class RaftNode implements AutoCloseable {
                                 entries.get(entries.size() - 1).index();
                         nextIndex.put(peer.nodeId(), lastEntryIndex + 1);
                         matchIndex.put(peer.nodeId(), lastEntryIndex);
-                        System.out.println("[RAFT] " + nodeId + " updated matchIndex[" + peer.nodeId() + "]=" + lastEntryIndex +
+                        LogHandler.info("[RAFT] " + nodeId + " updated matchIndex[" + peer.nodeId() + "]=" + lastEntryIndex +
                             " (entries=" + entries.size() + ", prevLogIndex=" + prevLogIndex + ")");
                         updateCommitIndex();
                     } else {
                         nextIndex.computeIfPresent(peer.nodeId(), (k, v) -> Math.max(1, v - 1));
-                        System.out.println("[RAFT] " + nodeId + " AppendEntries rejected by " + peer.nodeId() +
+                        LogHandler.info("[RAFT] " + nodeId + " AppendEntries rejected by " + peer.nodeId() +
                             ", decrementing nextIndex to " + nextIndex.get(peer.nodeId()));
                     }
                 } catch (Exception e) {
                     if (running) {
-                        System.err.println("[RAFT] AppendEntries to " + peer + " failed: " + e.getMessage());
+                        LogHandler.error("[RAFT] AppendEntries to " + peer + " failed: " + e.getMessage());
                     }
                 }
             });
@@ -1587,7 +1621,7 @@ public class RaftNode implements AutoCloseable {
 
                 } catch (Exception e) {
                     if (running) {
-                        System.err.println("[RAFT] InstallSnapshot to " + peer + " failed: " + e.getMessage());
+                        LogHandler.error("[RAFT] InstallSnapshot to " + peer + " failed: " + e.getMessage());
                     }
                 }
             });
@@ -1644,12 +1678,12 @@ public class RaftNode implements AutoCloseable {
             // concurrently.
             List<LogEntry> toApply = raftLog.getEntriesToApply();
             if (!toApply.isEmpty()) {
-                System.out.println("[RAFT] " + nodeId + " applyCommittedEntries: " + toApply.size() + " entries to apply" +
+                LogHandler.info("[RAFT] " + nodeId + " applyCommittedEntries: " + toApply.size() + " entries to apply" +
                     " (commitIndex=" + raftLog.getCommitIndex() + ", lastApplied=" + raftLog.getLastApplied() + ")");
             }
             for (LogEntry entry : toApply) {
                 try {
-                    System.out.println("[RAFT] " + nodeId + " applying entry " + entry.index() +
+                    LogHandler.info("[RAFT] " + nodeId + " applying entry " + entry.index() +
                         " opType=" + entry.opType() + " clientId=" + entry.clientId() + " requestId=" + entry.requestId());
                     stateMachineApplier.accept(entry);
                     // Advance exactly one position only after successful apply.
@@ -1658,13 +1692,13 @@ public class RaftNode implements AutoCloseable {
                     // Complete any pending commit futures for this applied index
                     CompletableFuture<Boolean> future = pendingCommits.get(entry.index());
                     if (future != null) {
-                        System.out.println("[RAFT] " + nodeId + " completing commit future for index " + entry.index());
+                        LogHandler.info("[RAFT] " + nodeId + " completing commit future for index " + entry.index());
                         future.complete(true);
-                        System.out.println("[RAFT] " + nodeId + " completed commit future for index " + entry.index() + " after apply");
+                        LogHandler.info("[RAFT] " + nodeId + " completed commit future for index " + entry.index() + " after apply");
                     }
                 } catch (Exception e) {
                     terminalApplyFailure = new ApplyFailure(entry.index(), entry, e);
-                    System.err.println("[RAFT] Terminal apply failure at index=" + entry.index()
+                    LogHandler.error("[RAFT] Terminal apply failure at index=" + entry.index()
                         + ", term=" + entry.term()
                         + ", opType=" + entry.opType()
                         + ", clientId=" + entry.clientId()
@@ -1728,7 +1762,7 @@ public class RaftNode implements AutoCloseable {
         try {
             compactLog(lastApplied);
         } catch (Exception e) {
-            System.err.println("[RAFT] Log compaction failed: " + e.getMessage());
+            LogHandler.error("[RAFT] Log compaction failed: " + e.getMessage());
         }
     }
 
@@ -1756,7 +1790,7 @@ public class RaftNode implements AutoCloseable {
         // Get the term of the entry at lastIncludedIndex
         long lastIncludedTerm = raftLog.getTermAt(lastIncludedIndex);
 
-        System.out.println("[RAFT] Starting log compaction, lastIncludedIndex=" + lastIncludedIndex +
+        LogHandler.info("[RAFT] Starting log compaction, lastIncludedIndex=" + lastIncludedIndex +
                 ", lastIncludedTerm=" + lastIncludedTerm);
 
         if (generationManager == null) {
@@ -1790,7 +1824,7 @@ public class RaftNode implements AutoCloseable {
         // Step 4: Switch CURRENT to new generation (THIS IS THE COMMIT POINT)
         generationManager.switchCurrent(newGen);
 
-        System.out.println("[RAFT] Generation " + newGen + " committed via CURRENT switch");
+        LogHandler.info("[RAFT] Generation " + newGen + " committed via CURRENT switch");
 
         // Step 5: Use compactThrough to properly set snapshot boundary
         // This removes entries <= lastIncludedIndex and sets logStartIndex = lastIncludedIndex + 1
@@ -1801,7 +1835,7 @@ public class RaftNode implements AutoCloseable {
             wal.compact(lastIncludedIndex, raftLog.getCommitIndex(), currentTerm, votedFor);
         }
 
-        System.out.println("[RAFT] Log compaction complete, log entries now=" + raftLog.size() +
+        LogHandler.info("[RAFT] Log compaction complete, log entries now=" + raftLog.size() +
                 ", logStartIndex=" + raftLog.getLogStartIndex());
     }
 
@@ -1828,20 +1862,20 @@ public class RaftNode implements AutoCloseable {
                 }
             }
 
-            System.out.println("[RAFT] " + nodeId + " checking commit for index=" + index +
+            LogHandler.info("[RAFT] " + nodeId + " checking commit for index=" + index +
                 " term=" + entry.term() + " currentTerm=" + currentTerm +
                 " replicationCount=" + replicationCount + "/" + majority +
                 " matchIndex=" + matchIndex);
 
             if (replicationCount >= majority) {
                 raftLog.advanceCommitIndex(index);
-                System.out.println("[RAFT] " + nodeId + " committed index " + index);
+                LogHandler.info("[RAFT] " + nodeId + " committed index " + index);
 
                 // Complete the commit future for committed entries
                 CompletableFuture<Boolean> future = pendingCommits.get(index);
                 if (future != null) {
                     future.complete(true);
-                    System.out.println("[RAFT] " + nodeId + " completed commit future for index " + index);
+                    LogHandler.info("[RAFT] " + nodeId + " completed commit future for index " + index);
                 }
             }
         }
@@ -1879,7 +1913,7 @@ public class RaftNode implements AutoCloseable {
                         }
                     } catch (IOException e) {
                         if (running) {
-                            System.err.println("[RAFT] RPC server error: " + e.getMessage());
+                            LogHandler.error("[RAFT] RPC server error: " + e.getMessage());
                         }
                     }
                 }
@@ -1892,7 +1926,7 @@ public class RaftNode implements AutoCloseable {
             throw e;
         }
 
-        System.out.println("[RAFT] RPC server listening on port " + port);
+        LogHandler.info("[RAFT] RPC server listening on port " + port);
     }
 
     private void handleRpc(SocketChannel channel) {
@@ -1912,7 +1946,7 @@ public class RaftNode implements AutoCloseable {
             }
         } catch (IOException e) {
             if (running) {
-                System.err.println("[RAFT] RPC handler error: " + e.getMessage());
+                LogHandler.error("[RAFT] RPC handler error: " + e.getMessage());
             }
         } finally {
             activeRpcChannels.remove(channel);
@@ -2282,9 +2316,9 @@ public class RaftNode implements AutoCloseable {
             currentTerm = dis.readLong();
             String vf = dis.readUTF();
             votedFor = vf.isEmpty() ? null : vf;
-            System.out.println("[RAFT] Loaded state: term=" + currentTerm + ", votedFor=" + votedFor);
+            LogHandler.info("[RAFT] Loaded state: term=" + currentTerm + ", votedFor=" + votedFor);
         } catch (IOException e) {
-            System.err.println("[RAFT] Failed to load state: " + e.getMessage());
+            LogHandler.error("[RAFT] Failed to load state: " + e.getMessage());
         }
     }
 
@@ -2296,7 +2330,7 @@ public class RaftNode implements AutoCloseable {
         try {
             saveStateOrThrow();
         } catch (IOException e) {
-            System.err.println("[RAFT] Node " + nodeId + " failed to persist state: " + e.getMessage());
+            LogHandler.error("[RAFT] Node " + nodeId + " failed to persist state: " + e.getMessage());
         }
     }
 
@@ -2357,7 +2391,7 @@ public class RaftNode implements AutoCloseable {
             try {
                 wal.persistCommitIndex(raftLog.getCommitIndex(), raftLog.getLastApplied());
             } catch (IOException e) {
-                System.err.println("[RAFT] Failed to persist commit index to WAL: " + e.getMessage());
+                LogHandler.error("[RAFT] Failed to persist commit index to WAL: " + e.getMessage());
             }
         }
     }

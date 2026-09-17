@@ -52,6 +52,7 @@ public class RebalanceManager {
     private final ChunkOperationLock chunkOperationLock;
     /** May be null in single-node mode; non-null in cluster mode. */
     private final RaftNode raftNode;
+    private final Observability.Registry observability;
 
     private final double highThreshold;
     private final double lowThreshold;
@@ -78,7 +79,8 @@ public class RebalanceManager {
                 0.30,
                 DEFAULT_REBALANCE_INTERVAL_MILLIS,
                 new TcpChunkTransfer(),
-                FailureInjector.noop());
+                FailureInjector.noop(),
+                null);
     }
 
     /**
@@ -100,7 +102,8 @@ public class RebalanceManager {
                 0.30,
                 DEFAULT_REBALANCE_INTERVAL_MILLIS,
                 new TcpChunkTransfer(),
-                FailureInjector.noop());
+                FailureInjector.noop(),
+                null);
     }
 
     /**
@@ -124,11 +127,13 @@ public class RebalanceManager {
                 lowThreshold,
                 rebalanceIntervalMillis,
                 chunkTransfer,
-                failureInjector);
+                failureInjector,
+                null);
     }
 
     /**
-     * Full test constructor (with raftNode parameter).
+     * Full test constructor (with raftNode but no observability).
+     * Kept for backward compatibility with existing tests.
      */
     public RebalanceManager(MetadataStore metadataStore,
                              NodeRegistry nodeRegistry,
@@ -140,6 +145,33 @@ public class RebalanceManager {
                              long rebalanceIntervalMillis,
                              ChunkTransfer chunkTransfer,
                              FailureInjector failureInjector) {
+        this(metadataStore,
+                nodeRegistry,
+                placementManager,
+                chunkOperationLock,
+                raftNode,
+                highThreshold,
+                lowThreshold,
+                rebalanceIntervalMillis,
+                chunkTransfer,
+                failureInjector,
+                null);
+    }
+
+    /**
+     * Full test constructor (with raftNode and observability parameters).
+     */
+    public RebalanceManager(MetadataStore metadataStore,
+                             NodeRegistry nodeRegistry,
+                             PlacementManager placementManager,
+                             ChunkOperationLock chunkOperationLock,
+                             RaftNode raftNode,
+                             double highThreshold,
+                             double lowThreshold,
+                             long rebalanceIntervalMillis,
+                             ChunkTransfer chunkTransfer,
+                             FailureInjector failureInjector,
+                             Observability.Registry observability) {
         this.metadataStore = Objects.requireNonNull(metadataStore);
         this.nodeRegistry = Objects.requireNonNull(nodeRegistry);
         this.placementManager = Objects.requireNonNull(placementManager);
@@ -150,6 +182,7 @@ public class RebalanceManager {
         this.rebalanceIntervalMillis = rebalanceIntervalMillis;
         this.chunkTransfer = Objects.requireNonNull(chunkTransfer);
         this.failureInjector = Objects.requireNonNull(failureInjector);
+        this.observability = observability != null ? observability : new Observability.Registry();
     }
 
     private final long rebalanceIntervalMillis;
@@ -185,7 +218,7 @@ public class RebalanceManager {
                     rebalanceIntervalMillis,
                     TimeUnit.MILLISECONDS);
 
-            System.out.println("[REBALANCE] Manager started (interval=" + rebalanceIntervalMillis + "ms, " +
+            LogHandler.info("[REBALANCE] Manager started (interval=" + rebalanceIntervalMillis + "ms, " +
                     "high=" + highThreshold + ", low=" + lowThreshold + ", raft=" + raftNode + ")");
         }
     }
@@ -239,16 +272,20 @@ public class RebalanceManager {
         if (raftNode != null && !raftNode.isLeader()) {
             return;
         }
+        observability.managers().rebalanceAttempt();
+        observability.managers().rebalanceActiveStart();
         try {
             RebalanceResult result = rebalanceOnce();
             if (result.chunksMoved() > 0 || result.chunksFailed() > 0) {
-                System.out.println("[REBALANCE] Complete: scanned=" + result.chunksScanned() +
+                LogHandler.info("[REBALANCE] Complete: scanned=" + result.chunksScanned() +
                         " moved=" + result.chunksMoved() +
                         " skipped=" + result.chunksSkipped() +
                         " failed=" + result.chunksFailed());
             }
         } catch (Exception e) {
-            System.err.println("[REBALANCE] Error during rebalance: " + e.getMessage());
+            LogHandler.error("[REBALANCE] Error during rebalance: " + e.getMessage());
+        } finally {
+            observability.managers().rebalanceActiveEnd();
         }
     }
 
@@ -307,7 +344,7 @@ public class RebalanceManager {
 
         // Skip if another move/repair is in flight for this chunk.
         if (!chunkOperationLock.tryAcquire(chunkId)) {
-            System.out.println("[REBALANCE] SKIPPED — chunk lock held for " + chunkId);
+            LogHandler.info("[REBALANCE] SKIPPED — chunk lock held for " + chunkId);
             return false;
         }
 
@@ -396,7 +433,7 @@ public class RebalanceManager {
                 if (expectedChecksum != null && !expectedChecksum.isEmpty()) {
                     String actual = computeSha256Hex(sourceData);
                     if (!expectedChecksum.equalsIgnoreCase(actual)) {
-                        System.out.println("[REBALANCE] FAILED — source checksum mismatch for " + chunkId);
+                        LogHandler.info("[REBALANCE] FAILED — source checksum mismatch for " + chunkId);
                         return false;
                     }
                 }
@@ -412,7 +449,7 @@ public class RebalanceManager {
                 String destActualChecksum = computeSha256Hex(destData);
                 if (expectedChecksum != null && !expectedChecksum.isEmpty()) {
                     if (!expectedChecksum.equalsIgnoreCase(destActualChecksum)) {
-                        System.out.println("[REBALANCE] FAILED — dest checksum mismatch for " + chunkId);
+                        LogHandler.info("[REBALANCE] FAILED — dest checksum mismatch for " + chunkId);
                         // Best-effort cleanup of bad dest data.
                         try {
                             chunkTransfer.deleteChunk(dest, chunkId);
@@ -436,17 +473,20 @@ public class RebalanceManager {
                             chunkTransfer.deleteChunk(source, chunkId);
                         } catch (IOException e) {
                             // Per spec: if delete fails, do NOT revert metadata.
-                            System.err.println("[REBALANCE] WARNING — source delete failed for " + chunkId +
+                            LogHandler.error("[REBALANCE] WARNING — source delete failed for " + chunkId +
                                     ": " + e.getMessage());
                         }
                         // Step 7: Local used-capacity adjustment for hysteresis.
                         adjustLocalUsedCapacity(source, dest, chunk.getChunkSize());
-                        System.out.println("[REBALANCE] SUCCESS — moved chunk=" + chunkId +
+                        observability.managers().rebalanceSuccess();
+                        observability.managers().rebalanceChunks(1);
+                        LogHandler.info("[REBALANCE] SUCCESS — moved chunk=" + chunkId +
                                 " from " + source.getNodeId() + " to " + dest.getNodeId() + " (via Raft)");
                         return true;
                     }
                     // Raft submit failed — destPut is still true, cleanup handled inside trySubmitReplicaMove.
-                    System.err.println("[REBALANCE] FAILED — Raft submit failed for chunk " + chunkId);
+                    LogHandler.error("[REBALANCE] FAILED — Raft submit failed for chunk " + chunkId);
+                    observability.managers().rebalanceFailure();
                     return false;
                 } else {
                     // Single-node mode: fall back to direct store mutation (legacy path).
@@ -468,6 +508,7 @@ public class RebalanceManager {
                             } catch (IOException ignored) {
                             }
                         }
+                        observability.managers().rebalanceFailure();
                         return false;
                     }
 
@@ -477,14 +518,16 @@ public class RebalanceManager {
                         chunkTransfer.deleteChunk(source, chunkId);
                     } catch (IOException e) {
                         // Per spec: if delete fails, do NOT revert metadata.
-                        System.err.println("[REBALANCE] WARNING — source delete failed for " + chunkId +
+                        LogHandler.error("[REBALANCE] WARNING — source delete failed for " + chunkId +
                                 ": " + e.getMessage());
                     }
 
                     // Step 7: Local used-capacity adjustment for hysteresis.
                     adjustLocalUsedCapacity(source, dest, chunk.getChunkSize());
 
-                    System.out.println("[REBALANCE] SUCCESS — moved chunk=" + chunkId +
+                    observability.managers().rebalanceSuccess();
+                    observability.managers().rebalanceChunks(1);
+                    LogHandler.info("[REBALANCE] SUCCESS — moved chunk=" + chunkId +
                             " from " + source.getNodeId() + " to " + dest.getNodeId());
 
                     return true;
@@ -497,7 +540,7 @@ public class RebalanceManager {
                     } catch (IOException ignored) {
                     }
                 }
-                System.err.println("[REBALANCE] FAILED — chunk " + chunkId + " error: " + e.getMessage());
+                LogHandler.error("[REBALANCE] FAILED — chunk " + chunkId + " error: " + e.getMessage());
                 return false;
             }
         } finally {
@@ -538,7 +581,7 @@ public class RebalanceManager {
             if (destPut) {
                 try { chunkTransfer.deleteChunk(dest, chunkId); } catch (IOException ignored) {}
             }
-            System.err.println("[REBALANCE] FAILED — build updated metadata for " + chunkId + ": " + e.getMessage());
+            LogHandler.error("[REBALANCE] FAILED — build updated metadata for " + chunkId + ": " + e.getMessage());
             return false;
         }
 
@@ -550,7 +593,7 @@ public class RebalanceManager {
             if (destPut) {
                 try { chunkTransfer.deleteChunk(dest, chunkId); } catch (IOException ignored) {}
             }
-            System.err.println("[REBALANCE] FAILED — serialize metadata bytes for " + chunkId + ": " + e.getMessage());
+            LogHandler.error("[REBALANCE] FAILED — serialize metadata bytes for " + chunkId + ": " + e.getMessage());
             return false;
         }
 
@@ -569,7 +612,7 @@ public class RebalanceManager {
                 if (destPut) {
                     try { chunkTransfer.deleteChunk(dest, chunkId); } catch (IOException ignored) {}
                 }
-                System.err.println("[REBALANCE] FAILED — Raft submit not committed for chunk " + chunkId);
+                LogHandler.error("[REBALANCE] FAILED — Raft submit not committed for chunk " + chunkId);
                 return false;
             }
             return true;
@@ -579,7 +622,7 @@ public class RebalanceManager {
             if (destPut) {
                 try { chunkTransfer.deleteChunk(dest, chunkId); } catch (IOException ignored) {}
             }
-            System.err.println("[REBALANCE] FAILED — Raft submit threw for chunk " + chunkId + ": " + e.getMessage());
+            LogHandler.error("[REBALANCE] FAILED — Raft submit threw for chunk " + chunkId + ": " + e.getMessage());
             return false;
         }
     }

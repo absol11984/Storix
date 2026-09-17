@@ -56,6 +56,7 @@ public class NodeRecoveryManager {
     private final MetadataStore metadataStore;
     private final ChunkOperationLock chunkOperationLock;
     private final long scanIntervalMillis;
+    private final Observability.Registry observability;
 
     private final Map<String, NodeRecoveryState> recoveryStates = new ConcurrentHashMap<>();
     private final Map<String, ReentrantLock> nodeLocks = new ConcurrentHashMap<>();
@@ -68,17 +69,26 @@ public class NodeRecoveryManager {
     public NodeRecoveryManager(NodeRegistry nodeRegistry,
                                MetadataStore metadataStore,
                                ChunkOperationLock chunkOperationLock) {
-        this(nodeRegistry, metadataStore, chunkOperationLock, DEFAULT_SCAN_INTERVAL_MILLIS);
+        this(nodeRegistry, metadataStore, chunkOperationLock, DEFAULT_SCAN_INTERVAL_MILLIS, null);
     }
 
     public NodeRecoveryManager(NodeRegistry nodeRegistry,
                                MetadataStore metadataStore,
                                ChunkOperationLock chunkOperationLock,
                                long scanIntervalMillis) {
+        this(nodeRegistry, metadataStore, chunkOperationLock, scanIntervalMillis, null);
+    }
+
+    public NodeRecoveryManager(NodeRegistry nodeRegistry,
+                               MetadataStore metadataStore,
+                               ChunkOperationLock chunkOperationLock,
+                               long scanIntervalMillis,
+                               Observability.Registry observability) {
         this.nodeRegistry = nodeRegistry;
         this.metadataStore = metadataStore;
         this.chunkOperationLock = chunkOperationLock;
         this.scanIntervalMillis = scanIntervalMillis;
+        this.observability = observability != null ? observability : new Observability.Registry();
         this.executor = createExecutor();
     }
 
@@ -312,6 +322,8 @@ public class NodeRecoveryManager {
             return false;
         }
 
+        observability.managers().recoveryAttempt();
+        observability.managers().recoveryActiveStart();
         try {
             NodeRecoveryState state = recoveryStates.getOrDefault(nodeId, NodeRecoveryState.FAILED);
 
@@ -331,6 +343,7 @@ public class NodeRecoveryManager {
                     if (!verifyHealth(node)) {
                         recoveryStates.put(nodeId, NodeRecoveryState.FAILED);
                         node.setRecoveryHold(false);
+                        observability.managers().recoveryFailure();
                         return false;
                     }
                     recoveryStates.put(nodeId, NodeRecoveryState.RECOVERING);
@@ -340,12 +353,14 @@ public class NodeRecoveryManager {
                     if (!reconcileNodeChunks(node)) {
                         recoveryStates.put(nodeId, NodeRecoveryState.FAILED);
                         node.setRecoveryHold(false);
+                        observability.managers().recoveryFailure();
                         return false;
                     }
                     // Mark eligible again.
                     node.setRecoveryHold(false);
                     node.setStatus(NodeStatus.ACTIVE);
                     recoveryStates.put(nodeId, NodeRecoveryState.READY);
+                    observability.managers().recoverySuccess();
                     return true;
                 case READY:
                 case FAILED:
@@ -354,6 +369,7 @@ public class NodeRecoveryManager {
             }
         } finally {
             lock.unlock();
+            observability.managers().recoveryActiveEnd();
         }
     }
 
@@ -366,7 +382,7 @@ public class NodeRecoveryManager {
             node.setStatus(NodeStatus.UNHEALTHY);
             return true;
         } catch (Exception e) {
-            System.err.println("[RECOVERY] health check failed for " + node.getNodeId() + ": " + e.getMessage());
+            LogHandler.error("[RECOVERY] health check failed for " + node.getNodeId() + ": " + e.getMessage());
             return false;
         }
     }
@@ -524,7 +540,7 @@ public class NodeRecoveryManager {
 
             return true;
         } catch (Exception e) {
-            System.err.println("[RECOVERY] reconcile failed for " + node.getNodeId() + ": " + e.getMessage());
+            LogHandler.error("[RECOVERY] reconcile failed for " + node.getNodeId() + ": " + e.getMessage());
             return false;
         }
     }
@@ -600,8 +616,13 @@ public class NodeRecoveryManager {
             putChunkToNode(targetNode, chunkId, data);
 
             if (expectedChecksum != null && !expectedChecksum.isEmpty()) {
-                return verifyChunkOnNode(targetNode, chunkId, expectedChecksum);
+                if (verifyChunkOnNode(targetNode, chunkId, expectedChecksum)) {
+                    observability.managers().recoveryChunks(1);
+                    return true;
+                }
+                return false;
             }
+            observability.managers().recoveryChunks(1);
             return true;
         } catch (IOException e) {
             return false;

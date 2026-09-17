@@ -1,5 +1,7 @@
 package com.storix.storage;
 
+import com.storix.storage.observability.LogHandler;
+
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
@@ -7,6 +9,9 @@ import java.nio.ByteBuffer;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.file.Path;
+import com.storix.storage.observability.StorageMetrics;
+
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -27,6 +32,7 @@ public class ChunkServer {
     private final String host;
     private final int port;
     private final ChunkStorage storage;
+    private final StorageMetrics storageMetrics;
     private final String metadataHost;
     private final int metadataPort;
     private final long heartbeatIntervalMillis;
@@ -69,6 +75,7 @@ public class ChunkServer {
         this.host = host;
         this.port = port;
         this.storage = new ChunkStorage(storageDir, totalCapacityBytes);
+        this.storageMetrics = new StorageMetrics();
         this.metadataHost = metadataHost;
         this.metadataPort = metadataPort;
 
@@ -130,7 +137,7 @@ public class ChunkServer {
                 this.serverChannel = sc;
                 serverChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
                 serverChannel.bind(new InetSocketAddress(port));
-                System.out.println("Storage node " + nodeId + " listening on " + host + ":" + port);
+                LogHandler.info("Storage node " + nodeId + " listening on " + host + ":" + port);
 
                 // Do not advertise the node until its listener is bound. Otherwise
                 // placement can route a client to a registered node that cannot yet
@@ -151,7 +158,7 @@ public class ChunkServer {
                         });
                     } catch (IOException e) {
                         if (running && serverChannel != null && serverChannel.isOpen()) {
-                            System.err.println("Accept failed: " + e.getMessage());
+                            LogHandler.error("Accept failed: " + e.getMessage());
                         }
                     }
                 }
@@ -224,13 +231,13 @@ public class ChunkServer {
     }
 
     private void handleClient(SocketChannel clientChannel) {
-        ChunkHandler handler = new ChunkHandler(nodeId, storage);
+        ChunkHandler handler = new ChunkHandler(nodeId, storage, storageMetrics);
         try (clientChannel) {
             handler.handle(clientChannel);
         } catch (IOException e) {
             // Expected during shutdown when sockets are closed.
             if (running) {
-                System.err.println("Client handler error: " + e.getMessage());
+                LogHandler.error("Client handler error: connection terminated");
             }
         } finally {
             activeClientChannels.remove(clientChannel);
@@ -247,9 +254,9 @@ public class ChunkServer {
                     storage.getUsedCapacityBytes());
 
             sendToMetadataServer((byte) 10, json); // REGISTER_NODE = 10
-            System.out.println("Registered with metadata server at " + metadataHost + ":" + metadataPort);
+            LogHandler.info("Registered with metadata server at " + metadataHost + ":" + metadataPort);
         } catch (IOException e) {
-            System.err.println("Failed to register with metadata server: " + e.getMessage());
+            LogHandler.error("Failed to register with metadata server: " + e.getMessage());
         }
     }
 
@@ -281,16 +288,23 @@ public class ChunkServer {
 
                 // Rebuild heartbeat payload each tick from live capacity so metadata
                 // server sees the current used/total ratio (updated by rebalance moves).
-                String json = String.format(
-                        "{\"nodeId\":\"%s\",\"totalCapacityBytes\":%d,\"usedCapacityBytes\":%d}",
-                        nodeId,
-                        storage.getTotalCapacityBytes(),
-                        storage.getUsedCapacityBytes());
+                Map<String, Long> telemetry = storageMetrics.snapshotTelemetry(
+                        storage.listStoredChunkIds().size());
+                StringBuilder builder = new StringBuilder();
+                builder.append("{")
+                        .append("\"nodeId\":\"").append(nodeId).append("\"")
+                        .append(",\"totalCapacityBytes\":").append(storage.getTotalCapacityBytes())
+                        .append(",\"usedCapacityBytes\":").append(storage.getUsedCapacityBytes());
+                for (Map.Entry<String, Long> entry : telemetry.entrySet()) {
+                    builder.append(",\"").append(entry.getKey()).append("\"").append(':').append(entry.getValue());
+                }
+                builder.append('}');
+                String json = builder.toString();
                 try {
                     sendToMetadataServer((byte) 11, json); // HEARTBEAT = 11
                 } catch (IOException e) {
                     if (running) {
-                        System.err.println("Heartbeat failed: " + e.getMessage());
+                        LogHandler.error("Heartbeat failed: " + e.getMessage());
                     }
                 }
             }, heartbeatIntervalMillis, heartbeatIntervalMillis, TimeUnit.MILLISECONDS);
@@ -390,7 +404,7 @@ public class ChunkServer {
 
         // Graceful shutdown on SIGINT/SIGTERM
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Shutting down storage node...");
+            LogHandler.info("Shutting down storage node...");
             server.stop();
         }));
 

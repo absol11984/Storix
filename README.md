@@ -184,26 +184,35 @@ java -jar client/target/client-1.0.0.jar status
 
 Output:
 ```
-Storix Cluster
+Storix Cluster Status
 
-Metadata Server:
-ACTIVE
+Health: HEALTHY (Lifecycle: RUNNING)
+
+Raft Consensus:
+  Role: LEADER | Term: 1 | Leader: node-a | CommitIndex: 100 | LastApplied: 100
 
 Storage Nodes:
----------------------------------------
-node-a     127.0.0.1:9001   ACTIVE
-node-b     127.0.0.1:9002   ACTIVE
-node-c     127.0.0.1:9003   ACTIVE
----------------------------------------
+--------------------------------------------------------------------------------
+Node ID    Address          Status     Health     Chunks   Used/Total
+--------------------------------------------------------------------------------
+node-a     127.0.0.1:9001   ACTIVE     HEALTHY    10       500MB/1000MB
+node-b     127.0.0.1:9002   ACTIVE     HEALTHY    10       510MB/1000MB
+node-c     127.0.0.1:9003   ACTIVE     HEALTHY    5        400MB/1000MB
+--------------------------------------------------------------------------------
 
-Objects: 1
-Chunks: 1
-Healthy nodes: 3/3
+Cluster Data:
+  Objects: 10
+  Chunks: 25
+  Healthy nodes: 3/3
+  Replication: Healthy=25, Degraded=0
 
-Replication:
-Healthy: 1
-Degraded: 0
+Metrics Summary:
+  Requests: Total=1000, Success=995, Failed=5, Active=2
+  Repair: Active=0, Repaired=15, Failed=0
+  Recovery: Active=0, Restored=0, Failed=0
+  Rebalance: Active=0, Moved=0, Failed=0
 ```
+
 
 ### Get file info
 
@@ -254,6 +263,53 @@ java -jar client/target/client-1.0.0.jar list
 ```bash
 java -jar client/target/client-1.0.0.jar repair
 ```
+
+## Observability & Cluster Monitoring
+
+The `status` command yields a comprehensive, deterministic health snapshot of the cluster in a lock-free, read-only map generated on demand by the Metadata Server.
+
+### Health States
+The cluster explicitly computes health across multiple layers:
+- `HEALTHY`: Normal operations.
+- `DEGRADED`: At least one storage node is in `recoveryHold`, or there is at least one under-replicated (degraded) chunk.
+- `UNHEALTHY`: The metadata server lacks sufficient nodes to satisfy storage requirements, or a node has remained unregistered/unreachable past its timeouts.
+- `STARTING` / `STOPPING`: The server is bound but still spinning up or gracefully shutting down operations (no incoming external queries are fully active).
+
+### Metric Semantics
+- **Requests**: Captures operations at `opcode` boundaries. Failure categories (e.g. `timeout`, `storage_failure`, `invalid_request`, `internal`) expose the nature of errors deterministically, avoiding stacktrace leakage.
+- **Managers**: Tracks background work explicitly using `try/finally` increment/decrement logic.
+  - *Repair*: Count of tasks that effectively found and copied chunks.
+  - *Recovery*: Scans that synchronized a missing storage node successfully.
+  - *Rebalance*: Tasks moving data away from full/evicted nodes.
+- **Storage Telemetry**: Heartbeats contain in-line metrics. Storage nodes expose chunk read/write successes/failures dynamically, active connections, and explicit checksum/corruption failures observed via client verification.
+
+### Unhealthy Node Diagnosis Example
+When a client detects an anomaly or `get test.bin` hangs/fails, checking `status` is the first diagnostic step.
+
+If a storage node crashes or has a network partition, `StorixCLI status` will show:
+```
+Storix Cluster Status
+
+Health: DEGRADED (Lifecycle: RUNNING)
+
+Storage Nodes:
+--------------------------------------------------------------------------------
+Node ID    Address          Status     Health     Chunks   Used/Total
+--------------------------------------------------------------------------------
+node-a     127.0.0.1:9001   ACTIVE     HEALTHY    10       500MB/1000MB
+node-b     127.0.0.1:9002   ACTIVE     HEALTHY    10       510MB/1000MB
+node-c     127.0.0.1:9003   INACTIVE   UNHEALTHY  5        400MB/1000MB
+--------------------------------------------------------------------------------
+
+Cluster Data:
+  Objects: 10
+  Chunks: 25
+  Healthy nodes: 2/3
+  Replication: Healthy=20, Degraded=5
+```
+Here, `node-c` reads `UNHEALTHY` and 5 chunks are `Degraded`. The administrator should:
+1. Try restarting `node-c`. Wait for the node to enter `DEGRADED` (recovery hold) status and eventually `HEALTHY` once caught up.
+2. If `node-c` is permanently lost, wait for the timeout, or trigger a manual repair using `storix repair`, which scans degraded chunks and instructs nodes `a` and `b` to replicate them.
 
 ## Protocol
 
@@ -450,21 +506,32 @@ $ java -jar storage-node/target/storage-node-1.0.0.jar --id node-c --port 9003 -
 
 # Check cluster status
 $ java -jar client/target/client-1.0.0.jar status
-Storix Cluster
+Storix Cluster Status
 
-Metadata Server:
-ACTIVE
+Health: HEALTHY (Lifecycle: RUNNING)
+
+Raft State: UNKNOWN (Leader: false)
 
 Storage Nodes:
----------------------------------------
-node-a     127.0.0.1:9001   ACTIVE
-node-b     127.0.0.1:9002   ACTIVE
-node-c     127.0.0.1:9003   ACTIVE
----------------------------------------
+--------------------------------------------------------------------------------
+Node ID    Address          Status     Health     Chunks   Used/Total
+--------------------------------------------------------------------------------
+node-a     127.0.0.1:9001   ACTIVE     HEALTHY    0        -
+node-b     127.0.0.1:9002   ACTIVE     HEALTHY    0        -
+node-c     127.0.0.1:9003   ACTIVE     HEALTHY    0        -
+--------------------------------------------------------------------------------
 
-Objects: 0
-Chunks: 0
-Healthy nodes: 3/3
+Cluster Data:
+  Objects: 0
+  Chunks: 0
+  Healthy nodes: 3/3
+  Replication: Healthy=0, Degraded=0
+
+Metrics Summary:
+  Requests: Total=0, Success=0, Failed=0, Active=0
+  Repair: Active=0, Repaired=0, Failed=0
+  Recovery: Active=0, Restored=0, Failed=0
+  Rebalance: Active=0, Moved=0, Failed=0
 
 # Upload a file (replicated to 2 nodes)
 $ java -jar client/target/client-1.0.0.jar put test.bin

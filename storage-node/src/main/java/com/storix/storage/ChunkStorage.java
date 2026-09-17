@@ -1,5 +1,7 @@
 package com.storix.storage;
 
+import com.storix.storage.observability.LogHandler;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -244,7 +246,7 @@ public class ChunkStorage {
             if (totalCapacityBytes > 0) {
                 usedCapacityBytes = Math.max(0, usedCapacityBytes - oldSize);
             }
-            System.err.println("[CORRUPT] Quarantined chunk " + chunkId + " to " + quarantineFile);
+            LogHandler.error("[CORRUPT] Quarantined chunk " + chunkId + " to " + quarantineFile);
         } finally {
             capacityLock.unlock();
         }

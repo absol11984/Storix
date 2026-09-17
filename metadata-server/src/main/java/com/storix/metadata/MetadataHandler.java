@@ -13,6 +13,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Handles metadata client requests.
@@ -28,6 +29,7 @@ public class MetadataHandler {
     private final RaftNode raftNode;
     private final MetadataStateMachine stateMachine;
     private final int port;
+    private final Observability.Registry observability;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     // Request deduplication cache (TTL 1 hour)
@@ -47,6 +49,13 @@ public class MetadataHandler {
     public MetadataHandler(MetadataStore store, NodeRegistry nodeRegistry,
                           PlacementManager placementManager, RepairManager repairManager,
                           RaftNode raftNode, MetadataStateMachine stateMachine, int port) {
+        this(store, nodeRegistry, placementManager, repairManager, raftNode, stateMachine, port, new Observability.Registry());
+    }
+
+    public MetadataHandler(MetadataStore store, NodeRegistry nodeRegistry,
+                          PlacementManager placementManager, RepairManager repairManager,
+                          RaftNode raftNode, MetadataStateMachine stateMachine, int port,
+                          Observability.Registry observability) {
         this.store = store;
         this.nodeRegistry = nodeRegistry;
         this.placementManager = placementManager;
@@ -54,6 +63,7 @@ public class MetadataHandler {
         this.raftNode = raftNode;
         this.stateMachine = stateMachine;
         this.port = port;
+        this.observability = observability;
     }
 
     /**
@@ -170,9 +180,16 @@ public class MetadataHandler {
      * Processes a request and returns the response buffer.
      */
     private ByteBuffer processRequest(byte opcode, byte[] payload) throws IOException {
+        long startedAt = System.nanoTime();
         RequestContext ctx = unwrapRequest(opcode, payload);
+        boolean success = false;
+        String failureCategory = null;
+
+        // Observability: track in-flight active requests.
+        // Must start/end exactly once for each processed request.
+        observability.requests().activeRequestStart();
         try {
-            return switch (opcode) {
+            ByteBuffer response = switch (opcode) {
                 case MetadataProtocol.CREATE_OBJECT -> handleCreateObject(ctx);
                 case MetadataProtocol.GET_OBJECT -> handleGetObject(ctx);
                 case MetadataProtocol.UPDATE_OBJECT -> handleUpdateObject(ctx);
@@ -189,9 +206,76 @@ public class MetadataHandler {
 
                 default -> createErrorResponse(MetadataProtocol.ERROR, "Unknown opcode: " + opcode);
             };
+
+            // Response layout: [4 bytes len][1 byte status][...]
+            byte responseStatus = response.get(4);
+            success = responseStatus == MetadataProtocol.OK;
+            if (!success) {
+                // Classify based on response status and opcode
+                failureCategory = classifyResponseFailure(responseStatus, opcode);
+            }
+            return response;
+        } catch (java.net.SocketTimeoutException | java.io.EOFException e) {
+            failureCategory = "timeout";
+            return createErrorResponse(MetadataProtocol.ERROR, "Internal error");
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            failureCategory = "invalid_request";
+            return createErrorResponse(MetadataProtocol.ERROR, "Invalid JSON");
+        } catch (IOException e) {
+            // Local disk/storage error handling object metadata or WAL
+            failureCategory = "storage_failure";
+            return createErrorResponse(MetadataProtocol.ERROR, "Internal error");
+        } catch (IllegalArgumentException e) {
+            // Invalid request data
+            failureCategory = "invalid_request";
+            return createErrorResponse(MetadataProtocol.ERROR, "Internal error");
         } catch (Exception e) {
-            return createErrorResponse(MetadataProtocol.ERROR, e.getMessage());
+            // Unknown/unclassified failure
+            failureCategory = "internal";
+            return createErrorResponse(MetadataProtocol.ERROR, "Internal error");
+        } finally {
+            try {
+                // Ensure active request is decremented even if any of the
+                // metrics recording/response classification throws.
+                observability.requests().activeRequestEnd();
+            } finally {
+                String operation = ctx.operation != null ? ctx.operation : opcodeName(opcode);
+                observability.requests().record(operation, success,
+                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt),
+                        failureCategory);
+            }
         }
+    }
+
+    private String classifyResponseFailure(byte responseStatus, byte opcode) {
+        return switch (responseStatus) {
+            case MetadataProtocol.NOT_LEADER -> "raft_rejection";
+            case MetadataProtocol.NOT_FOUND -> {
+                if (opcode == MetadataProtocol.HEARTBEAT) {
+                    yield "unavailable_node";
+                }
+                yield "invalid_request";
+            }
+            case MetadataProtocol.ERROR -> "internal";
+            default -> "internal"; // Never emit "other" fallback
+        };
+    }
+
+    private static String opcodeName(byte opcode) {
+        return switch (opcode) {
+            case MetadataProtocol.CREATE_OBJECT -> "CREATE_OBJECT";
+            case MetadataProtocol.GET_OBJECT -> "GET_OBJECT";
+            case MetadataProtocol.UPDATE_OBJECT -> "UPDATE_OBJECT";
+            case MetadataProtocol.DELETE_OBJECT -> "DELETE_OBJECT";
+            case MetadataProtocol.LIST_OBJECTS -> "LIST_OBJECTS";
+            case MetadataProtocol.REGISTER_NODE -> "REGISTER_NODE";
+            case MetadataProtocol.HEARTBEAT -> "HEARTBEAT";
+            case MetadataProtocol.GET_NODES -> "GET_NODES";
+            case MetadataProtocol.GET_PLACEMENT -> "GET_PLACEMENT";
+            case MetadataProtocol.GET_CLUSTER_STATUS -> "GET_CLUSTER_STATUS";
+            case MetadataProtocol.REPAIR -> "REPAIR";
+            default -> "UNKNOWN";
+        };
     }
 
     private ByteBuffer handleCreateObject(RequestContext ctx) throws IOException {
@@ -211,7 +295,7 @@ public class MetadataHandler {
         Optional<DeduplicationCache.CachedResult> cached = deduplicationCache.get(dedupKey);
         if (cached.isPresent()) {
             // Return cached result for idempotent operation
-            System.out.println("[HANDLER] Duplicate request detected: " + dedupKey);
+            LogHandler.info("[HANDLER] Duplicate request detected: " + dedupKey);
             return createSuccessResponse(cached.get().responseData());
         }
 
@@ -238,7 +322,6 @@ public class MetadataHandler {
 
     private ByteBuffer handleGetObject(RequestContext ctx) throws IOException {
         byte[] payload = ctx.innerPayload;
-        System.out.println("[DEBUG-GET_OBJECT] payload=" + new String(payload));
         Map<String, String> request = objectMapper.readValue(payload, Map.class);
         String objectName = request.get("objectName");
         if (objectName == null) {
@@ -273,7 +356,7 @@ public class MetadataHandler {
         // Check deduplication cache
         Optional<DeduplicationCache.CachedResult> cached = deduplicationCache.get(dedupKey);
         if (cached.isPresent()) {
-            System.out.println("[HANDLER] Duplicate request detected: " + dedupKey);
+            LogHandler.info("[HANDLER] Duplicate request detected: " + dedupKey);
             return createSuccessResponse(cached.get().responseData());
         }
 
@@ -315,7 +398,7 @@ public class MetadataHandler {
         // Check deduplication cache
         Optional<DeduplicationCache.CachedResult> cached = deduplicationCache.get(dedupKey);
         if (cached.isPresent()) {
-            System.out.println("[HANDLER] Duplicate request detected: " + dedupKey);
+            LogHandler.info("[HANDLER] Duplicate request detected: " + dedupKey);
             return createSuccessResponse(cached.get().responseData());
         }
 
@@ -379,7 +462,26 @@ public class MetadataHandler {
         long totalCap = (totalCapObj instanceof Number) ? ((Number) totalCapObj).longValue() : -1;
         long usedCap = (usedCapObj instanceof Number) ? ((Number) usedCapObj).longValue() : 0;
 
-        boolean found = nodeRegistry.heartbeat(nodeId, totalCap, usedCap);
+        // Optional storage-node telemetry fields (best-effort)
+        Map<String, Long> telemetry = null;
+        if (request.containsKey("activeConnections")
+                || request.containsKey("chunkReadSuccesses")
+                || request.containsKey("chunkReadFailures")
+                || request.containsKey("chunkWriteSuccesses")
+                || request.containsKey("chunkWriteFailures")
+                || request.containsKey("checksumFailures")
+                || request.containsKey("chunkCount")) {
+            telemetry = new HashMap<>();
+            telemetry.put("activeConnections", asLong(request.get("activeConnections"), 0));
+            telemetry.put("chunkReadSuccesses", asLong(request.get("chunkReadSuccesses"), 0));
+            telemetry.put("chunkReadFailures", asLong(request.get("chunkReadFailures"), 0));
+            telemetry.put("chunkWriteSuccesses", asLong(request.get("chunkWriteSuccesses"), 0));
+            telemetry.put("chunkWriteFailures", asLong(request.get("chunkWriteFailures"), 0));
+            telemetry.put("checksumFailures", asLong(request.get("checksumFailures"), 0));
+            telemetry.put("chunkCount", asLong(request.get("chunkCount"), 0));
+        }
+
+        boolean found = nodeRegistry.heartbeat(nodeId, totalCap, usedCap, telemetry);
         if (found) {
             return createSuccessResponse(new byte[0]);
         } else {
@@ -395,11 +497,8 @@ public class MetadataHandler {
 
     private ByteBuffer handleGetPlacement(RequestContext ctx) throws IOException {
         byte[] payload = ctx.innerPayload;
-        String payloadStr = new String(payload);
-        System.out.println("[DEBUG-GET_PLACEMENT] payload=" + payloadStr);
         Map<String, Object> request = objectMapper.readValue(payload, Map.class); // Use Object to be safe
         Object chunkIndexObj = request.get("chunkIndex");
-        System.out.println("[DEBUG-GET_PLACEMENT] chunkIndexObj=" + chunkIndexObj + " type=" + (chunkIndexObj != null ? chunkIndexObj.getClass().getName() : "null"));
         Integer chunkIndex = null;
         if (chunkIndexObj instanceof Number) {
             chunkIndex = ((Number) chunkIndexObj).intValue();
@@ -428,8 +527,6 @@ public class MetadataHandler {
     }
 
     private ByteBuffer handleGetClusterStatus(RequestContext ctx) throws IOException {
-        Collection<NodeInfo> allNodes = nodeRegistry.getAllNodes();
-
         // Calculate replication stats
         int objects = store.listObjects().size();
         int chunks = 0;
@@ -457,7 +554,7 @@ public class MetadataHandler {
         }
 
         Map<String, Object> status = new HashMap<>();
-        status.put("nodes", allNodes);
+        status.put("nodes", buildDetachedNodeSnapshots());
         status.put("objects", objects);
         status.put("chunks", chunks);
         status.put("healthyNodes", nodeRegistry.healthyCount());
@@ -467,9 +564,69 @@ public class MetadataHandler {
         status.put("replicationFactor", placementManager.getReplicationFactor());
         status.put("isLeader", raftNode != null ? raftNode.isLeader() : true);
         status.put("raftState", raftNode != null ? raftNode.getState().name() : "SINGLE");
+        status.put("lifecycleState", observability.lifecycleState());
+        status.put("healthState", computeGlobalHealthState(objects > 0, nodeRegistry.size(), nodeRegistry.healthyCount(), degradedChunks));
+        status.put("raftSnapshot", raftNode != null ? raftNode.getOperationalSnapshot() : RaftOperationalSnapshot.singleNodeSnapshot());
+        status.put("metrics", observability.snapshot());
 
         byte[] data = objectMapper.writeValueAsBytes(status);
         return createSuccessResponse(data);
+    }
+
+    private List<Map<String, Object>> buildDetachedNodeSnapshots() {
+        return nodeRegistry.getAllNodes().stream()
+                .map(node -> {
+                    Map<String, Object> snapshot = new HashMap<>();
+                    snapshot.put("nodeId", node.getNodeId());
+                    snapshot.put("host", node.getHost());
+                    snapshot.put("port", node.getPort());
+                    snapshot.put("status", node.getStatus().name());
+                    snapshot.put("healthState", computeNodeHealthState(node));
+                    snapshot.put("totalCapacityBytes", node.getTotalCapacityBytes());
+                    snapshot.put("usedCapacityBytes", node.getUsedCapacityBytes());
+                    snapshot.put("availableCapacityBytes", node.getAvailableCapacityBytes());
+                    snapshot.put("chunkCount", node.getChunkCount());
+                    snapshot.put("activeConnections", node.getActiveConnections());
+                    snapshot.put("chunkReadSuccesses", node.getChunkReadSuccesses());
+                    snapshot.put("chunkReadFailures", node.getChunkReadFailures());
+                    snapshot.put("chunkWriteSuccesses", node.getChunkWriteSuccesses());
+                    snapshot.put("chunkWriteFailures", node.getChunkWriteFailures());
+                    snapshot.put("checksumFailures", node.getChecksumFailures());
+                    snapshot.put("recoveryHold", node.isRecoveryHold());
+                    snapshot.put("lastHeartbeat", node.getLastHeartbeat());
+                    return snapshot;
+                })
+                .toList();
+    }
+
+    private String computeNodeHealthState(NodeInfo node) {
+        if (node.isRecoveryHold()) {
+            return "DEGRADED";
+        }
+        if (node.getStatus() == NodeStatus.ACTIVE) {
+            return "HEALTHY";
+        }
+        return "UNHEALTHY";
+    }
+
+    private String computeGlobalHealthState(boolean hasData, int totalNodes, int healthyNodes, int degradedChunks) {
+        String lifecycle = observability.lifecycleState();
+        if ("STOPPING".equals(lifecycle)) return "STOPPING";
+        if ("STARTING".equals(lifecycle)) return "STARTING";
+
+        if (totalNodes == 0) {
+            return hasData ? "UNHEALTHY" : "HEALTHY";
+        }
+
+        int unhealthyNodes = totalNodes - healthyNodes;
+        if (unhealthyNodes >= totalNodes) {
+            return "UNHEALTHY";
+        }
+
+        if (unhealthyNodes > 0 || degradedChunks > 0) {
+            return "DEGRADED";
+        }
+        return "HEALTHY";
     }
 
     private ByteBuffer handleRepair(RequestContext ctx) throws IOException {
@@ -602,6 +759,23 @@ public class MetadataHandler {
     /**
      * Gets the deduplication cache for testing.
      */
+    private static long asLong(Object value, long defaultValue) {
+        if (value == null) {
+            return defaultValue;
+        }
+        if (value instanceof Number n) {
+            return n.longValue();
+        }
+        if (value instanceof String s) {
+            try {
+                return Long.parseLong(s);
+            } catch (NumberFormatException ignored) {
+                return defaultValue;
+            }
+        }
+        return defaultValue;
+    }
+
     public DeduplicationCache getDeduplicationCache() {
         return deduplicationCache;
     }

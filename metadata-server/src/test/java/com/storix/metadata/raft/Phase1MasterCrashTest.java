@@ -801,6 +801,8 @@ class Phase1MasterCrashTest {
             try {
                 node.start();
             } catch (IOException e) {
+                System.err.println("Node start failed: " + e.getMessage());
+                e.printStackTrace();
                 // Expected on shutdown
             }
         });

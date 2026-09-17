@@ -1,5 +1,7 @@
 package com.storix.metadata.wal;
 
+import com.storix.metadata.LogHandler;
+
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -434,7 +436,7 @@ public class GenerationManager {
         // fsync directory (best effort)
         fsyncDirectory(storageDir);
 
-        System.out.println("[GEN] Switched CURRENT to generation " + generation);
+        LogHandler.info("[GEN] Switched CURRENT to generation " + generation);
     }
 
     /**
@@ -482,7 +484,7 @@ public class GenerationManager {
                 }
             }
             Files.delete(genDir);
-            System.out.println("[GEN] Deleted candidate generation: " + generation);
+            LogHandler.info("[GEN] Deleted candidate generation: " + generation);
         }
     }
 
@@ -502,7 +504,7 @@ public class GenerationManager {
                 }
             }
         } catch (IOException e) {
-            System.err.println("[GEN] Failed to list generations: " + e.getMessage());
+            LogHandler.error("[GEN] Failed to list generations: " + e.getMessage());
         }
         return generations;
     }
@@ -520,7 +522,7 @@ public class GenerationManager {
                 try {
                     deleteCandidateGeneration(gen);
                 } catch (IOException e) {
-                    System.err.println("[GEN] Failed to delete candidate generation " + gen + ": " + e.getMessage());
+                    LogHandler.error("[GEN] Failed to delete candidate generation " + gen + ": " + e.getMessage());
                 }
             }
         }
@@ -562,7 +564,7 @@ public class GenerationManager {
 
         // Switch CURRENT to make gen-1 authoritative
         switchCurrent(1);
-        System.out.println("[GEN] Initialized first generation: gen-1 (empty state)");
+        LogHandler.info("[GEN] Initialized first generation: gen-1 (empty state)");
     }
 
     /**
@@ -577,7 +579,7 @@ public class GenerationManager {
         // If no current generation (fresh start), start from generation 1
         long nextGen = (currentGen >= 0) ? currentGen + 1 : 1;
         createCandidateGeneration(nextGen);
-        System.out.println("[GEN] Prepared generation " + nextGen + " for snapshot at index " + snapshotIndex);
+        LogHandler.info("[GEN] Prepared generation " + nextGen + " for snapshot at index " + snapshotIndex);
         return nextGen;
     }
 
@@ -594,7 +596,7 @@ public class GenerationManager {
                 Files.deleteIfExists(dummyFile);
             }
         } catch (IOException e) {
-            System.err.println("[GEN] Directory sync failed (best effort): " + e.getMessage());
+            LogHandler.error("[GEN] Directory sync failed (best effort): " + e.getMessage());
         }
     }
 

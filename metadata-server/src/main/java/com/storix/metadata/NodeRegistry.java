@@ -37,10 +37,10 @@ public class NodeRegistry {
                 existing.setTotalCapacityBytes(totalCapacityBytes);
                 existing.setUsedCapacityBytes(usedCapacityBytes);
                 existing.recordHeartbeat();
-                System.out.println("[REGISTRY] Node re-registered: " + nodeId + " " + host + ":" + port);
+                LogHandler.info("[REGISTRY] Node re-registered: " + nodeId + " " + host + ":" + port);
                 return existing;
             } else {
-                System.out.println("[REGISTRY] Node registered: " + nodeId + " " + host + ":" + port);
+                LogHandler.info("[REGISTRY] Node registered: " + nodeId + " " + host + ":" + port);
                 NodeInfo node = new NodeInfo(nodeId, host, port);
                 node.setTotalCapacityBytes(totalCapacityBytes);
                 node.setUsedCapacityBytes(usedCapacityBytes);
@@ -63,12 +63,27 @@ public class NodeRegistry {
      * @param usedCapacityBytes used capacity in bytes, ignored when total is unknown
      */
     public boolean heartbeat(String nodeId, long totalCapacityBytes, long usedCapacityBytes) {
+        return heartbeat(nodeId, totalCapacityBytes, usedCapacityBytes, null);
+    }
+
+    /** Records a heartbeat and optional storage-node aggregate telemetry. */
+    public boolean heartbeat(String nodeId, long totalCapacityBytes, long usedCapacityBytes,
+                             Map<String, Long> telemetry) {
         NodeInfo node = nodes.get(nodeId);
         if (node != null) {
             node.recordHeartbeat();
             if (totalCapacityBytes > 0) {
                 node.setTotalCapacityBytes(totalCapacityBytes);
                 node.setUsedCapacityBytes(usedCapacityBytes);
+            }
+            if (telemetry != null) {
+                node.updateTelemetry(telemetry.getOrDefault("activeConnections", 0L),
+                        telemetry.getOrDefault("chunkReadSuccesses", 0L),
+                        telemetry.getOrDefault("chunkReadFailures", 0L),
+                        telemetry.getOrDefault("chunkWriteSuccesses", 0L),
+                        telemetry.getOrDefault("chunkWriteFailures", 0L),
+                        telemetry.getOrDefault("checksumFailures", 0L),
+                        telemetry.getOrDefault("chunkCount", 0L));
             }
             return true;
         }
@@ -91,7 +106,7 @@ public class NodeRegistry {
             if (node.getStatus() == NodeStatus.ACTIVE && node.isTimedOut(timeoutMillis)) {
                 node.setStatus(NodeStatus.UNHEALTHY);
                 newlyUnhealthy.add(node.getNodeId());
-                System.out.println("[HEALTH] Node " + node.getNodeId() + " marked UNHEALTHY");
+                LogHandler.info("[HEALTH] Node " + node.getNodeId() + " marked UNHEALTHY");
             }
         }
         return newlyUnhealthy;

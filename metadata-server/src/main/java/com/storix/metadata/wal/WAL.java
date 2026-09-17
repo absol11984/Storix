@@ -1,5 +1,7 @@
 package com.storix.metadata.wal;
 
+import com.storix.metadata.LogHandler;
+
 import com.storix.metadata.raft.LogEntry;
 
 import java.io.*;
@@ -683,7 +685,7 @@ public class WAL implements AutoCloseable {
             long currentSize = channel.size();
             if (truncateTo < currentSize) {
                 channel.truncate(truncateTo);
-                System.out.println("[WAL] Physically truncated WAL from " + currentSize + " to " + truncateTo);
+                LogHandler.info("[WAL] Physically truncated WAL from " + currentSize + " to " + truncateTo);
             }
         }
 
@@ -799,11 +801,11 @@ public class WAL implements AutoCloseable {
                 // TRUNCATED_TAIL: WAL was cleanly cut at end - recoverable, start fresh.
                 // All other statuses: INTERNAL CORRUPTION - must not silently lose data.
                 if (e.getStatus() == WALRecoveryException.RecoveryStatus.TRUNCATED_TAIL) {
-                    System.out.println("[WAL] WAL truncated during compaction, starting fresh: " + e.getMessage());
+                    LogHandler.info("[WAL] WAL truncated during compaction, starting fresh: " + e.getMessage());
                     recoveryResult = WALRecoveryResult.truncated(List.of(), term, votedFor, commitIndex, 0, e.getMessage());
                 } else {
                     // Internal corruption - re-throw to avoid silent data loss
-                    System.err.println("[WAL] WAL internal corruption during compaction, refusing to compact: " + e.getMessage());
+                    LogHandler.error("[WAL] WAL internal corruption during compaction, refusing to compact: " + e.getMessage());
                     throw e;
                 }
             }
