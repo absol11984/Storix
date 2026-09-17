@@ -466,30 +466,6 @@ and does not change Raft election semantics or production timeouts.
 - `EndToEndIntegrationTest.java` - Full integration tests
 - `pom.xml` - Added test dependencies on metadata-server and storage-node
 
-## Phase 1 Status: COMPLETE
-
-Phase 1 of the Storix distributed storage system is complete with:
-- ✓ Raft consensus for leader election and log replication
-- ✓ Crash-safe persistence with atomic generation commits
-- ✓ Generation immutability after commit
-- ✓ WAL + snapshot recovery
-- ✓ Multi-chunk InstallSnapshot with checksum validation
-- ✓ Crash before/after CURRENT switch recovery
-- ✓ Full test suite (468 tests)
-
-## Phase 5 Status: COMPLETE
-
-Phase 5 is the final Storix phase. Observability, production lifecycle, and test isolation are complete:
-
-- ✓ Lifecycle states: STARTING → RUNNING → STOPPING
-- ✓ Cluster health: HEALTHY / DEGRADED / UNHEALTHY
-- ✓ Request metrics with `activeRequests` and failure classification
-- ✓ Repair, recovery, and rebalance manager metrics
-- ✓ Storage telemetry (reads, writes, checksums, capacity)
-- ✓ Raft operational snapshot in STATUS output
-- ✓ GET_CLUSTER_STATUS (opcode 13)
-- ✓ Full test suite: `mvn clean test` → 468 tests, 0 failures
-
 ## Future Enhancements (Not Yet Implemented)
 
 - No authentication
