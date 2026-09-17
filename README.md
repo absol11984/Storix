@@ -386,7 +386,7 @@ Default chunk size: 1 MB
 ## Run Tests
 
 ```bash
-mvn test
+mvn clean test
 ```
 
 ### Test isolation
@@ -428,7 +428,7 @@ and does not change Raft election semantics or production timeouts.
 - **Crash Recovery**: Atomic generation commits with rollback safety
 - **Generation Immutability**: Committed generations cannot be modified
 
-**Test Coverage (166 tests):**
+**Test Coverage (468 tests):**
 - WAL tests (recovery, compaction, truncation)
 - RaftLog tests (append, truncate, boundary)
 - Generation tests (creation, immutability, recovery)
@@ -475,7 +475,20 @@ Phase 1 of the Storix distributed storage system is complete with:
 - ✓ WAL + snapshot recovery
 - ✓ Multi-chunk InstallSnapshot with checksum validation
 - ✓ Crash before/after CURRENT switch recovery
-- ✓ Full test suite (166 tests)
+- ✓ Full test suite (468 tests)
+
+## Phase 5 Status: COMPLETE
+
+Phase 5 is the final Storix phase. Observability, production lifecycle, and test isolation are complete:
+
+- ✓ Lifecycle states: STARTING → RUNNING → STOPPING
+- ✓ Cluster health: HEALTHY / DEGRADED / UNHEALTHY
+- ✓ Request metrics with `activeRequests` and failure classification
+- ✓ Repair, recovery, and rebalance manager metrics
+- ✓ Storage telemetry (reads, writes, checksums, capacity)
+- ✓ Raft operational snapshot in STATUS output
+- ✓ GET_CLUSTER_STATUS (opcode 13)
+- ✓ Full test suite: `mvn clean test` → 468 tests, 0 failures
 
 ## Future Enhancements (Not Yet Implemented)
 
@@ -510,7 +523,8 @@ Storix Cluster Status
 
 Health: HEALTHY (Lifecycle: RUNNING)
 
-Raft State: UNKNOWN (Leader: false)
+Raft Consensus:
+  Role: LEADER | Term: 1 | Leader: node-a | CommitIndex: 0 | LastApplied: 0
 
 Storage Nodes:
 --------------------------------------------------------------------------------
