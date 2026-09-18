@@ -1,29 +1,28 @@
 # Storix
 
-A distributed object storage system built with Java 21, featuring multi-node replication, fault tolerance, and automatic repair.
+A distributed object storage system built with Java 21, featuring multi-node replication, fault tolerance, and repair.
 
 ## Architecture
 
 ```
-                    ┌─────────────┐
-                    │   Client    │
-                    └──────┬──────┘
-                           │
-                           ▼
-                   ┌───────────────┐
-                   │   Metadata    │
-                   │    Server     │
-                   │  (port 9090)  │
-                   └───────┬───────┘
-                           │
-           ┌───────────────┼───────────────┐
-           │               │               │
-           ▼               ▼               ▼
-    ┌──────────┐   ┌──────────┐   ┌──────────┐
-    │  Node A  │   │  Node B  │   │  Node C  │
-    │ (port    │   │ (port    │   │ (port    │
-    │  9001)   │   │  9002)   │   │  9003)   │
-    └──────────┘   └──────────┘   └──────────┘
+                 ┌─────────────┐
+                 │   Client    │
+                 └──────┬──────┘
+                        │
+                        ▼
+                ┌───────────────┐
+                │   Metadata     │
+                │   Server       │
+                │  (port 9090)   │
+                └──────┬────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        │              │              │
+        ▼              ▼              ▼
+   ┌──────────┐   ┌──────────┐   ┌──────────┐
+   │  Node A  │   │  Node B  │   │  Node C  │
+   │ (9001)   │   │ (9002)   │   │ (9003)   │
+   └──────────┘   └──────────┘   └──────────┘
 ```
 
 ### Metadata Persistence Architecture
@@ -34,306 +33,76 @@ The Metadata Server uses a crash-safe persistence model:
                     CURRENT
                        |
                        v
-              AUTHORITATIVE SNAPSHOT
+           AUTHORITATIVE SNAPSHOT
                        |
                        v
                  GENERATION N
                        |
-              +--------+--------+
-              |                 |
-        metadata state       snapshot
-              |
-              v
-             WAL
-              |
-              v
-     mutations after snapshot
+            +----------+----------+
+            |                     |
+ metadata state snapshot
+            |
+            v
+          WAL
+            |
+            v
+   mutations after snapshot
 ```
 
-**Key Components:**
-- **CURRENT**: Single authoritative generation pointer (atomic file)
-- **GenerationManager**: Manages generation directories and CURRENT pointer
-- **WAL**: Durable Write-Ahead Log for post-snapshot mutations
-- **MetadataStateMachine**: Applies WAL/Raft mutations
-- **MetadataStore**: Live/materialized metadata state
+**Key Components**
+- **CURRENT**: single authoritative generation pointer (atomic file)
+- **GenerationManager**: creates/validates immutable generation directories
+- **WAL**: durable write-ahead log for post-snapshot mutations
+- **MetadataStateMachine**: applies WAL/Raft mutations to reconstruct state
+- **MetadataStore**: live/materialized metadata state
 
-**Generation Format:**
-```
-generations/
-    gen-1/
-        metadata.json    # State snapshot
-        snapshot.bin     # Binary snapshot with header
-        manifest.json    # Generation metadata
-
-    gen-2/
-        metadata.json
-        snapshot.bin
-        manifest.json
-
-CURRENT              # Atomic generation pointer
-wal.dat             # Write-Ahead Log
-```
-
-## Features
-
-### Distributed Storage
-- Multiple independent Storage Nodes that register with the Metadata Server
-- Configurable replication factor (default: 2) for fault tolerance
-- Deterministic round-robin chunk placement across healthy nodes
-
-### Fault Tolerance
-- Node health monitoring with heartbeat-based detection
-- Automatic failover: reads skip unhealthy replicas and use healthy ones
-- Configurable timeout and health-check intervals
-
-### Automatic Repair
-- Background health monitor detects under-replicated chunks
-- Automatic repair: copies chunks from source replicas to new targets
-- Manual repair trigger available via CLI
-
-### Cluster Management
-- `status` command shows all nodes, health, and replication status
-- `info` command shows per-replica health for each object
-- `repair` command triggers manual repair cycle
+### Cluster Health & Repair (high level)
+- Storage nodes register with the Metadata Server and send periodic heartbeats.
+- The Metadata Server tracks which nodes are **ACTIVE** (and which are unhealthy/dead).
+- Placement chooses replica targets among healthy nodes.
+- A background repair cycle scans for under-replicated chunks and repairs them.
 
 ## Components
 
-### Storage Node (`storage-node`)
-- TCP server handling PUT_CHUNK, GET_CHUNK, DELETE_CHUNK operations
-- Stores chunks as individual files on disk
-- Uses Java NIO and virtual threads
-- Registers with metadata server on startup
-- Sends heartbeat every 2 seconds
-
 ### Metadata Server (`metadata-server`)
-- TCP server managing object metadata
-- Tracks chunk locations, replica nodes, and checksums
-- Persists metadata to JSON file
-- **Node Registry**: tracks registered nodes with health status
-- **Placement Manager**: selects replica nodes for new chunks
-- **Repair Manager**: detects and repairs under-replicated chunks
-- **Health Monitor**: scheduled task that checks node health
+- TCP server for metadata requests.
+- Maintains node registry, chunk/object metadata, and health.
+
+### Storage Node (`storage-node`)
+- TCP server that stores chunks on disk.
+- Enforces an optional configured logical capacity.
+- Registers with the Metadata Server and sends heartbeats.
 
 ### Client (`client`)
-- CLI for put, get, delete, info, list, status, repair operations
-- Handles file chunking and reconstruction
-- Communicates with both servers
-- Replica-aware GET with checksum verification
+- CLI for `put`, `get`, `delete`, `info`, and `list`.
+- Uploads are chunked and replicated.
+- Downloads verify chunk integrity via checksum.
 
-## Requirements
-
-- Java 21+
-- Maven 3.9+
-
-## Build
-
-```bash
-mvn clean package
-```
-
-## Start Services
-
-### 1. Start Metadata Server
-
-```bash
-java -jar metadata-server/target/metadata-server-1.0.0.jar --port 9090 --metadata ./metadata.json --replication-factor 2 --timeout 6000 --interval 2000
-```
-
-Options:
-- `--port` - Metadata server port (default: 9090)
-- `--metadata` - Metadata persistence file (default: ./metadata.json)
-- `--replication-factor` - Number of replicas per chunk (default: 2)
-- `--timeout` - Node timeout in milliseconds (default: 6000)
-- `--interval` - Health check interval in milliseconds (default: 2000)
-
-### 2. Start Storage Nodes
-
-Each storage node registers with the metadata server and sends heartbeats.
-
-```bash
-# Node A
-java -jar storage-node/target/storage-node-1.0.0.jar --id node-a --host 127.0.0.1 --port 9001 --storage ./node-a-storage --metadata 127.0.0.1:9090
-
-# Node B
-java -jar storage-node/target/storage-node-1.0.0.jar --id node-b --host 127.0.0.1 --port 9002 --storage ./node-b-storage --metadata 127.0.0.1:9090
-
-# Node C
-java -jar storage-node/target/storage-node-1.0.0.jar --id node-c --host 127.0.0.1 --port 9003 --storage ./node-c-storage --metadata 127.0.0.1:9090
-```
-
-Options:
-- `--id` - Unique node identifier (required)
-- `--host` - Host address to bind (default: 127.0.0.1)
-- `--port` - Port to listen on (required)
-- `--storage` - Directory for chunk storage (required)
-- `--metadata` - Metadata server address host:port (required)
-
-## Usage
-
-### Upload a file
-
-```bash
-java -jar client/target/client-1.0.0.jar put test.bin
-```
-
-### Check cluster status
-
-```bash
-java -jar client/target/client-1.0.0.jar status
-```
-
-Output:
-```
-Storix Cluster Status
-
-Health: HEALTHY (Lifecycle: RUNNING)
-
-Raft Consensus:
-  Role: LEADER | Term: 1 | Leader: node-a | CommitIndex: 100 | LastApplied: 100
-
-Storage Nodes:
---------------------------------------------------------------------------------
-Node ID    Address          Status     Health     Chunks   Used/Total
---------------------------------------------------------------------------------
-node-a     127.0.0.1:9001   ACTIVE     HEALTHY    10       500MB/1000MB
-node-b     127.0.0.1:9002   ACTIVE     HEALTHY    10       510MB/1000MB
-node-c     127.0.0.1:9003   ACTIVE     HEALTHY    5        400MB/1000MB
---------------------------------------------------------------------------------
-
-Cluster Data:
-  Objects: 10
-  Chunks: 25
-  Healthy nodes: 3/3
-  Replication: Healthy=25, Degraded=0
-
-Metrics Summary:
-  Requests: Total=1000, Success=995, Failed=5, Active=2
-  Repair: Active=0, Repaired=15, Failed=0
-  Recovery: Active=0, Restored=0, Failed=0
-  Rebalance: Active=0, Moved=0, Failed=0
-```
-
-
-### Get file info
-
-```bash
-java -jar client/target/client-1.0.0.jar info test.bin
-```
-
-Output:
-```
-Object: test.bin
-Size: 5242880 bytes
-Chunks: 5
-Chunk Size: 1048576 bytes
-Replication Factor: 2
-
-Chunk 0:
-  node-a ACTIVE
-  node-b ACTIVE
-
-Chunk 1:
-  node-b ACTIVE
-  node-c ACTIVE
-...
-
-Status: HEALTHY
-```
-
-### Download a file
-
-```bash
-java -jar client/target/client-1.0.0.jar get test.bin recovered.bin
-```
-
-### Delete a file
-
-```bash
-java -jar client/target/client-1.0.0.jar delete test.bin
-```
-
-### List all objects
-
-```bash
-java -jar client/target/client-1.0.0.jar list
-```
-
-### Trigger manual repair
-
-```bash
-java -jar client/target/client-1.0.0.jar repair
-```
-
-## Observability & Cluster Monitoring
-
-The `status` command yields a comprehensive, deterministic health snapshot of the cluster in a lock-free, read-only map generated on demand by the Metadata Server.
-
-### Health States
-The cluster explicitly computes health across multiple layers:
-- `HEALTHY`: Normal operations.
-- `DEGRADED`: At least one storage node is in `recoveryHold`, or there is at least one under-replicated (degraded) chunk.
-- `UNHEALTHY`: The metadata server lacks sufficient nodes to satisfy storage requirements, or a node has remained unregistered/unreachable past its timeouts.
-- `STARTING` / `STOPPING`: The server is bound but still spinning up or gracefully shutting down operations (no incoming external queries are fully active).
-
-### Metric Semantics
-- **Requests**: Captures operations at `opcode` boundaries. Failure categories (e.g. `timeout`, `storage_failure`, `invalid_request`, `internal`) expose the nature of errors deterministically, avoiding stacktrace leakage.
-- **Managers**: Tracks background work explicitly using `try/finally` increment/decrement logic.
-  - *Repair*: Count of tasks that effectively found and copied chunks.
-  - *Recovery*: Scans that synchronized a missing storage node successfully.
-  - *Rebalance*: Tasks moving data away from full/evicted nodes.
-- **Storage Telemetry**: Heartbeats contain in-line metrics. Storage nodes expose chunk read/write successes/failures dynamically, active connections, and explicit checksum/corruption failures observed via client verification.
-
-### Unhealthy Node Diagnosis Example
-When a client detects an anomaly or `get test.bin` hangs/fails, checking `status` is the first diagnostic step.
-
-If a storage node crashes or has a network partition, `StorixCLI status` will show:
-```
-Storix Cluster Status
-
-Health: DEGRADED (Lifecycle: RUNNING)
-
-Storage Nodes:
---------------------------------------------------------------------------------
-Node ID    Address          Status     Health     Chunks   Used/Total
---------------------------------------------------------------------------------
-node-a     127.0.0.1:9001   ACTIVE     HEALTHY    10       500MB/1000MB
-node-b     127.0.0.1:9002   ACTIVE     HEALTHY    10       510MB/1000MB
-node-c     127.0.0.1:9003   INACTIVE   UNHEALTHY  5        400MB/1000MB
---------------------------------------------------------------------------------
-
-Cluster Data:
-  Objects: 10
-  Chunks: 25
-  Healthy nodes: 2/3
-  Replication: Healthy=20, Degraded=5
-```
-Here, `node-c` reads `UNHEALTHY` and 5 chunks are `Degraded`. The administrator should:
-1. Try restarting `node-c`. Wait for the node to enter `DEGRADED` (recovery hold) status and eventually `HEALTHY` once caught up.
-2. If `node-c` is permanently lost, wait for the timeout, or trigger a manual repair using `storix repair`, which scans degraded chunks and instructs nodes `a` and `b` to replicate them.
-
-## Protocol
+## Protocol (wire-level overview)
 
 ### Storage Node Protocol
 
 Request format:
-```
+
+```text
 [4 bytes: request length]
 [1 byte: opcode]
 [4 bytes: chunkId length][N bytes: chunkId]
 [4 bytes: data length][N bytes: data] (PUT only)
 ```
 
-Opcodes:
-- `1` = PUT_CHUNK
-- `2` = GET_CHUNK
-- `3` = DELETE_CHUNK
-
 Response format:
-```
+
+```text
 [4 bytes: response length]
 [1 byte: status]
 [4 bytes: data length][N bytes: data]
 ```
+
+Opcodes:
+- `1` = PUT_CHUNK
+- `2` = GET_CHUNK
+- `3` = DELETE_CHUNK
 
 Status:
 - `0` = OK
@@ -342,20 +111,19 @@ Status:
 ### Metadata Server Protocol
 
 Request format:
-```
+
+```text
 [4 bytes: request length]
 [1 byte: opcode]
 [4 bytes: payload length][N bytes: JSON payload]
 ```
 
-Opcodes (Prompt 1):
+Opcodes:
 - `1` = CREATE_OBJECT
 - `2` = GET_OBJECT
 - `3` = UPDATE_OBJECT
 - `4` = DELETE_OBJECT
 - `5` = LIST_OBJECTS
-
-Opcodes (Prompt 2 - Distributed):
 - `10` = REGISTER_NODE
 - `11` = HEARTBEAT
 - `12` = GET_NODES
@@ -364,7 +132,8 @@ Opcodes (Prompt 2 - Distributed):
 - `15` = REPAIR
 
 Response format:
-```
+
+```text
 [4 bytes: response length]
 [1 byte: status]
 [4 bytes: payload length][N bytes: JSON payload]
@@ -374,204 +143,377 @@ Status:
 - `0` = OK
 - `1` = ERROR
 - `2` = NOT_FOUND
+- `3` = NOT_LEADER
 
-## Configuration
+## Requirements
 
-Default ports:
-- Storage Node: 8080
-- Metadata Server: 9090
+- **Java 21+**
+- **Maven 3.9+**
+- **Git**
 
-Default chunk size: 1 MB
+Verify your tools:
+
+```bash
+java -version
+mvn -version
+git --version
+```
+
+## Installation
+
+### 1) Clone the repository
+
+Use the GitHub URL with `git clone` (do not paste the URL directly):
+
+```bash
+git clone https://github.com/absol11984/Storix.git
+cd Storix
+```
+
+## Build
+
+```bash
+mvn -DskipTests clean package
+```
+
+This:
+- compiles/packages the project
+- creates these runnable JARs:
+
+```text
+metadata-server/target/
+storage-node/target/
+client/target/
+```
 
 ## Run Tests
+
+Do **not** manually start the Storix cluster before running tests—Maven tests start their own temporary servers/nodes where applicable.
 
 ```bash
 mvn clean test
 ```
 
-### Test isolation
-`metadata-server/pom.xml` configures Maven Surefire with `forkCount=1` and
-`reuseForks=false`. Each metadata-server test class runs in its own JVM,
-preventing cross-test port and Raft state pollution. The tradeoff is slower
-startup and higher JVM overhead per test class. This is test-only isolation
-and does not change Raft election semantics or production timeouts.
+If successful, the run ends with:
 
-## What Was Implemented
+```text
+BUILD SUCCESS
+```
 
-### Phase 1: Distributed Storage with Crash Safety
+### Build vs Test (quick difference)
 
-#### Core Storage
-- Storage Node TCP server with virtual threads
-- Chunk storage on filesystem
-- Binary protocol for PUT_CHUNK, GET_CHUNK, DELETE_CHUNK
-- Object and chunk metadata models
+- `mvn -DskipTests clean package` = build/package only (no tests)
+- `mvn clean test` = runs the automated test suite
 
-#### Distributed Cluster
-- **Node Registry**: Tracks registered nodes with health status
-- **Node Registration**: Storage nodes register with metadata server on startup
-- **Heartbeat System**: Nodes send heartbeats every 2 seconds
-- **Health Monitor**: Scheduled background task checks node health
-- **Placement Manager**: Deterministic round-robin chunk placement
-- **Automatic Repair**: Detects under-replicated chunks and repairs them
-
-#### Raft Consensus
-- RaftNode for leader election and log replication
-- AppendEntries RPC for log consistency
-- InstallSnapshot RPC for state transfer
-- Term-based leader election
-
-#### Crash-Safe Persistence (Phase 1)
-- **GenerationManager**: Manages immutable generation directories
-- **CURRENT Pointer**: Atomic generation pointer (single source of truth)
-- **WAL**: Write-Ahead Log for durability
-- **SnapshotManager**: Log compaction with snapshots
-- **Crash Recovery**: Atomic generation commits with rollback safety
-- **Generation Immutability**: Committed generations cannot be modified
-
-**Test Coverage (468 tests):**
-- WAL tests (recovery, compaction, truncation)
-- RaftLog tests (append, truncate, boundary)
-- Generation tests (creation, immutability, recovery)
-- InstallSnapshot tests (multi-chunk, checksum, failure)
-- Crash recovery tests (before/after CURRENT switch)
-- Cluster integration tests (registration, heartbeat, failover)
-
-## Files Created/Modified
-
-### storage-node
-- `ChunkServer.java` - Added node ID, registration, heartbeat thread
-- `pom.xml` - Added maven-shade-plugin for fat JAR
-
-### metadata-server
-- `NodeStatus.java` - ACTIVE/UNHEALTHY enum
-- `NodeInfo.java` - Node info with heartbeat tracking
-- `NodeRegistry.java` - Thread-safe node registry
-- `PlacementManager.java` - Deterministic chunk placement
-- `RepairManager.java` - Chunk repair logic
-- `HealthMonitor.java` - Scheduled health checks
-- `ChunkInfo.java` - Added replicaNodeIds and checksum fields
-- `MetadataProtocol.java` - Added opcodes 10-15
-- `MetadataHandler.java` - Added handlers for new opcodes
-- `MetadataServer.java` - Added NodeRegistry, RepairManager, HealthMonitor
-- `NodeRegistryTest.java` - Node registry tests
-- `PlacementManagerTest.java` - Placement algorithm tests
-- `pom.xml` - Added maven-shade-plugin
-
-### client
-- `NodeInfoDTO.java` - Node info DTO
-- `ChunkInfoDTO.java` - Added replicaNodeIds and checksum
-- `MetadataClient.java` - Added registerNode, heartbeat, getNodes, etc.
-- `StorixClient.java` - Replica-aware put/get/delete
-- `StorixCLI.java` - Added status and repair commands
-- `EndToEndIntegrationTest.java` - Full integration tests
-- `pom.xml` - Added test dependencies on metadata-server and storage-node
-
-## Future Enhancements (Not Yet Implemented)
-
-- No authentication
-- No encryption
-- No load balancing
-- No tiered storage
-- No quota management
-
-## Example Session
+## Quick Start (3-storage-node demo)
 
 ```bash
-# Terminal 1: Start metadata server
-$ java -jar metadata-server/target/metadata-server-1.0.0.jar --port 9090 --metadata ./metadata.json --replication-factor 2
-[HEALTH] Monitor started (timeout=6000ms, interval=2000ms)
-Metadata server listening on port 9090
-
-# Terminal 2: Start storage node A
-$ java -jar storage-node/target/storage-node-1.0.0.jar --id node-a --port 9001 --storage ./node-a-storage --metadata 127.0.0.1:9090
-Registered with metadata server at 127.0.0.1:9090
-Storage node node-a listening on 127.0.0.1:9001
-
-# Terminal 3: Start storage node B
-$ java -jar storage-node/target/storage-node-1.0.0.jar --id node-b --port 9002 --storage ./node-b-storage --metadata 127.0.0.1:9090
-
-# Terminal 4: Start storage node C
-$ java -jar storage-node/target/storage-node-1.0.0.jar --id node-c --port 9003 --storage ./node-c-storage --metadata 127.0.0.1:9090
-
-# Check cluster status
-$ java -jar client/target/client-1.0.0.jar status
-Storix Cluster Status
-
-Health: HEALTHY (Lifecycle: RUNNING)
-
-Raft Consensus:
-  Role: LEADER | Term: 1 | Leader: node-a | CommitIndex: 0 | LastApplied: 0
-
-Storage Nodes:
---------------------------------------------------------------------------------
-Node ID    Address          Status     Health     Chunks   Used/Total
---------------------------------------------------------------------------------
-node-a     127.0.0.1:9001   ACTIVE     HEALTHY    0        -
-node-b     127.0.0.1:9002   ACTIVE     HEALTHY    0        -
-node-c     127.0.0.1:9003   ACTIVE     HEALTHY    0        -
---------------------------------------------------------------------------------
-
-Cluster Data:
-  Objects: 0
-  Chunks: 0
-  Healthy nodes: 3/3
-  Replication: Healthy=0, Degraded=0
-
-Metrics Summary:
-  Requests: Total=0, Success=0, Failed=0, Active=0
-  Repair: Active=0, Repaired=0, Failed=0
-  Recovery: Active=0, Restored=0, Failed=0
-  Rebalance: Active=0, Moved=0, Failed=0
-
-# Upload a file (replicated to 2 nodes)
-$ java -jar client/target/client-1.0.0.jar put test.bin
-Uploading test.bin
-File size: 5242880 bytes
-Uploading chunk 1/5
-...
-Upload successful
-
-# Check object info
-$ java -jar client/target/client-1.0.0.jar info test.bin
-Object: test.bin
-Size: 5242880 bytes
-Chunks: 5
-Chunk Size: 1048576 bytes
-Replication Factor: 2
-
-Chunk 0:
-  node-a ACTIVE
-  node-b ACTIVE
-
-Chunk 1:
-  node-b ACTIVE
-  node-c ACTIVE
-...
-
-Status: HEALTHY
-
-# Download (automatically uses healthy replicas)
-$ java -jar client/target/client-1.0.0.jar get test.bin recovered.bin
-Downloading test.bin
-...
-Download successful: recovered.bin
-
-# Node failure and automatic repair (kill node-b)
-$ kill %1  # kill node-b process
-
-# Metadata server detects failure and repairs:
-# [HEALTH] Node node-b marked UNHEALTHY
-# [REPAIR] Triggering automatic repair...
-# [REPAIR] chunk xxx-chunk-0 source=node-a destination=node-c SUCCESS
-
-# GET still works (failover to node-c)
-$ java -jar client/target/client-1.0.0.jar get test.bin recovered2.bin
-[GET] node-b unavailable (not in active nodes)
-Download successful: recovered2.bin
-
-# Restart node-b
-$ java -jar storage-node/target/storage-node-1.0.0.jar --id node-b ...
-
-# Clean up
-$ java -jar client/target/client-1.0.0.jar delete test.bin
+git clone https://github.com/absol11984/Storix.git
+cd Storix
+mvn -DskipTests clean package
 ```
+
+Then start **four separate terminals**:
+- Terminal 1: Metadata Server
+- Terminal 2: Storage Node A
+- Terminal 3: Storage Node B
+- Terminal 4: Storage Node C
+
+After nodes register, run this minimal end-to-end check:
+
+```bash
+echo "Hello from Storix" > test.txt
+java -jar client/target/client-1.0.0.jar put test.txt
+java -jar client/target/client-1.0.0.jar get test.txt recovered.txt
+cmp test.txt recovered.txt
+```
+
+For full details (including `info`, `list`, and SHA-256), see **First Upload and Download** below.
+
+## Running Storix (3-storage-node demonstration)
+
+### Terminal setup (use FOUR separate terminals)
+
+Terminal 1:
+
+```bash
+java -jar metadata-server/target/metadata-server-1.0.0.jar \
+  --port 9090 \
+  --metadata ./metadata.json \
+  --replication-factor 2 \
+  --timeout 6000 \
+  --interval 2000
+```
+
+Terminal 2 (Storage Node A):
+
+```bash
+java -jar storage-node/target/storage-node-1.0.0.jar \
+  --id node-a \
+  --host 127.0.0.1 \
+  --port 9001 \
+  --storage ./node-a-storage \
+  --metadata 127.0.0.1:9090 \
+  --capacity 107374182400
+```
+
+Terminal 3 (Storage Node B):
+
+```bash
+java -jar storage-node/target/storage-node-1.0.0.jar \
+  --id node-b \
+  --host 127.0.0.1 \
+  --port 9002 \
+  --storage ./node-b-storage \
+  --metadata 127.0.0.1:9090 \
+  --capacity 107374182400
+```
+
+Terminal 4 (Storage Node C):
+
+```bash
+java -jar storage-node/target/storage-node-1.0.0.jar \
+  --id node-c \
+  --host 127.0.0.1 \
+  --port 9003 \
+  --storage ./node-c-storage \
+  --metadata 127.0.0.1:9090 \
+  --capacity 107374182400
+```
+
+### Startup order
+
+1. Start Metadata Server.
+2. Start Node A.
+3. Start Node B.
+4. Start Node C.
+5. **Wait for the storage nodes to register with the Metadata Server.**
+6. Only then use the client to upload files.
+
+Uploading before enough nodes are registered can cause placement/replication errors.
+
+### Optional: confirm nodes are healthy
+
+In an additional terminal, you can check status:
+
+```bash
+java -jar client/target/client-1.0.0.jar status
+```
+
+You want to see enough **ACTIVE** nodes to satisfy the configured replication factor.
+
+## First Upload and Download (end-to-end)
+
+Run this from the repository root (same directory where you ran `mvn ...`).
+
+### 1) Create a small file
+
+```bash
+echo "Hello from Storix" > test.txt
+```
+
+### 2) Upload
+
+```bash
+java -jar client/target/client-1.0.0.jar put test.txt
+```
+
+### 3) Inspect object metadata
+
+```bash
+java -jar client/target/client-1.0.0.jar info test.txt
+```
+
+### 4) List objects
+
+```bash
+java -jar client/target/client-1.0.0.jar list
+```
+
+### 5) Download (recover)
+
+```bash
+java -jar client/target/client-1.0.0.jar get test.txt recovered.txt
+```
+
+### 6) Verify exact file equality
+
+- `cmp` prints nothing when files are identical:
+
+```bash
+cmp test.txt recovered.txt
+```
+
+- SHA-256 hashes should match:
+
+```bash
+sha256sum test.txt recovered.txt
+```
+
+If the two commands show matching hashes, the download reconstructed the original bytes correctly.
+
+## Client Commands
+
+Storix CLI supports the following commands:
+
+- `put <file> [chunkSize]`
+  - Example:
+    ```bash
+    java -jar client/target/client-1.0.0.jar put test.txt
+    ```
+  - `chunkSize` is optional and can be provided in bytes (integer) or with `K`/`M` suffix.
+
+- `get <object> <output>`
+  - Example:
+    ```bash
+    java -jar client/target/client-1.0.0.jar get test.txt recovered.txt
+    ```
+
+- `info <object>`
+  - Example:
+    ```bash
+    java -jar client/target/client-1.0.0.jar info test.txt
+    ```
+
+- `list`
+  - Example:
+    ```bash
+    java -jar client/target/client-1.0.0.jar list
+    ```
+
+- `delete <object>`
+  - Example:
+    ```bash
+    java -jar client/target/client-1.0.0.jar delete test.txt
+    ```
+
+(Additional commands in this build: `status`, `repair`.)
+
+## File Types
+
+Storix stores **bytes**, so uploads are not limited to a particular file extension.
+
+Examples:
+
+- `.txt`
+- `.pdf`
+- `.jpg`
+- `.png`
+- `.mp3`
+- `.mp4`
+- `.zip`
+- `.jar`
+- `.java`
+
+## Configuration
+
+Defaults are taken from the current CLI/source; the table below shows the example values used in this README’s 3-node demo.
+
+| Setting | Value (Metadata Server) |
+|---|---|
+| Metadata Server | `--port 9090` |
+| Metadata persistence file | `--metadata ./metadata.json` |
+| Replication factor | `--replication-factor 2` |
+| Health timeout (`--timeout`) | `6000` ms |
+| Health check interval (`--interval`) | `2000` ms |
+
+| Setting | Value (Storage Node A) |
+|---|---|
+| Node ID (`--id`) | `node-a` |
+| Host (`--host`) | `127.0.0.1` |
+| Port (`--port`) | `9001` |
+| Storage dir (`--storage`) | `./node-a-storage` |
+| Metadata (`--metadata`) | `127.0.0.1:9090` |
+| Capacity (`--capacity`) | `107374182400` bytes (100 GiB logical) |
+
+| Setting | Value (Storage Node B) |
+|---|---|
+| Node ID (`--id`) | `node-b` |
+| Host (`--host`) | `127.0.0.1` |
+| Port (`--port`) | `9002` |
+| Storage dir (`--storage`) | `./node-b-storage` |
+| Metadata (`--metadata`) | `127.0.0.1:9090` |
+| Capacity (`--capacity`) | `107374182400` bytes (100 GiB logical) |
+
+| Setting | Value (Storage Node C) |
+|---|---|
+| Node ID (`--id`) | `node-c` |
+| Host (`--host`) | `127.0.0.1` |
+| Port (`--port`) | `9003` |
+| Storage dir (`--storage`) | `./node-c-storage` |
+| Metadata (`--metadata`) | `127.0.0.1:9090` |
+| Capacity (`--capacity`) | `107374182400` bytes (100 GiB logical) |
+
+| Setting | Value |
+|---|---|
+| Chunk size (client default) | `1048576` bytes (1 MiB) |
+
+### What `--capacity` means
+
+`--capacity 107374182400` configures a **100 GiB logical capacity** for the demo.
+
+This enables capacity-related reporting (e.g., Used/Total) and lets the storage node enforce a maximum logical capacity when writing chunks.
+
+It does **not** pre-allocate or reserve 100 GiB of physical disk space for you. It tracks capacity logically based on actual written chunk sizes.
+
+## Troubleshooting
+
+### Clean restart (stop old local processes)
+
+If you run the demo repeatedly on your laptop, stop any existing Storix processes before restarting.
+
+```bash
+pkill -f 'metadata-server-1.0.0.jar' || true
+pkill -f 'storage-node-1.0.0.jar' || true
+```
+
+Notes:
+- This is only intended to stop **local demo** processes.
+- If you want to preserve existing data, **do not delete** `metadata.json` or the node storage directories.
+
+### Troubleshooting
+
+#### Connection refused
+Check:
+- Metadata Server is running.
+- Storage nodes are running.
+- Storage nodes point to `127.0.0.1:9090` via `--metadata`.
+- Required ports (`9090`, `9001`, `9002`, `9003`) are free.
+
+#### Insufficient healthy nodes
+Uploads require enough **healthy** nodes to satisfy the configured replication factor.
+
+If you only have (for example) 1 node **ACTIVE** but `--replication-factor 2`, placement/replication can fail.
+
+#### Used/Total shows `-`
+Capacity reporting shows `-` when nodes are started without `--capacity` (the default capacity is unlimited/unknown).
+
+Start nodes with `--capacity <bytes>` if you want Used/Total to appear in `status` output.
+
+#### Maven test failure
+If `mvn clean test` fails:
+
+1. Stop leftover local Storix processes (if any).
+2. Re-run:
+
+```bash
+mvn clean test
+```
+
+If it still fails, share the failing test output/logs so the underlying issue can be diagnosed.
+
+## Implementation Details
+
+- **Replication & Placement**: chunk replicas are placed deterministically across healthy nodes.
+- **Health**: heartbeat-driven node health with timeouts and periodic checks.
+- **Repair**: background scans detect under-replicated chunks and repair them.
+- **Integrity**: the client verifies chunk checksums during reads.
+
+## Limitations
+
+(not part of this demo build):
+- no authentication
+- no encryption
+- no load balancing
+- no tiered storage
+- no quota management beyond the demo capacity enforcement
